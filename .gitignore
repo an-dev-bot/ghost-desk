@@ -1,0 +1,11 @@
+# Spec of the project: not part of the published app
+ESPEC_G1_GHOST_DESK.md
+
+# Test output and Python cache
+capturas/
+__pycache__/
+*.pyc
+
+# System files
+.DS_Store
+Thumbs.db

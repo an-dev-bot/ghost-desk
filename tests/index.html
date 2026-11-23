@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Ghost Desk · pruebas</title>
+<style>
+  body{font:14px/1.5 ui-monospace,monospace;background:#06070b;color:#f1f3f8;margin:16px}
+  .pass{color:#20e08a} .fail{color:#ff4d6d} h1{font-size:16px} pre{white-space:pre-wrap}
+</style>
+</head>
+<body>
+<h1>Ghost Desk · pruebas de la especificación</h1>
+<div id="summary">corriendo…</div>
+<pre id="results"></pre>
+<script>
+  // Show load errors (a syntax error in a module would otherwise leave "corriendo…" forever).
+  const show = m => { document.getElementById("summary").innerHTML += '<div class="fail">' + String(m).replace(/</g, "&lt;") + "</div>"; };
+  addEventListener("error", e => show("Error: " + e.message + " @ " + e.filename + ":" + e.lineno));
+  addEventListener("unhandledrejection", e => show("Promesa rechazada: " + (e.reason?.stack || e.reason)));
+  import("./tests.js").catch(e => { show("No cargó: " + (e?.stack || e)); document.title = "DONE error"; });
+</script>
+</body>
+</html>
