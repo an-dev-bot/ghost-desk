@@ -29,7 +29,7 @@ export function createFinnhub({ getKey, onTrade, onError }) {
 
   async function call(path, params = {}) {
     const key = getKey();
-    if (!key) throw new SourceError("finnhub", "nokey", "Falta la clave de Finnhub");
+    if (!key) throw new SourceError("finnhub", "nokey", "Finnhub key missing");
     await lim.take();
     const qs = new URLSearchParams({ ...params, token: key });
     try {
@@ -71,7 +71,7 @@ export function createFinnhub({ getKey, onTrade, onError }) {
           for (const t of m.data || []) if (!last[t.s] || t.t >= last[t.s].t) last[t.s] = t;
           for (const s in last) onTrade?.({ id: s, px: last[s].p, t: last[s].t });
         } else if (m.type === "error") {
-          onError?.(new SourceError("finnhub", /limit/i.test(m.msg || "") ? "limit" : "http", m.msg || "Error del flujo en vivo"));
+          onError?.(new SourceError("finnhub", /limit/i.test(m.msg || "") ? "limit" : "http", m.msg || "Live stream error"));
         }
       },
     }).start();

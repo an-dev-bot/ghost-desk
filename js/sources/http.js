@@ -14,7 +14,7 @@ let fetchImpl = (...a) => fetch(...a);
 export function setFetch(fn) { fetchImpl = fn || ((...a) => fetch(...a)); }
 
 export async function getJSON(url, { source = "?", headers, timeout = 12000 } = {}) {
-  if (typeof navigator !== "undefined" && navigator.onLine === false) throw new SourceError(source, "offline", "Sin conexión");
+  if (typeof navigator !== "undefined" && navigator.onLine === false) throw new SourceError(source, "offline", "Offline");
   const ctl = new AbortController();
   const timer = setTimeout(() => ctl.abort(), timeout);
   let r;
@@ -22,18 +22,18 @@ export async function getJSON(url, { source = "?", headers, timeout = 12000 } = 
     r = await fetchImpl(url, { headers, signal: ctl.signal, cache: "no-store", credentials: "omit", referrerPolicy: "no-referrer" });
   } catch {
     const off = typeof navigator !== "undefined" && navigator.onLine === false;
-    throw new SourceError(source, off ? "offline" : "net", off ? "Sin conexión" : "No se pudo conectar");
+    throw new SourceError(source, off ? "offline" : "net", off ? "Offline" : "Could not connect");
   } finally {
     clearTimeout(timer);
   }
   if (!r.ok) {
     let body = "";
     try { body = (await r.text()).slice(0, 300); } catch {}
-    if (r.status === 401 || r.status === 403) throw new SourceError(source, "auth", "Rechazó la clave", r.status, body);
-    if (r.status === 429) throw new SourceError(source, "limit", "Llegó al límite de peticiones", r.status, body);
-    if (r.status === 451) throw new SourceError(source, "net", "No disponible en tu región", r.status, body);
-    if (r.status === 404) throw new SourceError(source, "notfound", "No encontrado", r.status, body);
-    throw new SourceError(source, "http", "Respondió con error " + r.status, r.status, body);
+    if (r.status === 401 || r.status === 403) throw new SourceError(source, "auth", "Rejected the key", r.status, body);
+    if (r.status === 429) throw new SourceError(source, "limit", "Hit its request limit", r.status, body);
+    if (r.status === 451) throw new SourceError(source, "net", "Not available in your region", r.status, body);
+    if (r.status === 404) throw new SourceError(source, "notfound", "Not found", r.status, body);
+    throw new SourceError(source, "http", "Answered with error " + r.status, r.status, body);
   }
   try { return await r.json(); } catch { throw new SourceError(source, "http", "Respuesta ilegible"); }
 }

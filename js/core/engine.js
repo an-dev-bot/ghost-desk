@@ -6,13 +6,19 @@
 // produced (ms). Market state is mkt = {open, since}: an order only fills while the market is open and
 // with a price produced after the current session started (stocks wait for the opening bell).
 
-import { START_CASH, quoteBuy, quoteSell, markValue } from "./money.js";
+import { START_CASH, START_MIN, START_MAX, quoteBuy, quoteSell, markValue } from "./money.js";
 
 export class TradeError extends Error {}
 
-export function newPortfolio(now = Date.now()) {
-  return { v: 1, start: START_CASH, cash: START_CASH, pos: {}, orders: [], trades: [], days: {}, createdAt: now, seq: 0 };
+export function newPortfolio(now = Date.now(), start = START_CASH) {
+  if (!validStart(start)) throw new TradeError(`The starting balance must be between ${money(START_MIN)} and ${money(START_MAX)}.`);
+  start = Math.round(start * 100) / 100;
+  return { v: 1, start, cash: start, pos: {}, orders: [], trades: [], days: {}, createdAt: now, seq: 0 };
 }
+export function validStart(n) {
+  return typeof n === "number" && isFinite(n) && n >= START_MIN && n <= START_MAX;
+}
+const money = n => "$" + n.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 
 /** Only what is needed to value and re-quote an instrument later (stored inside positions/orders). */
 export function slimInst(i) {
@@ -31,11 +37,11 @@ export function available(s) {
 const EPS = 1e-9;
 
 export function executeBuy(s, inst, usd, q, now, reason = "manual", fromOrder = false) {
-  if (!(usd > 0)) throw new TradeError("El monto tiene que ser mayor que cero.");
+  if (!(usd > 0)) throw new TradeError("The amount must be greater than zero.");
   const limit = fromOrder ? s.cash : available(s);
-  if (usd > limit + EPS) throw new TradeError("No te alcanza: tienes " + limit.toFixed(2) + " disponibles.");
+  if (usd > limit + EPS) throw new TradeError("Not enough cash: you have " + money(limit) + " available.");
   const r = quoteBuy(inst, usd, q);
-  if (!r) throw new TradeError("No hay precio en vivo para operar.");
+  if (!r) throw new TradeError("No live price to trade with.");
   let p = s.pos[inst.key];
   if (!p) {
     p = s.pos[inst.key] = { key: inst.key, inst: slimInst(inst), qty: 0, cost: 0, avg: 0, sl: null, tp: null, openedAt: now, minRatio: 1, lastPx: q.px, lastT: q.t ?? now, lastQu: q.quoteUsd ?? null };
@@ -56,10 +62,10 @@ export function executeBuy(s, inst, usd, q, now, reason = "manual", fromOrder = 
 
 export function executeSell(s, key, frac, q, now, reason = "manual") {
   const p = s.pos[key];
-  if (!p) throw new TradeError("No tienes esta posición.");
+  if (!p) throw new TradeError("You don't hold this position.");
   if (frac > 0.9999) frac = 1;
   const r = quoteSell(p.inst, p, frac, q);
-  if (!r) throw new TradeError("No hay precio en vivo para vender.");
+  if (!r) throw new TradeError("No live price to sell at.");
   p.qty -= r.qty;
   p.cost -= r.costPart;
   s.cash += r.proceeds;
@@ -84,14 +90,14 @@ export function executeSell(s, key, frac, q, now, reason = "manual") {
 export function placeOrder(s, inst, spec, q, now, mkt) {
   const { side, type } = spec;
   if (side === "buy") {
-    if (!(spec.amount > 0)) throw new TradeError("El monto tiene que ser mayor que cero.");
-    if (spec.amount > available(s) + EPS) throw new TradeError("No te alcanza: tienes " + available(s).toFixed(2) + " disponibles.");
+    if (!(spec.amount > 0)) throw new TradeError("The amount must be greater than zero.");
+    if (spec.amount > available(s) + EPS) throw new TradeError("Not enough cash: you have " + money(available(s)) + " available.");
   } else {
-    if (!s.pos[inst.key]) throw new TradeError("No tienes esta posición.");
-    if (!(spec.frac > 0 && spec.frac <= 1)) throw new TradeError("Elige cuánto vender.");
+    if (!s.pos[inst.key]) throw new TradeError("You don't hold this position.");
+    if (!(spec.frac > 0 && spec.frac <= 1)) throw new TradeError("Choose how much to sell.");
   }
-  if (type === "limit" && !(spec.limit > 0)) throw new TradeError("Pon el precio límite.");
-  if (type === "market" && mkt.open && !(q?.px > 0)) throw new TradeError("No hay precio en vivo para operar.");
+  if (type === "limit" && !(spec.limit > 0)) throw new TradeError("Set the limit price.");
+  if (type === "market" && mkt.open && !(q?.px > 0)) throw new TradeError("No live price to trade with.");
   if (type === "market" && mkt.open) {
     const trade = side === "buy" ? executeBuy(s, inst, spec.amount, q, now) : executeSell(s, inst.key, spec.frac, q, now);
     return { trade };
@@ -114,7 +120,7 @@ export function cancelOrder(s, id) {
 
 export function setStops(s, key, { sl, tp }) {
   const p = s.pos[key];
-  if (!p) throw new TradeError("No tienes esta posición.");
+  if (!p) throw new TradeError("You don't hold this position.");
   if (sl !== undefined) p.sl = sl > 0 ? sl : null;
   if (tp !== undefined) p.tp = tp > 0 ? tp : null;
   return p;
@@ -187,7 +193,7 @@ export function positionView(p, q) {
   return { value, pl, plPct: pl == null || !p.cost ? null : pl / p.cost, live: q?.px > 0 };
 }
 
-/** Record the portfolio value for today (local date), for "hoy" and the daily summary. */
+/** Record the portfolio value for today (local date), for "today" and the daily summary. */
 export function recordDay(s, dateKey, total, now) {
   const d = (s.days[dateKey] ||= { first: total, firstT: now, last: total, lastT: now });
   d.last = total; d.lastT = now;

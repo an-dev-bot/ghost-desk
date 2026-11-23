@@ -1,9 +1,9 @@
 {
   "name": "Ghost Desk",
   "short_name": "Ghost Desk",
-  "description": "Dinero falso, precios reales: memecoins, cripto, acciones de EE. UU. y divisas.",
-  "lang": "es",
-  "start_url": "./#inicio",
+  "description": "Fake money, real prices: memecoins, crypto, US stocks and forex.",
+  "lang": "en-US",
+  "start_url": "./#home",
   "scope": "./",
   "display": "standalone",
   "orientation": "portrait",

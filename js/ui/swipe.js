@@ -4,7 +4,7 @@ export function swipeHTML(side, label) {
   return `<div class="swipe ${side}" data-swipe>
     <div class="swipe-fill"></div>
     <span class="swipe-label">${label}</span>
-    <button type="button" class="swipe-thumb" aria-label="${label}. Desliza a la derecha o pulsa Enter para confirmar">
+    <button type="button" class="swipe-thumb" aria-label="${label}. Slide right or press Enter to confirm">
       <svg viewBox="0 0 24 24" width="24" height="24" aria-hidden="true"><path d="M5 12h12m-5-6 6 6-6 6" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
     </button>
   </div>`;

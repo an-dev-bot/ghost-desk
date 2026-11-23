@@ -18,7 +18,7 @@ export function drawChart(canvas, bars, { mode = "candles", dp, ivl = "1m", empt
 
   if (!bars || bars.length < 2) {
     g.fillStyle = muted; g.font = `12px ${mono}`; g.textAlign = "center";
-    wrapText(g, empty || "Esperando precios en vivo…", W / 2, H / 2 - 8, W - 32, 16);
+    wrapText(g, empty || "Waiting for live prices…", W / 2, H / 2 - 8, W - 32, 16);
     return;
   }
   const right = 62, bottom = 18, top = 10, left = 6;
@@ -85,8 +85,8 @@ function short(v, dp) {
 }
 function timeLabel(t, ivl) {
   const d = new Date(t);
-  if (ivl === "1d") return d.toLocaleDateString("es-MX", { day: "2-digit", month: "short" });
-  return d.toLocaleTimeString("es-MX", { hour: "2-digit", minute: "2-digit" });
+  if (ivl === "1d") return d.toLocaleDateString("en-US", { month: "short", day: "numeric" });
+  return d.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" });
 }
 function hexA(col, a) {
   const m = /^#([0-9a-f]{6})$/i.exec(col);

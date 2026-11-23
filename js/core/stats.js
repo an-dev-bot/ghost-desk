@@ -10,7 +10,7 @@ function prevDay(key) {
   return localDay(new Date(y, m - 1, d - 1, 12).getTime());
 }
 
-export const MARKET_LABEL = { meme: "Memecoins", crypto: "Cripto", stock: "Acciones", fx: "Divisas" };
+export const MARKET_LABEL = { meme: "Memecoins", crypto: "Crypto", stock: "Stocks", fx: "Forex" };
 
 /** Per market and overall: closed trades, win rate, total realized, best and worst trade. */
 export function scoreboard(trades) {
@@ -62,10 +62,16 @@ export function winStreak(trades) {
   return best;
 }
 
-const REASON = { manual: "manual", limit: "orden límite", open: "orden en espera (apertura)", sl: "stop loss", tp: "take profit" };
+const REASON = { manual: "manual", limit: "limit order", open: "waiting order (market open)", sl: "stop loss", tp: "take profit" };
+
+/** US format a spreadsheet reads as a date: 11/23/2026 4:05:09 PM (phone's local time). */
+export function usDateTime(ms) {
+  const d = new Date(ms), h = d.getHours();
+  return `${d.getMonth() + 1}/${d.getDate()}/${d.getFullYear()} ${h % 12 || 12}:${pad(d.getMinutes())}:${pad(d.getSeconds())} ${h < 12 ? "AM" : "PM"}`;
+}
 
 export function toCSV(trades) {
-  const head = ["fecha", "mercado", "simbolo", "nombre", "lado", "cantidad", "precio", "monto_usd", "comision_usd", "deslizamiento_usd", "resultado_usd", "resultado_pct", "motivo"];
+  const head = ["date", "market", "symbol", "name", "side", "quantity", "price", "amount_usd", "fee_usd", "slippage_usd", "pl_usd", "pl_pct", "reason"];
   const cell = v => {
     const s = v == null ? "" : String(v);
     return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
@@ -73,7 +79,7 @@ export function toCSV(trades) {
   // Token names come from the internet: never let a spreadsheet read them as formulas.
   const text = v => (/^[=+\-@\t\r]/.test(String(v ?? "")) ? "'" : "") + (v ?? "");
   const rows = trades.map(t => [
-    new Date(t.t).toISOString(), MARKET_LABEL[t.m] || t.m, text(t.sym), text(t.name), t.side === "buy" ? "compra" : "venta",
+    usDateTime(t.t), MARKET_LABEL[t.m] || t.m, text(t.sym), text(t.name), t.side === "buy" ? "buy" : "sell",
     +t.qty.toPrecision(10), +t.px.toPrecision(10), t.usd.toFixed(2), (t.fee || 0).toFixed(4), (t.slip || 0).toFixed(4),
     t.side === "sell" ? t.pl.toFixed(2) : "", t.side === "sell" ? (t.plPct * 100).toFixed(2) : "", REASON[t.reason] || t.reason,
   ].map(cell).join(","));

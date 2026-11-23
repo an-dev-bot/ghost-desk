@@ -23,17 +23,17 @@ function isNum(n) { return typeof n === "number" && isFinite(n); }
 
 export function parseBackup(text) {
   let d;
-  try { d = JSON.parse(text); } catch { throw new BackupError("El archivo no es un respaldo de Ghost Desk (no se pudo leer)."); }
-  if (!d || d.app !== BACKUP_APP || d.format !== 1) throw new BackupError("El archivo no es un respaldo de Ghost Desk.");
+  try { d = JSON.parse(text); } catch { throw new BackupError("That file is not a Ghost Desk backup (it could not be read)."); }
+  if (!d || d.app !== BACKUP_APP || d.format !== 1) throw new BackupError("That file is not a Ghost Desk backup.");
   const p = d.portfolio;
-  if (!p || !isNum(p.cash) || !isNum(p.start) || typeof p.pos !== "object" || !Array.isArray(p.orders) || !Array.isArray(p.trades)) {
-    throw new BackupError("El respaldo está incompleto o dañado.");
+  if (!p || !isNum(p.cash) || !isNum(p.start) || !(p.start > 0) || typeof p.pos !== "object" || !Array.isArray(p.orders) || !Array.isArray(p.trades)) {
+    throw new BackupError("The backup is incomplete or damaged.");
   }
   for (const k in p.pos) {
     const x = p.pos[k];
-    if (!x?.inst?.m || !isNum(x.qty) || !isNum(x.cost)) throw new BackupError("Una posición del respaldo está dañada.");
+    if (!x?.inst?.m || !isNum(x.qty) || !isNum(x.cost)) throw new BackupError("A position in the backup is damaged.");
   }
-  for (const t of p.trades) if (!isNum(t.t) || !isNum(t.usd) || !t.m) throw new BackupError("Una operación del respaldo está dañada.");
+  for (const t of p.trades) if (!isNum(t.t) || !isNum(t.usd) || !t.m) throw new BackupError("A trade in the backup is damaged.");
   p.days ||= {};
   p.seq = Math.max(p.seq || 0, ...p.trades.map(t => t.id || 0), ...p.orders.map(o => o.id || 0));
   return { portfolio: p, achievements: d.achievements || null, settings: publicSettings(d.settings) };

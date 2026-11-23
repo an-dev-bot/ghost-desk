@@ -38,10 +38,10 @@ export function createTwelve({ getKey, budgetStore, cache, onError }) {
 
   async function fetchSeries(symbol, ivl, now) {
     const key = getKey();
-    if (!key) throw new SourceError("twelvedata", "nokey", "Falta la clave de Twelve Data");
+    if (!key) throw new SourceError("twelvedata", "nokey", "Twelve Data key missing");
     const b = await loadBudget(now);
-    if (b.dayOut || b.used >= DAILY_CAP) throw new SourceError("twelvedata", "limit", "Se acabaron las velas de hoy", 429, "day");
-    if (lim.free() <= 0) throw new SourceError("twelvedata", "limit", "Espera un minuto para más velas", 429, "minute");
+    if (b.dayOut || b.used >= DAILY_CAP) throw new SourceError("twelvedata", "limit", "Out of candles for today", 429, "day");
+    if (lim.free() <= 0) throw new SourceError("twelvedata", "limit", "Wait a minute for more candles", 429, "minute");
     await lim.take();
     await spend(now);
     const qs = new URLSearchParams({ symbol, interval: IVL[ivl], outputsize: "300", timezone: "UTC", order: "ASC" });
@@ -52,13 +52,13 @@ export function createTwelve({ getKey, budgetStore, cache, onError }) {
     if (d?.status === "error") {
       const msg = String(d.message || "");
       let err;
-      if (d.code === 401) err = new SourceError("twelvedata", "auth", "Twelve Data rechazó la clave", 401);
+      if (d.code === 401) err = new SourceError("twelvedata", "auth", "Twelve Data rejected the key", 401);
       else if (d.code === 429) {
         const day = /day|daily/i.test(msg);
         if (day) { b.dayOut = true; await budgetStore.set("td.budget", b); }
-        err = new SourceError("twelvedata", "limit", day ? "Se acabaron las velas de hoy" : "Espera un minuto para más velas", 429, day ? "day" : "minute");
-      } else if (d.code === 403) err = new SourceError("twelvedata", "premium", "Ese símbolo no viene en el plan gratis", 403);
-      else err = new SourceError("twelvedata", "notfound", "Sin velas para ese símbolo", d.code || 400);
+        err = new SourceError("twelvedata", "limit", day ? "Out of candles for today" : "Wait a minute for more candles", 429, day ? "day" : "minute");
+      } else if (d.code === 403) err = new SourceError("twelvedata", "premium", "That symbol is not in the free plan", 403);
+      else err = new SourceError("twelvedata", "notfound", "No candles for that symbol", d.code || 400);
       onError?.(err);
       throw err;
     }

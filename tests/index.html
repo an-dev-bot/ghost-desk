@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="es">
+<html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -10,7 +10,7 @@
 </style>
 </head>
 <body>
-<h1>Ghost Desk · pruebas de la especificación</h1>
+<h1>Ghost Desk · spec tests</h1>
 <div id="summary">corriendo…</div>
 <pre id="results"></pre>
 <script>
@@ -18,7 +18,7 @@
   const show = m => { document.getElementById("summary").innerHTML += '<div class="fail">' + String(m).replace(/</g, "&lt;") + "</div>"; };
   addEventListener("error", e => show("Error: " + e.message + " @ " + e.filename + ":" + e.lineno));
   addEventListener("unhandledrejection", e => show("Promesa rechazada: " + (e.reason?.stack || e.reason)));
-  import("./tests.js").catch(e => { show("No cargó: " + (e?.stack || e)); document.title = "DONE error"; });
+  import("./tests.js").catch(e => { show("Failed to load: " + (e?.stack || e)); document.title = "DONE error"; });
 </script>
 </body>
 </html>

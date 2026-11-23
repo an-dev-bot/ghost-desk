@@ -4,25 +4,25 @@
 import { greenStreak, winStreak } from "./stats.js";
 
 export const ACHIEVEMENTS = [
-  { id: "first_trade", icon: "🎯", name: "Primer disparo", desc: "Haz tu primera operación." },
-  { id: "first_win", icon: "💚", name: "Primera ganancia", desc: "Cierra una operación en verde." },
-  { id: "trades_10", icon: "🔟", name: "10 operaciones", desc: "Llega a 10 operaciones." },
-  { id: "trades_50", icon: "⚡", name: "50 operaciones", desc: "Llega a 50 operaciones." },
-  { id: "trades_100", icon: "💯", name: "100 operaciones", desc: "Llega a 100 operaciones." },
-  { id: "win_50", icon: "🚀", name: "+50% en una", desc: "Gana 50% o más en una sola operación." },
-  { id: "win_100", icon: "🌕", name: "La duplicaste", desc: "Gana 100% o más en una sola operación." },
-  { id: "survivor", icon: "🛡️", name: "Sobreviviste a la caída", desc: "Aguanta una caída de 30% en una posición y ciérrala en verde." },
-  { id: "four_markets", icon: "🌎", name: "Los 4 mercados", desc: "Opera memecoins, cripto, acciones y divisas." },
-  { id: "streak_3", icon: "🔥", name: "Racha de 3", desc: "Cierra 3 días seguidos en verde." },
-  { id: "streak_7", icon: "🏆", name: "Semana en verde", desc: "Cierra 7 días seguidos en verde." },
-  { id: "wins_5", icon: "🎰", name: "5 ganadoras seguidas", desc: "Cierra 5 operaciones seguidas con ganancia." },
-  { id: "sniper", icon: "🔭", name: "Francotirador", desc: "Compra una memecoin en sus primeros 10 minutos de vida." },
-  { id: "limit_fill", icon: "⏳", name: "Paciencia", desc: "Que se llene una orden límite." },
-  { id: "stop_loss", icon: "🧊", name: "Sangre fría", desc: "Que tu stop loss te saque a tiempo." },
-  { id: "take_profit", icon: "💰", name: "A cobrar", desc: "Que se active tu take profit." },
-  { id: "opening_bell", icon: "🔔", name: "Campanazo", desc: "Opera una acción en los primeros 5 minutos de Wall Street." },
-  { id: "profit_1000", icon: "💵", name: "+$1,000", desc: "Acumula $1,000 de ganancia realizada." },
-  { id: "value_15k", icon: "📈", name: "Cartera de $15,000", desc: "Haz crecer tu cartera a $15,000." },
+  { id: "first_trade", icon: "🎯", name: "First Shot", desc: "Make your first trade." },
+  { id: "first_win", icon: "💚", name: "First Win", desc: "Close a trade in the green." },
+  { id: "trades_10", icon: "🔟", name: "10 Trades", desc: "Reach 10 trades." },
+  { id: "trades_50", icon: "⚡", name: "50 Trades", desc: "Reach 50 trades." },
+  { id: "trades_100", icon: "💯", name: "100 Trades", desc: "Reach 100 trades." },
+  { id: "win_50", icon: "🚀", name: "+50% in One", desc: "Make 50% or more on a single trade." },
+  { id: "win_100", icon: "🌕", name: "Doubled It", desc: "Make 100% or more on a single trade." },
+  { id: "survivor", icon: "🛡️", name: "Survived the Dip", desc: "Hold through a 30% drop on a position and close it in the green." },
+  { id: "four_markets", icon: "🌎", name: "All 4 Markets", desc: "Trade memecoins, crypto, stocks and forex." },
+  { id: "streak_3", icon: "🔥", name: "3-Day Streak", desc: "Close 3 days in a row in the green." },
+  { id: "streak_7", icon: "🏆", name: "Green Week", desc: "Close 7 days in a row in the green." },
+  { id: "wins_5", icon: "🎰", name: "5 Wins in a Row", desc: "Close 5 trades in a row at a profit." },
+  { id: "sniper", icon: "🔭", name: "Sniper", desc: "Buy a memecoin in its first 10 minutes of life." },
+  { id: "limit_fill", icon: "⏳", name: "Patience", desc: "Get a limit order filled." },
+  { id: "stop_loss", icon: "🧊", name: "Cold Blood", desc: "Let your stop loss get you out in time." },
+  { id: "take_profit", icon: "💰", name: "Cash Out", desc: "Have your take profit trigger." },
+  { id: "opening_bell", icon: "🔔", name: "Opening Bell", desc: "Trade a stock in the first 5 minutes of Wall Street." },
+  { id: "profit_10", icon: "💵", name: "+10% Realized", desc: "Bank realized profit worth 10% of your starting balance." },
+  { id: "value_150", icon: "📈", name: "Portfolio +50%", desc: "Grow your portfolio to 1.5× your starting balance." },
 ];
 
 export function newAchievements() {
@@ -31,7 +31,7 @@ export function newAchievements() {
 
 /**
  * Update lifetime counters with new trades and return the achievements unlocked now.
- * ctx = {trades (current portfolio), total, now, stockOpenSince (ms or null)}
+ * ctx = {trades (current portfolio), total, start (starting balance), now, stockOpenSince (ms or null)}
  */
 export function evaluate(ach, newTrades, ctx) {
   const got = [];
@@ -63,8 +63,10 @@ export function evaluate(ach, newTrades, ctx) {
   if (streak >= 7) unlock("streak_7");
   if (winStreak(trades) >= 5) unlock("wins_5");
   const realized = trades.reduce((a, t) => a + (t.side === "sell" ? t.pl : 0), 0);
-  if (realized >= 1000) unlock("profit_1000");
-  if (ctx.total >= 15000) unlock("value_15k");
+  // Money goals scale with the starting balance the owner picked ($10K, $100K, $1M or her own).
+  const base = ctx.start > 0 ? ctx.start : 0;
+  if (base && realized >= base * 0.1) unlock("profit_10");
+  if (base && ctx.total >= base * 1.5) unlock("value_150");
   return got;
 }
 

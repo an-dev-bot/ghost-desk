@@ -2,7 +2,7 @@
 // It only caches the app's own files and the fonts. Price requests are never intercepted or stored,
 // so a URL that carries an API key (Finnhub) never ends up in any cache.
 
-const VERSION = "g1-2026-11-23a";
+const VERSION = "g1-2026-11-23b";
 const SHELL = [
   "./", "index.html", "manifest.webmanifest", "css/app.css",
   "js/app.js", "js/store.js",
@@ -47,7 +47,7 @@ async function appFile(e, req, nav) {
     return r;
   }).catch(() => null);
   if (hit) { e.waitUntil(net); return hit; }
-  return (await net) || new Response("Sin conexión", { status: 503, headers: { "Content-Type": "text/plain; charset=utf-8" } });
+  return (await net) || new Response("Offline", { status: 503, headers: { "Content-Type": "text/plain; charset=utf-8" } });
 }
 
 async function font(req) {

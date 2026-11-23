@@ -35,18 +35,18 @@ export const ymd = (y, mo, d) => `${y}-${pad(mo)}-${pad(d)}`;
 
 // NYSE full-day closures (published by NYSE).
 const HOLIDAYS = {
-  "2025-01-01": "Año Nuevo", "2025-01-09": "Día de duelo nacional", "2025-01-20": "Día de Martin Luther King",
-  "2025-02-17": "Día de los Presidentes", "2025-04-18": "Viernes Santo", "2025-05-26": "Memorial Day",
-  "2025-06-19": "Juneteenth", "2025-07-04": "Día de la Independencia", "2025-09-01": "Día del Trabajo",
-  "2025-11-27": "Acción de Gracias", "2025-12-25": "Navidad",
-  "2026-01-01": "Año Nuevo", "2026-01-19": "Día de Martin Luther King", "2026-02-16": "Día de los Presidentes",
-  "2026-04-03": "Viernes Santo", "2026-05-25": "Memorial Day", "2026-06-19": "Juneteenth",
-  "2026-07-03": "Día de la Independencia", "2026-09-07": "Día del Trabajo", "2026-11-26": "Acción de Gracias",
-  "2026-12-25": "Navidad",
-  "2027-01-01": "Año Nuevo", "2027-01-18": "Día de Martin Luther King", "2027-02-15": "Día de los Presidentes",
-  "2027-03-26": "Viernes Santo", "2027-05-31": "Memorial Day", "2027-06-18": "Juneteenth",
-  "2027-07-05": "Día de la Independencia", "2027-09-06": "Día del Trabajo", "2027-11-25": "Acción de Gracias",
-  "2027-12-24": "Navidad",
+  "2025-01-01": "New Year's Day", "2025-01-09": "National Day of Mourning", "2025-01-20": "Martin Luther King Jr. Day",
+  "2025-02-17": "Presidents' Day", "2025-04-18": "Good Friday", "2025-05-26": "Memorial Day",
+  "2025-06-19": "Juneteenth", "2025-07-04": "Independence Day", "2025-09-01": "Labor Day",
+  "2025-11-27": "Thanksgiving", "2025-12-25": "Christmas",
+  "2026-01-01": "New Year's Day", "2026-01-19": "Martin Luther King Jr. Day", "2026-02-16": "Presidents' Day",
+  "2026-04-03": "Good Friday", "2026-05-25": "Memorial Day", "2026-06-19": "Juneteenth",
+  "2026-07-03": "Independence Day", "2026-09-07": "Labor Day", "2026-11-26": "Thanksgiving",
+  "2026-12-25": "Christmas",
+  "2027-01-01": "New Year's Day", "2027-01-18": "Martin Luther King Jr. Day", "2027-02-15": "Presidents' Day",
+  "2027-03-26": "Good Friday", "2027-05-31": "Memorial Day", "2027-06-18": "Juneteenth",
+  "2027-07-05": "Independence Day", "2027-09-06": "Labor Day", "2027-11-25": "Thanksgiving",
+  "2027-12-24": "Christmas",
 };
 // Early closes (13:00 New York).
 const EARLY = { "2025-07-03": 13, "2025-11-28": 13, "2025-12-24": 13, "2026-11-27": 13, "2026-12-24": 13, "2027-11-26": 13 };
@@ -55,7 +55,7 @@ const EARLY = { "2025-07-03": 13, "2025-11-28": 13, "2025-12-24": 13, "2026-11-2
 export function addHolidays(rows) {
   for (const r of rows || []) {
     if (!r?.atDate || !/^\d{4}-\d{2}-\d{2}$/.test(r.atDate)) continue;
-    if (!r.tradingHour) { HOLIDAYS[r.atDate] ??= r.eventName || "Feriado"; continue; }
+    if (!r.tradingHour) { HOLIDAYS[r.atDate] ??= r.eventName || "Holiday"; continue; }
     const m = /-(\d{1,2}):(\d{2})$/.exec(r.tradingHour); // e.g. "09:30-13:00"
     if (m && +m[1] < 16) EARLY[r.atDate] = +m[1] + +m[2] / 60;
   }

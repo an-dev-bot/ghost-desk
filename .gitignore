@@ -3,6 +3,7 @@ ESPEC_G1_GHOST_DESK.md
 
 # Test output and Python cache
 capturas/
+screenshots/
 __pycache__/
 *.pyc
 

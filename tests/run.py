@@ -8,6 +8,7 @@
 
 Extra modes against the real price sources (4th argument):
   live     the real app with no keys: memecoins, crypto and FX must show live prices
+  offline  installs the app, stops its server and the network: portfolio and history still open
   badkeys  wrong Finnhub / Twelve Data keys: clear notices, nothing blank, nothing cached
   tddemo   Twelve Data's public "demo" key: real EUR/USD candles, saved and reused without a credit
 """
@@ -62,7 +63,7 @@ class Page:
             except Exception:
                 pass
             await asyncio.sleep(0.25)
-        raise TimeoutError("la página no terminó de cargar: " + url)
+        raise TimeoutError("page did not finish loading: " + url)
 
     async def shot(self, name):
         r = await self.send("Page.captureScreenshot", format="png")
@@ -128,7 +129,7 @@ LAYOUT_SETUP = r"""
   const memes = [['MEMEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA','SUPERLONGNAMECOIN','Super Long Name Coin With Many Words',0.00002167,48.2],['MEMEBBBBB','GHOST','Ghost',0.0123,-22.5]]
     .map(([id,s,n,px,ch], k) => { const i = { key:'meme:'+id, m:'meme', id, sym:s, name:n, pair:'P'+k, born: now - (k ? 3 : 900) * 60e3 }; add(i, { px, ch24: ch, ch1h: ch/3, ch5m: 1.1, ch6h: ch/2, liq: 254000, mc: 2.1e6, vol: 8.9e5 }); return i; });
   g.lists.crypto.push(...crypto.map(i => i.key)); g.lists.stock.push(...stocks.map(i => i.key));
-  g.lists.meme.trending.push(...memes.map(i => i.key)); g.lists.meme.nuevas.push(...memes.map(i => i.key));
+  g.lists.meme.trending.push(...memes.map(i => i.key)); g.lists.meme.new.push(...memes.map(i => i.key));
   const S = g.state();
   const q = i => ({ ...g.live.get(i.key), t: now });
   E.executeBuy(S, crypto[0], 2500, q(crypto[0]), now - 3600e3);
@@ -160,9 +161,9 @@ OVERFLOW = r"""
 async def layout_tests(p):
     await p.send("Emulation.setDeviceMetricsOverride", width=375, height=812, deviceScaleFactor=2, mobile=True)
     await p.send("Emulation.setTouchEmulationEnabled", enabled=True, maxTouchPoints=5)
-    await p.goto(BASE + "/index.html?test=1#inicio", "document.documentElement.dataset.ready === '1'")
+    await p.goto(BASE + "/index.html?test=1#home", "document.documentElement.dataset.ready === '1'")
     await p.js("indexedDB.deleteDatabase('ghost-desk-test'), true")
-    await p.goto(BASE + "/index.html?test=1&r=2#inicio", "document.documentElement.dataset.ready === '1'")
+    await p.goto(BASE + "/index.html?test=1&r=2#home", "document.documentElement.dataset.ready === '1'")
     await p.js(LAYOUT_SETUP)
     await asyncio.sleep(1.2)
     fails = []
@@ -170,20 +171,20 @@ async def layout_tests(p):
     async def check(name):
         r = await p.js(OVERFLOW)
         good = r["docW"] <= r["vw"] and not r["bad"]
-        print(("PASA " if good else "FALLA") + f" 6 · {name}: ancho {r['docW']}px de {r['vw']}px" + ("" if good else " → " + "; ".join(r["bad"])))
+        print(("PASS " if good else "FAIL ") + f" 6 · {name}: width {r['docW']}px of {r['vw']}px" + ("" if good else " → " + "; ".join(r["bad"])))
         if not good:
             fails.append(name)
         await p.shot(name.replace(" ", "-").lower())
 
-    for tab in ["inicio", "mercados", "cartera", "historial", "logros"]:
+    for tab in ["home", "markets", "portfolio", "history", "achievements"]:
         await p.js(f"ghostDesk.setTab('{tab}'), true")
         await asyncio.sleep(0.5)
-        await check("pestaña " + tab)
+        await check("tab " + tab)
     for m in ["meme", "stock", "fx"]:
-        await p.js(f"ghostDesk.setTab('mercados'), document.querySelector('.seg.mk [data-market=\"{m}\"]').click(), true")
+        await p.js(f"ghostDesk.setTab('markets'), document.querySelector('.seg.mk [data-market=\"{m}\"]').click(), true")
         await asyncio.sleep(0.4)
-        await check("mercados " + m)
-    for key, name in [("crypto:BTCUSDT", "hoja btc"), ("meme:MEMEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", "hoja memecoin"), ("fx:USDJPY", "hoja usdjpy"), ("stock:AAPL", "hoja aapl sin clave")]:
+        await check("markets " + m)
+    for key, name in [("crypto:BTCUSDT", "sheet btc"), ("meme:MEMEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", "sheet memecoin"), ("fx:USDJPY", "sheet usdjpy"), ("stock:AAPL", "sheet aapl no key")]:
         await p.js(f"ghostDesk.closeSheet(true), ghostDesk.openSheet('{key}'), true")
         await asyncio.sleep(0.7)
         await check(name)
@@ -192,22 +193,22 @@ async def layout_tests(p):
     await asyncio.sleep(0.6)
     b = await p.js("(() => { const r = s => { const x = document.querySelector(s).getBoundingClientRect(); return { w: x.width, h: x.height, top: x.top, bottom: x.bottom }; }; return { buy: r('[data-side=buy]'), sell: r('[data-side=sell]'), vh: innerHeight }; })()")
     thumb_ok = all(x["h"] >= 48 and x["w"] >= 140 and x["top"] >= b["vh"] * 0.75 for x in (b["buy"], b["sell"]))
-    print(("PASA " if thumb_ok else "FALLA") + f" 6 · Comprar y Vender: {round(b['buy']['w'])}×{round(b['buy']['h'])} px, abajo de la pantalla (y={round(b['buy']['top'])} de {b['vh']})")
+    print(("PASS " if thumb_ok else "FAIL ") + f" 6 · Buy and Sell: {round(b['buy']['w'])}×{round(b['buy']['h'])} px, at the bottom of the screen (y={round(b['buy']['top'])} of {b['vh']})")
     if not thumb_ok:
-        fails.append("botones")
-    # Buy through the real swipe gesture: tap Comprar, tap $500, slide the thumb.
+        fails.append("buttons")
+    # Buy through the real swipe gesture: tap Buy, tap $500, slide the thumb.
     before = await p.js("ghostDesk.state().trades.length")
     await p.js("ghostDesk.chooseSide('buy'), true")
     await asyncio.sleep(0.3)
     await p.js("document.querySelector('[data-amt=\"500\"]').click(), true")
     await asyncio.sleep(0.4)
-    await check("hoja comprar")
+    await check("sheet buy")
     sw = await p.js("(() => { const t = document.querySelector('.swipe-thumb').getBoundingClientRect(), b = document.querySelector('.swipe').getBoundingClientRect(); return { x: t.x + t.width / 2, y: t.y + t.height / 2, w: t.width, h: t.height, end: b.right - 10 }; })()")
     chips = await p.js("Math.min(...[...document.querySelectorAll('.chips.amt button')].map(b => b.getBoundingClientRect().height))")
     size_ok = sw["w"] >= 48 and sw["h"] >= 48 and chips >= 40
-    print(("PASA " if size_ok else "FALLA") + f" 6 · Botón de deslizar {round(sw['w'])}×{round(sw['h'])} px, montos de {round(chips)} px de alto")
+    print(("PASS " if size_ok else "FAIL ") + f" 6 · Slide button {round(sw['w'])}×{round(sw['h'])} px, amount chips {round(chips)} px tall")
     if not size_ok:
-        fails.append("deslizar")
+        fails.append("slide")
     await p.send("Input.dispatchMouseEvent", type="mousePressed", x=sw["x"], y=sw["y"], button="left", clickCount=1)
     for k in range(1, 13):
         await p.send("Input.dispatchMouseEvent", type="mouseMoved", x=sw["x"] + (sw["end"] - sw["x"]) * k / 12, y=sw["y"], button="left")
@@ -216,83 +217,137 @@ async def layout_tests(p):
     await asyncio.sleep(0.8)
     after = await p.js("ghostDesk.state().trades.slice(-1)[0]")
     bought = (await p.js("ghostDesk.state().trades.length")) == before + 1 and after["sym"] == "SOL" and abs(after["usd"] - 500) < 1e-9
-    print(("PASA " if bought else "FALLA") + f" 6 · Comprar $500 de SOL deslizando para confirmar")
+    print(("PASS " if bought else "FAIL ") + f" 6 · Buy $500 of SOL by sliding to confirm")
     if not bought:
-        fails.append("compra deslizando")
-    await p.shot("despues-de-comprar")
+        fails.append("slide buy")
+    await p.shot("after-buy")
     await asyncio.sleep(2.5)
     await p.js("ghostDesk.closeSheet(true), ghostDesk.openSettings(), true")
     await asyncio.sleep(0.5)
-    await check("ajustes")
+    await check("settings")
+    fails += await reset_tests(p, check)
     if p.events:
-        print("Errores en la consola:", *p.events[:10], sep="\n  ")
+        print("Console errors:", *p.events[:10], sep="\n  ")
     return not fails and not p.events
+
+
+async def reset_tests(p, check):
+    """Settings → Reset portfolio: pick $1,000,000 (two taps), then a custom $25,000. Achievements stay."""
+    fails = []
+    ach0 = await p.js("(async () => { const st = await import('./js/store.js'); return Object.keys((await st.kv.get('achievements'))?.unlocked || {}).length; })()")
+    trades0 = await p.js("ghostDesk.state().trades.length")
+    await p.js("document.querySelector('[data-start=\"1000000\"]').scrollIntoView(), document.querySelector('[data-start=\"1000000\"]').click(), true")
+    await asyncio.sleep(0.3)
+    label = await p.js("document.querySelector('[data-reset]').textContent")
+    await p.js("document.querySelector('[data-reset]').click(), true")
+    await asyncio.sleep(0.2)
+    s1 = await p.js("ghostDesk.state().start")
+    label2 = await p.js("document.querySelector('[data-reset]')?.textContent")
+    await check("settings reset")
+    await p.js("document.querySelector('[data-reset]').click(), true")
+    await asyncio.sleep(1.2)
+    st = await p.js("(() => { const s = ghostDesk.state(); return { start: s.start, cash: s.cash, trades: s.trades.length, pos: Object.keys(s.pos).length, orders: s.orders.length, total: document.getElementById('total').textContent, pl: document.getElementById('totalPl').textContent }; })()")
+    ach1 = await p.js("(async () => { const st = await import('./js/store.js'); return Object.keys((await st.kv.get('achievements'))?.unlocked || {}).length; })()")
+    ok1 = (label == "Reset to $1,000,000" and s1 != 1000000 and "Tap again" in (label2 or "") and st["start"] == 1000000 and st["cash"] == 1000000
+           and st["trades"] == 0 and st["pos"] == 0 and st["orders"] == 0 and st["total"] == "$1,000,000.00" and "from $1,000,000" in st["pl"] and ach1 == ach0 and ach0 > 0 and trades0 > 0)
+    print(("PASS " if ok1 else "FAIL ") + f" Reset to $1,000,000 with two taps: header {st['total']} / “{st['pl']}”, {st['trades']} trades, achievements kept {ach1}/{ach0}")
+    if not ok1:
+        fails.append("reset 1M")
+    await p.js("ghostDesk.setTab('home'), true")
+    await asyncio.sleep(0.4)
+    await check("home at 1M")
+    # Amount chips scale with the starting balance: 1M → $1K, $5K, $10K, $50K, $100K
+    await p.js("ghostDesk.openSheet('crypto:BTCUSDT'), ghostDesk.chooseSide('buy'), true")
+    await asyncio.sleep(0.4)
+    chips = await p.js("[...document.querySelectorAll('.chips.amt button')].map(b => b.textContent).join(' ')")
+    amt = await p.js("document.getElementById('amtIn').value")
+    ok_chips = chips == "$1K $5K $10K $50K $100K Max" and amt == "10000"
+    print(("PASS " if ok_chips else "FAIL ") + f" Buy amounts follow the start: {chips} (default {amt})")
+    if not ok_chips:
+        fails.append("chips")
+    await check("sheet buy at 1M")
+    # Custom amount
+    await p.js("ghostDesk.closeSheet(true), ghostDesk.openSettings(), true")
+    await asyncio.sleep(0.4)
+    await p.js("document.querySelector('[data-start=custom]').click(), true")
+    await asyncio.sleep(0.2)
+    bad = await p.js("(() => { const i = document.getElementById('startIn'); i.value = '50'; i.dispatchEvent(new Event('input', { bubbles: true })); const b = document.querySelector('[data-reset]'); return { dis: b.disabled, txt: b.textContent }; })()")
+    good = await p.js("(() => { const i = document.getElementById('startIn'); i.value = '25000'; i.dispatchEvent(new Event('input', { bubbles: true })); const b = document.querySelector('[data-reset]'); return { dis: b.disabled, txt: b.textContent }; })()")
+    await check("settings custom start")
+    await p.js("document.querySelector('[data-reset]').click(), document.querySelector('[data-reset]').click(), true")
+    await asyncio.sleep(1)
+    s2 = await p.js("(() => { const s = ghostDesk.state(); return { start: s.start, cash: s.cash, total: document.getElementById('total').textContent }; })()")
+    ok2 = bad["dis"] and good["txt"] == "Reset to $25,000" and not good["dis"] and s2["start"] == 25000 and s2["cash"] == 25000 and s2["total"] == "$25,000.00"
+    print(("PASS " if ok2 else "FAIL ") + f" Custom start: $50 refused ({bad['txt']}), $25,000 accepted → {s2['total']}")
+    if not ok2:
+        fails.append("custom start")
+    return fails
 
 
 async def live_check(p):
     """Real app, real sources (no keys): every keyless market must show live prices in the browser."""
     await p.send("Emulation.setDeviceMetricsOverride", width=375, height=812, deviceScaleFactor=2, mobile=True)
-    await p.goto(BASE + "/index.html#inicio", "!!document.querySelector('#view .cd-card')")
+    await p.goto(BASE + "/index.html#home", "!!document.querySelector('#view .cd-card')")
     await asyncio.sleep(25)
     count = "(m => [...document.querySelectorAll('[data-p^=\"' + m + ':\"]')].filter(e => /[0-9]/.test(e.textContent)).length)"
     got = {m: await p.js(f"{count}('{m}')") for m in ["meme", "crypto", "fx"]}
-    print("Precios en vivo en Inicio:", got)
-    print("Avisos:", await p.js("document.getElementById('banners').innerText || '(ninguno)'"))
-    print("Estado:", await p.js("document.getElementById('liveDot').innerText"), "| teletipo:", (await p.js("document.getElementById('tape').innerText"))[:120].replace(chr(10), " "))
-    await p.shot("vivo-inicio")
+    print("Live prices on Home:", got)
+    print("Notices:", await p.js("document.getElementById('banners').innerText || '(none)'"))
+    print("Status:", await p.js("document.getElementById('liveDot').innerText"), "| ticker:", (await p.js("document.getElementById('tape').innerText"))[:120].replace(chr(10), " "))
+    await p.shot("live-home")
     ok = all(v >= 2 for v in got.values())
     for key, name in [("crypto:BTCUSDT", "btc"), ("fx:EURUSD", "eurusd")]:
         await p.js(f"(() => {{ const b = document.createElement('button'); b.dataset.open = '{key}'; b.hidden = true; document.body.append(b); b.click(); b.remove(); return true; }})()")
         await asyncio.sleep(6)
         note = await p.js("document.getElementById('chartNote')?.textContent")
         px = await p.js("document.querySelector('.sh-body .big')?.textContent")
-        print(f"Hoja {name}: precio {px} | gráfica: {note}")
-        await p.shot("vivo-hoja-" + name)
+        print(f"Sheet {name}: price {px} | chart: {note}")
+        await p.shot("live-sheet-" + name)
         await p.js("document.querySelector('[data-close]').click(), true")
         await asyncio.sleep(0.5)
-    await p.js("document.querySelector('[data-tab=mercados]').click(), true")
+    await p.js("document.querySelector('[data-tab=markets]').click(), true")
     await p.js("document.querySelector('.seg.mk [data-market=meme]').click(), true")
     await asyncio.sleep(8)
     first = await p.js("document.querySelector('#view .row')?.dataset.open")
-    print("Primera memecoin en Trending:", first)
+    print("First memecoin in Trending:", first)
     if first:
         await p.js(f"document.querySelector('#view .row').click(), true")
         await asyncio.sleep(6)
-        print("Hoja memecoin: precio", await p.js("document.querySelector('.sh-body .big')?.textContent"), "| gráfica:", await p.js("document.getElementById('chartNote')?.textContent"))
-        await p.shot("vivo-hoja-meme")
+        print("Sheet memecoin: price", await p.js("document.querySelector('.sh-body .big')?.textContent"), "| chart:", await p.js("document.getElementById('chartNote')?.textContent"))
+        await p.shot("live-sheet-meme")
         await p.js("document.querySelector('[data-close]').click(), true")
     await p.js("document.querySelector('.seg.mk [data-market=stock]').click(), true")
     await asyncio.sleep(1)
-    print("Acciones sin clave:", (await p.js("document.querySelector('.nokey')?.innerText || 'NO HAY AVISO'")).replace(chr(10), " "))
+    print("Stocks with no key:", (await p.js("document.querySelector('.nokey')?.innerText || 'NO NOTICE'")).replace(chr(10), " "))
     cached = await p.js("(async () => { const out = []; for (const k of await caches.keys()) for (const r of await (await caches.open(k)).keys()) out.push(new URL(r.url).host + new URL(r.url).pathname); return out; })()")
     hosts = sorted({c.split("/")[0] for c in cached})
-    print(f"Service worker: {len(cached)} archivos en caché, de {hosts}")
+    print(f"Service worker: {len(cached)} files cached, from {hosts}")
     if p.events:
-        print("Consola:", *p.events[:10], sep=chr(10) + "  ")
+        print("Console:", *p.events[:10], sep=chr(10) + "  ")
     return ok and bool(first)
 
 
 async def twelve_demo_check(p):
     """Twelve Data's public 'demo' key (EUR/USD only): real candles via the header, then served from the phone."""
     await p.send("Emulation.setDeviceMetricsOverride", width=375, height=812, deviceScaleFactor=2, mobile=True)
-    await p.goto(BASE + "/index.html#inicio", "!!document.querySelector('#view .cd-card')")
+    await p.goto(BASE + "/index.html#home", "!!document.querySelector('#view .cd-card')")
     await p.js("(async () => { const st = await import('./js/store.js'); await st.openStore(); const s = (await st.kv.get('settings')) || {}; await st.kv.set('settings', { ...s, twelveKey: 'demo', ivl: '1h' }); await st.candles.clear(); return true; })()")
-    await p.goto(BASE + "/index.html?r=2#inicio", "!!document.querySelector('#view .cd-card')")
+    await p.goto(BASE + "/index.html?r=2#home", "!!document.querySelector('#view .cd-card')")
     await asyncio.sleep(4)
     notes = []
     for k in range(2):
         await p.js("(() => { const b = document.createElement('button'); b.dataset.open = 'fx:EURUSD'; document.body.append(b); b.click(); b.remove(); return true; })()")
         await asyncio.sleep(7)
         notes.append(await p.js("document.getElementById('chartNote')?.textContent"))
-        print(f"EURUSD 1h, vez {k + 1}:", notes[-1])
+        print(f"EURUSD 1h, time {k + 1}:", notes[-1])
         await p.shot(f"twelvedata-eurusd-{k + 1}")
         await p.js("document.querySelector('[data-close]').click(), true")
         await asyncio.sleep(0.6)
     bars = await p.js("(async () => { const st = await import('./js/store.js'); const c = await st.candles.get('td:EUR/USD:1h'); return c ? { n: c.bars.length, last: new Date(c.bars.at(-1).t).toISOString(), close: c.bars.at(-1).c } : null; })()")
-    print("Velas guardadas en el teléfono:", bars)
+    print("Candles saved on the phone:", bars)
     await p.js("(async () => { const st = await import('./js/store.js'); const s = await st.kv.get('settings'); await st.kv.set('settings', { ...s, twelveKey: '' }); return true; })()")
-    ok = "Velas de Twelve Data" in (notes[0] or "") and "no gastaron crédito" in (notes[1] or "") and bars and bars["n"] > 50
-    print(("PASA " if ok else "FALLA") + " velas reales de Twelve Data, guardadas y reutilizadas")
+    ok = "Twelve Data candles" in (notes[0] or "") and "no credits used" in (notes[1] or "") and bars and bars["n"] > 50
+    print(("PASS " if ok else "FAIL ") + " real Twelve Data candles, saved and reused")
     return ok
 
 
@@ -304,7 +359,7 @@ async def offline_check(p):
     try:
         await asyncio.sleep(1)
         await p.send("Emulation.setDeviceMetricsOverride", width=375, height=812, deviceScaleFactor=2, mobile=True)
-        await p.goto(base + "/index.html#cartera", "!!document.querySelector('#view .stat-row')")
+        await p.goto(base + "/index.html#portfolio", "!!document.querySelector('#view .stat-row')")
         await p.js("""(async () => {
           const st = await import('./js/store.js'), E = await import('./js/core/engine.js');
           await st.openStore();
@@ -315,25 +370,25 @@ async def offline_check(p):
           await st.kv.set('portfolio', s);
           await navigator.serviceWorker.ready;
           return true; })()""")
-        await p.goto(base + "/index.html?r=1#cartera", "!!navigator.serviceWorker.controller && !!document.querySelector('#view .row')")
+        await p.goto(base + "/index.html?r=1#portfolio", "!!navigator.serviceWorker.controller && !!document.querySelector('#view .row')")
         await asyncio.sleep(2)
         srv.kill(); srv.wait()
         await p.send("Network.enable")
         await p.send("Network.emulateNetworkConditions", offline=True, latency=0, downloadThroughput=-1, uploadThroughput=-1)
-        await p.goto(base + "/index.html#cartera", "!!document.querySelector('#view .row')", timeout=20)
+        await p.goto(base + "/index.html#portfolio", "!!document.querySelector('#view .row')", timeout=20)
         await asyncio.sleep(2)
         pos = await p.js("document.querySelector('#view .row')?.innerText.replace(/\\n/g, ' ')")
         ban = await p.js("document.getElementById('banners').innerText")
         dot = await p.js("document.getElementById('liveDot').innerText")
-        await p.shot("sin-conexion-cartera")
-        await p.js("document.querySelector('[data-tab=historial]').click(), true")
+        await p.shot("offline-portfolio")
+        await p.js("document.querySelector('[data-tab=history]').click(), true")
         await asyncio.sleep(0.5)
         hist = await p.js("document.querySelectorAll('#view .tr').length")
-        await p.shot("sin-conexion-historial")
-        print(f"Sin servidor ni internet → posición: {pos} | indicador: {dot} | operaciones en historial: {hist}")
-        print("Aviso:", ban.replace(chr(10), " | "))
-        ok = "BTC" in (pos or "") and hist == 2 and "Sin conexión" in ban
-        print(("PASA " if ok else "FALLA") + " sin internet se ven cartera e historial")
+        await p.shot("offline-history")
+        print(f"No server, no internet → position: {pos} | indicator: {dot} | trades in history: {hist}")
+        print("Notice:", ban.replace(chr(10), " | "))
+        ok = "BTC" in (pos or "") and hist == 2 and "Offline" in ban
+        print(("PASS " if ok else "FAIL ") + " offline, portfolio and history still show")
         await p.send("Network.emulateNetworkConditions", offline=False, latency=0, downloadThroughput=-1, uploadThroughput=-1)
         return ok
     finally:
@@ -345,26 +400,26 @@ async def bad_keys_check(p):
     """Real Finnhub and Twelve Data answering a wrong key: the app must say so clearly, never go blank."""
     FAKE = "wrongkeyfortesting123"
     await p.send("Emulation.setDeviceMetricsOverride", width=375, height=812, deviceScaleFactor=2, mobile=True)
-    await p.goto(BASE + "/index.html#mercados", "!!document.querySelector('#view .seg')")
+    await p.goto(BASE + "/index.html#markets", "!!document.querySelector('#view .seg')")
     await p.js(f"(async () => {{ const st = await import('./js/store.js'); await st.openStore(); const s = (await st.kv.get('settings')) || {{}}; await st.kv.set('settings', {{ ...s, finnhubKey: '{FAKE}', twelveKey: '{FAKE}' }}); return true; }})()")
-    await p.goto(BASE + "/index.html?r=1#mercados", "!!document.querySelector('#view .seg')")
+    await p.goto(BASE + "/index.html?r=1#markets", "!!document.querySelector('#view .seg')")
     await p.js("document.querySelector('.seg.mk [data-market=stock]').click(), true")
     await asyncio.sleep(10)
     banners = await p.js("document.getElementById('banners').innerText")
-    print("Avisos con clave de Finnhub mala:", banners.replace(chr(10), " | ") or "(ninguno)")
+    print("Notices with a bad Finnhub key:", banners.replace(chr(10), " | ") or "(none)")
     view = await p.js("document.getElementById('view').innerText.trim().length")
-    await p.shot("clave-mala-acciones")
+    await p.shot("bad-key-stocks")
     await p.js("(() => { const b = document.createElement('button'); b.dataset.open = 'fx:EURUSD'; document.body.append(b); b.click(); b.remove(); return true; })()")
     await asyncio.sleep(6)
     note = await p.js("document.getElementById('chartNote')?.textContent")
-    print("Gráfica de EURUSD con clave de Twelve Data mala:", note)
+    print("EURUSD chart with a bad Twelve Data key:", note)
     banners2 = await p.js("document.getElementById('banners').innerText")
-    await p.shot("clave-mala-eurusd")
+    await p.shot("bad-key-eurusd")
     cached = await p.js("(async () => { const out = []; for (const k of await caches.keys()) for (const r of await (await caches.open(k)).keys()) out.push(r.url); return out; })()")
     leaked = [u for u in cached if FAKE in u or "finnhub" in u or "twelvedata" in u]
-    print(f"Caché del service worker: {len(cached)} entradas; con la clave o de fuentes de precios: {len(leaked)}")
-    ok = "Finnhub rechazó tu clave" in banners and view > 50 and "Twelve Data rechazó" in (note or "") and "Twelve Data rechazó tu clave" in banners2 and not leaked
-    print(("PASA " if ok else "FALLA") + " avisos claros con claves rechazadas")
+    print(f"Service worker cache: {len(cached)} entries; with the key or from price sources: {len(leaked)}")
+    ok = "Finnhub rejected your key" in banners and view > 50 and "Twelve Data rejected" in (note or "") and "Twelve Data rejected your key" in banners2 and not leaked
+    print(("PASS " if ok else "FAIL ") + " clear notices with rejected keys")
     await p.js(f"(async () => {{ const st = await import('./js/store.js'); const s = await st.kv.get('settings'); await st.kv.set('settings', {{ ...s, finnhubKey: '', twelveKey: '' }}); return true; }})()")
     return ok
 

@@ -1,4 +1,4 @@
-// Number, time and HTML helpers (Spanish UI, prices in dollars).
+// Number, time and HTML helpers (English UI, US formats, prices in dollars).
 
 export const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 
@@ -59,15 +59,16 @@ export function ago(ms, now = Date.now()) {
   if (m < 1) return Math.max(0, Math.round(m * 60)) + " s";
   if (m < 60) return Math.round(m) + " min";
   if (m < 1440) return Math.round(m / 60) + " h";
-  return Math.round(m / 1440) + " d";
+  const d = Math.round(m / 1440);
+  return d + (d === 1 ? " day" : " days");
 }
 
 export function dateTime(ms) {
-  return new Date(ms).toLocaleString("es-MX", { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" });
+  return new Date(ms).toLocaleString("en-US", { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
 }
 export function clock(ms) {
-  return new Date(ms).toLocaleTimeString("es-MX", { hour: "2-digit", minute: "2-digit" });
+  return new Date(ms).toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" });
 }
 export function weekdayTime(ms) {
-  return new Date(ms).toLocaleString("es-MX", { weekday: "short", hour: "2-digit", minute: "2-digit" });
+  return new Date(ms).toLocaleString("en-US", { weekday: "short", hour: "numeric", minute: "2-digit" });
 }

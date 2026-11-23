@@ -8,24 +8,27 @@
 // A position is {qty, cost, avg}: qty in units of the asset (base currency for fx), cost in USD
 // actually paid (fees included), avg the weighted execution price in the instrument's quote currency.
 
-export const START_CASH = 10000;
+export const START_CASH = 100000;
+// Starting balances offered when resetting; any other amount in [START_MIN, START_MAX] is allowed too.
+export const START_CHOICES = [10000, 100000, 1000000];
+export const START_MIN = 100, START_MAX = 1e9;
 export const MEME_FEE = 0.01;
 export const CRYPTO_FEE = 0.001;
 export const CRYPTO_SLIP = 0.0002;
 
 // Typical retail spreads (full spread, in price units of the pair).
 export const FX_PAIRS = [
-  { id: "EURUSD", base: "EUR", quote: "USD", spread: 0.0001, dp: 5, name: "Euro / Dólar" },
-  { id: "GBPUSD", base: "GBP", quote: "USD", spread: 0.00015, dp: 5, name: "Libra / Dólar" },
-  { id: "USDJPY", base: "USD", quote: "JPY", spread: 0.01, dp: 3, name: "Dólar / Yen" },
-  { id: "AUDUSD", base: "AUD", quote: "USD", spread: 0.00012, dp: 5, name: "Dólar australiano / Dólar" },
-  { id: "USDCAD", base: "USD", quote: "CAD", spread: 0.00018, dp: 5, name: "Dólar / Dólar canadiense" },
-  { id: "USDCHF", base: "USD", quote: "CHF", spread: 0.00015, dp: 5, name: "Dólar / Franco suizo" },
-  { id: "NZDUSD", base: "NZD", quote: "USD", spread: 0.00018, dp: 5, name: "Dólar neozelandés / Dólar" },
-  { id: "USDMXN", base: "USD", quote: "MXN", spread: 0.008, dp: 4, name: "Dólar / Peso mexicano" },
-  { id: "EURGBP", base: "EUR", quote: "GBP", spread: 0.00015, dp: 5, name: "Euro / Libra" },
-  { id: "EURJPY", base: "EUR", quote: "JPY", spread: 0.018, dp: 3, name: "Euro / Yen" },
-  { id: "GBPJPY", base: "GBP", quote: "JPY", spread: 0.025, dp: 3, name: "Libra / Yen" },
+  { id: "EURUSD", base: "EUR", quote: "USD", spread: 0.0001, dp: 5, name: "Euro / US Dollar" },
+  { id: "GBPUSD", base: "GBP", quote: "USD", spread: 0.00015, dp: 5, name: "British Pound / US Dollar" },
+  { id: "USDJPY", base: "USD", quote: "JPY", spread: 0.01, dp: 3, name: "US Dollar / Japanese Yen" },
+  { id: "AUDUSD", base: "AUD", quote: "USD", spread: 0.00012, dp: 5, name: "Australian Dollar / US Dollar" },
+  { id: "USDCAD", base: "USD", quote: "CAD", spread: 0.00018, dp: 5, name: "US Dollar / Canadian Dollar" },
+  { id: "USDCHF", base: "USD", quote: "CHF", spread: 0.00015, dp: 5, name: "US Dollar / Swiss Franc" },
+  { id: "NZDUSD", base: "NZD", quote: "USD", spread: 0.00018, dp: 5, name: "New Zealand Dollar / US Dollar" },
+  { id: "USDMXN", base: "USD", quote: "MXN", spread: 0.008, dp: 4, name: "US Dollar / Mexican Peso" },
+  { id: "EURGBP", base: "EUR", quote: "GBP", spread: 0.00015, dp: 5, name: "Euro / British Pound" },
+  { id: "EURJPY", base: "EUR", quote: "JPY", spread: 0.018, dp: 3, name: "Euro / Japanese Yen" },
+  { id: "GBPJPY", base: "GBP", quote: "JPY", spread: 0.025, dp: 3, name: "British Pound / Japanese Yen" },
 ];
 export const FX_BY_ID = Object.fromEntries(FX_PAIRS.map(p => [p.id, p]));
 

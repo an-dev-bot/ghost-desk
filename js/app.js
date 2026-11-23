@@ -1,12 +1,13 @@
 // Ghost Desk G1: fake money, real prices, four markets. Everything runs in the phone's browser.
 
-import { FX_BY_ID, quoteBuy, quoteSell, halfSpread, MEME_FEE, CRYPTO_FEE, CRYPTO_SLIP } from "./core/money.js";
+import { FX_BY_ID, quoteBuy, quoteSell, START_CASH, START_CHOICES, START_MIN, START_MAX } from "./core/money.js";
 import * as H from "./core/hours.js";
 import * as E from "./core/engine.js";
 import { scoreboard, greenStreak, localDay, toCSV, MARKET_LABEL, realizedByDay } from "./core/stats.js";
 import { ACHIEVEMENTS, newAchievements, evaluate, achievementById } from "./core/achievements.js";
 import { applyTick, ticksToBars } from "./core/candles.js";
 import { buildBackup, parseBackup, mergeAchievements } from "./core/backup.js";
+import { STYLES, STYLE_IDS, MAX_BOTS, newBot, botName, step as botStep, standing } from "./core/bots.js";
 import { openStore, kv, candles as candleStore, usingMemory } from "./store.js";
 import { SourceError } from "./sources/http.js";
 import * as dex from "./sources/dex.js";
@@ -24,23 +25,30 @@ const TEST = new URLSearchParams(location.search).get("test");
 const $ = s => document.querySelector(s);
 const $$ = s => [...document.querySelectorAll(s)];
 const MARKETS = ["meme", "crypto", "stock", "fx"];
+const TABS = ["home", "markets", "portfolio", "history", "achievements"];
 const FINNHUB_SIGNUP = "https://finnhub.io/register";
 const TWELVE_SIGNUP = "https://twelvedata.com/register";
+
+/** Default buy amount: 1% of the starting balance. Amount chips are fractions of it too. */
+const defaultBuy = start => Math.round(start * 0.01 * 100) / 100;
+const CHIP_FRACS = [0.001, 0.005, 0.01, 0.05, 0.1];
 
 const DEFAULT_CFG = {
   finnhubKey: "", twelveKey: "", sound: false,
   notif: { fills: true, moves: true, price: true, summary: true, streak: true }, moveTh: 5,
-  alerts: [], lastBuy: 100, chartMode: "candles", ivl: "5m", lastSummary: "", lastStreakDay: "",
+  alerts: [], lastBuy: defaultBuy(START_CASH), chartMode: "candles", ivl: "5m", lastSummary: "", lastStreakDay: "",
 };
 
 // ---------------------------------------------------------------- state
 let S, A, CFG;
+let BOTS = [];                // rival bots: [{id, style, name, pf (own portfolio), lastBuy, seed}]
+const bootAt = Date.now();    // bots never trade on a price produced before the app was opened
 const live = new Map();   // key → {inst, px, t, ch24, ch1h, liq, mc, vol, quoteUsd, dir, ...}
 const ticks = new Map();  // key → [{t, px}] recorded while the app is open
 const dirty = new Set();
-const lists = { meme: { trending: [], nuevas: [] }, memeAt: { trending: 0, nuevas: 0 }, crypto: [], stock: [], fx: fx.FX_INSTS.map(i => i.key), search: { meme: null, crypto: null, stock: null, fx: null } };
+const lists = { meme: { trending: [], new: [] }, memeAt: { trending: 0, new: 0 }, crypto: [], stock: [], fx: fx.FX_INSTS.map(i => i.key), search: { meme: null, crypto: null, stock: null, fx: null } };
 const src = {};           // source → {ok, err, errAt}
-const ui = { tab: "inicio", market: "crypto", memeView: "trending", hist: "all", histN: 100, sb: "all", sheet: null, query: { meme: "", crypto: "", stock: "", fx: "" }, searching: false };
+const ui = { tab: "home", market: "crypto", memeView: "trending", hist: "all", histN: 100, sb: "all", sheet: null, query: { meme: "", crypto: "", stock: "", fx: "" }, searching: false, resetStart: START_CASH, resetCustom: false };
 let chart = null, chartToken = null, fxRef = null, fhStatus = null, installPrompt = null;
 let cryptoNote = "";
 const moveSent = {};
@@ -56,7 +64,7 @@ const crypto = createCrypto({
       drawChartSoon();
     }
   },
-  onState: s => { if (s.mode === "coinbase") cryptoNote = "Binance no responde desde tu red: cripto usa Coinbase."; if (s.ws === "open") okSrc(crypto.mode); },
+  onState: s => { if (s.mode === "coinbase") cryptoNote = "Binance isn't reachable from your network: crypto is using Coinbase."; if (s.ws === "open") okSrc(crypto.mode); },
 });
 const fh = createFinnhub({
   getKey: () => CFG.finnhubKey,
@@ -125,6 +133,7 @@ function trackedKeys(m) {
   for (const k in S.pos) set.add(k);
   for (const o of S.orders) set.add(o.key);
   for (const a of CFG.alerts) set.add(a.key);
+  for (const b of BOTS) for (const k in b.pf.pos) set.add(k);
   if (ui.sheet?.kind === "inst") set.add(ui.sheet.key);
   return [...set].filter(k => !m || k.startsWith(m + ":"));
 }
@@ -153,18 +162,18 @@ function handleEvents(events) {
     const t = e.trade;
     if (e.type === "fill") {
       trades.push(t);
-      const kind = e.order.type === "limit" ? "Tu orden límite se llenó" : "Tu orden se llenó al abrir el mercado";
-      const body = `${t.side === "buy" ? "Compraste" : "Vendiste"} ${t.sym} a ${fmtPx(instOf(t.key), t.px)} · ${usd(t.usd)}${t.side === "sell" ? " · " + usd(t.pl, { sign: true }) : ""}`;
+      const kind = e.order.type === "limit" ? "Your limit order filled" : "Your order filled at the market open";
+      const body = `${t.side === "buy" ? "Bought" : "Sold"} ${t.sym} at ${fmtPx(instOf(t.key), t.px)} · ${usd(t.usd)}${t.side === "sell" ? " · " + usd(t.pl, { sign: true }) : ""}`;
       toast(kind + ": " + body, t.side === "sell" ? (t.pl >= 0 ? "up" : "down") : "");
       alertPhone("fills", kind, body, "fill-" + t.id);
     } else if (e.type === "sl" || e.type === "tp") {
       trades.push(t);
-      const kind = e.type === "sl" ? "Tu stop loss se activó" : "Tu take profit se activó";
-      const body = `Vendiste ${t.sym} a ${fmtPx(instOf(t.key), t.px)} · ${usd(t.pl, { sign: true })} (${pct(t.plPct * 100, 1)})`;
+      const kind = e.type === "sl" ? "Your stop loss triggered" : "Your take profit triggered";
+      const body = `Sold ${t.sym} at ${fmtPx(instOf(t.key), t.px)} · ${usd(t.pl, { sign: true })} (${pct(t.plPct * 100, 1)})`;
       toast(kind + ": " + body, t.pl >= 0 ? "up" : "down");
       alertPhone("fills", kind, body, "stop-" + t.id);
     } else if (e.type === "cancel") {
-      toast(`Se canceló tu orden de ${e.order.inst.sym}: ${e.reason}`, "down");
+      toast(`Your ${e.order.inst.sym} order was canceled: ${e.reason}`, "down");
     }
   }
   if (trades.length) {
@@ -177,10 +186,10 @@ function handleEvents(events) {
 function afterTrades(trades) {
   const tot = E.totals(S, quoteFor).total;
   const st = H.stockStatus(Date.now());
-  const got = evaluate(A, trades, { trades: S.trades, total: tot, now: Date.now(), stockOpenSince: st.open ? st.since : null });
+  const got = evaluate(A, trades, { trades: S.trades, total: tot, start: S.start, now: Date.now(), stockOpenSince: st.open ? st.since : null });
   for (const id of got) {
     const a = achievementById(id);
-    setTimeout(() => toast(`${a.icon} Logro: ${a.name}`, "gold"), 1400);
+    setTimeout(() => toast(`${a.icon} Achievement: ${a.name}`, "gold"), 1400);
   }
   if (got.length) saveAch();
   saveSoon(0);
@@ -198,7 +207,7 @@ function celebrate(t) {
     if (win) { confetti($("#confetti")); vibrate([25, 40, 25, 40, 60]); if (CFG.sound) sounds.win(); }
     else { shake($("#app")); vibrate(220); if (CFG.sound) sounds.loss(); }
   } else {
-    if (t.reason === "manual") toast(`Compraste ${usd(t.usd)} de ${t.sym}`, "up");
+    if (t.reason === "manual") toast(`Bought ${usd(t.usd)} of ${t.sym}`, "up");
     vibrate(20);
     if (CFG.sound) sounds.fill();
   }
@@ -218,10 +227,10 @@ function priceAlerts(k) {
   CFG.alerts = CFG.alerts.filter(a => !hit.includes(a));
   saveCfg();
   for (const a of hit) {
-    const text = `${L.inst.sym} tocó ${fmtPx(L.inst, a.price)}`;
+    const text = `${L.inst.sym} hit ${fmtPx(L.inst, a.price)}`;
     toast("🔔 " + text, "gold");
     if (CFG.sound) sounds.fill();
-    alertPhone("price", text, `Precio en vivo: ${fmtPx(L.inst, L.px)}`, "alert-" + a.id);
+    alertPhone("price", text, `Live price: ${fmtPx(L.inst, L.px)}`, "alert-" + a.id);
   }
   renderSheet();
 }
@@ -245,9 +254,9 @@ function moveAlert(k) {
   if (Date.now() - (moveSent[id] || 0) < 3600e3) return;
   moveSent[id] = Date.now();
   const L = live.get(k);
-  const text = `${L.inst.sym} ${ch > 0 ? "subió" : "bajó"} ${Math.abs(ch).toFixed(1)}% en 1 hora`;
+  const text = `${L.inst.sym} ${ch > 0 ? "rose" : "fell"} ${Math.abs(ch).toFixed(1)}% in 1 hour`;
   toast((ch > 0 ? "📈 " : "📉 ") + text, ch > 0 ? "up" : "down");
-  alertPhone("moves", text, `Ahora ${fmtPx(L.inst, L.px)}. Tienes una posición abierta.`, "move-" + k);
+  alertPhone("moves", text, `Now ${fmtPx(L.inst, L.px)}. You have an open position.`, "move-" + k);
 }
 
 function streakCheck() {
@@ -257,9 +266,9 @@ function streakCheck() {
   const n = greenStreak(S.trades, now);
   if (real > 0 && n >= 2) {
     CFG.lastStreakDay = today; saveCfg();
-    const text = `Llevas ${n} días en verde 🔥`;
+    const text = `${n} green days in a row 🔥`;
     setTimeout(() => toast(text, "gold"), 2600);
-    alertPhone("streak", text, "Sigue así: cierra hoy en verde otra vez mañana.", "streak");
+    alertPhone("streak", text, "Keep it going: close in the green again tomorrow.", "streak");
   }
 }
 
@@ -269,16 +278,17 @@ function dailySummary(now) {
   const sess = H.stockSessionFor(p.y, p.mo, p.d);
   const key = H.ymd(p.y, p.mo, p.d);
   if (!sess || now < sess.close || CFG.lastSummary === key) return;
-  if (now - sess.close > 8 * 3600e3) return; // too late to call it "al cierre"
+  if (now - sess.close > 8 * 3600e3) return; // too late to call it "at the close"
   CFG.lastSummary = key; saveCfg();
   const tot = E.totals(S, quoteFor).total;
   const day = S.days[localDay(now)];
   const todayTrades = S.trades.filter(t => localDay(t.t) === localDay(now));
   const real = todayTrades.reduce((a, t) => a + (t.side === "sell" ? t.pl : 0), 0);
-  const text = `Tu cartera vale ${usd(tot)}` + (day ? ` (${usd(tot - day.first, { sign: true })} desde las ${clock(day.firstT)})` : "") +
-    ` · ${todayTrades.length} operaciones hoy · realizado ${usd(real, { sign: true })}`;
-  toast("🔔 Cierre de Wall Street. " + text);
-  alertPhone("summary", "Resumen al cierre", text, "summary");
+  const n = todayTrades.length;
+  const text = `Your portfolio is worth ${usd(tot)}` + (day ? ` (${usd(tot - day.first, { sign: true })} since ${clock(day.firstT)})` : "") +
+    ` · ${n} ${n === 1 ? "trade" : "trades"} today · realized ${usd(real, { sign: true })}`;
+  toast("🔔 Wall Street closed. " + text);
+  alertPhone("summary", "Closing summary", text, "summary");
 }
 
 // ---------------------------------------------------------------- persistence
@@ -289,7 +299,7 @@ function saveSoon(ms = 400) {
 }
 async function flushSave() {
   clearTimeout(saveTimer);
-  try { await kv.set("portfolio", S); } catch (e) { console.warn("No se pudo guardar", e?.message); }
+  try { await kv.set("portfolio", S); } catch (e) { console.warn("Could not save", e?.message); }
 }
 const saveAch = () => kv.set("achievements", A).catch(() => {});
 const saveCfg = () => kv.set("settings", CFG).catch(() => {});
@@ -313,12 +323,16 @@ const kick = name => loops[name]?.run();
 
 async function memeLoop() {
   const need = new Set(trackedKeys("meme"));
-  const showing = ui.tab === "inicio" || (ui.tab === "mercados" && ui.market === "meme");
-  if (showing && !document.hidden) {
-    const view = ui.tab === "inicio" ? "trending" : ui.memeView;
-    if (!lists.meme[view].length || Date.now() - lists.memeAt[view] > 90e3) await loadMemeList(view);
-    else lists.meme[view].forEach(k => need.add(k));
-    (lists.search.meme || []).forEach(k => need.add(k));
+  const showing = ui.tab === "home" || (ui.tab === "markets" && ui.market === "meme");
+  if (!document.hidden) {
+    const views = new Set();
+    if (showing) views.add(ui.tab === "home" ? "trending" : ui.memeView);
+    if (BOTS.length) { views.add("trending"); views.add("new"); } // the bots look at memecoins too
+    for (const view of views) {
+      if (!lists.meme[view].length || Date.now() - lists.memeAt[view] > 90e3) await loadMemeList(view);
+      else lists.meme[view].forEach(k => need.add(k));
+    }
+    if (showing) (lists.search.meme || []).forEach(k => need.add(k));
   }
   const addrs = [...need].map(k => k.slice(5));
   if (!addrs.length) return;
@@ -335,14 +349,14 @@ async function loadMemeList(view) {
   lists.meme[view] = toks.map(t => t.key);
   lists.memeAt[view] = Date.now();
   toks.forEach(applyMeme);
-  if (ui.tab === "mercados" && ui.market === "meme" || ui.tab === "inicio") renderView();
+  if (ui.tab === "markets" && ui.market === "meme" || ui.tab === "home") renderView();
 }
 
 let cryptoTopAt = 0;
 async function cryptoLoop() {
   if (!lists.crypto.length || Date.now() - cryptoTopAt > 15 * 60e3) {
     const r = await crypto.top(30);
-    if (r.fromCG) okSrc("coingecko"); else noteError(new SourceError("coingecko", "http", "CoinGecko no respondió"));
+    if (r.fromCG) okSrc("coingecko"); else noteError(new SourceError("coingecko", "http", "CoinGecko did not answer"));
     lists.crypto = r.insts.map(i => i.key);
     r.insts.forEach(i => setLive(i, {}, { check: false }));
     cryptoTopAt = Date.now();
@@ -379,7 +393,7 @@ async function stockLoop() {
     } catch (e) { if (e.kind !== "premium") throw e; }
   }
   const open = H.stockStatus(now).open;
-  const listDue = now - stockListAt > (open ? 3 : 30) * 60e3 && (ui.tab === "inicio" || ui.tab === "mercados");
+  const listDue = now - stockListAt > (open ? 3 : 30) * 60e3 && (ui.tab === "home" || ui.tab === "markets" || BOTS.length > 0);
   const keys = new Set(trackedKeys("stock"));
   if (listDue) { lists.stock.forEach(k => keys.add(k)); stockListAt = now; }
   (lists.search.stock || []).slice(0, 8).forEach(k => { if (!live.get(k)?.px) keys.add(k); });
@@ -425,14 +439,131 @@ function startSources() {
   loop("meme", memeLoop, 10e3, 60e3);
   loop("stock", stockLoop, 60e3, 180e3);
   loop("clock", clockTick, 30e3, 60e3);
+  loop("bots", botTick, 15e3, 60e3);
 }
+
+// ---------------------------------------------------------------- rival bots
+const saveBots = () => kv.set("bots", { v: 1, list: BOTS }).catch(() => {});
+
+/** Every bot takes a turn with the live prices the app has right now. Only while the app is on screen. */
+function botTick(now = Date.now()) {
+  if (!BOTS.length || (document.hidden && !TEST)) return [];
+  const entries = [...live.values()].map(L => ({ ...L, inst: L.inst }));
+  const made = [];
+  for (const b of BOTS) {
+    const trades = botStep(b, { entries, now, status: m => mstatus(m, now), bootAt: TEST ? 0 : bootAt });
+    for (const t of trades) made.push([b, t]);
+  }
+  if (made.length) saveBots();
+  refreshStandings();
+  if (ui.sheet?.kind === "bot") renderSheet();
+  return made;
+}
+
+function refreshStandings() {
+  for (const id of ["lbSlot", "lbSlotFull"]) { const el = document.getElementById(id); if (el) el.innerHTML = leaderboardHTML(); }
+  const feed = $("#botFeed"); if (feed) feed.innerHTML = botFeedHTML();
+}
+
+function participants() {
+  const me = { id: "me", name: "You", ...standing(S, quoteFor) };
+  return [me, ...BOTS.map(b => ({ id: b.id, name: b.name, style: b.style, ...standing(b.pf, quoteFor) }))].sort((a, b) => b.plPct - a.plPct);
+}
+
+function leaderboardHTML() {
+  const medal = ["🥇", "🥈", "🥉"];
+  const tr = (label, t) => t ? `${label} <span class="${dirCls(t.pl)}">${usd(t.pl, { sign: true })}</span> ${esc(t.sym)}` : `${label} —`;
+  return `<div class="list">${participants().map((x, i) => `
+    <button class="row lb ${x.id === "me" ? "me" : ""}" ${x.id === "me" ? `data-tab="history"` : `data-bot="${esc(x.id)}"`}>
+      <span class="ico ico-rank" aria-label="Rank ${i + 1}">${medal[i] || i + 1}</span>
+      <span class="nm"><b>${esc(x.name)}${x.style ? ` <i class="mk-tag">${STYLES[x.style].name}</i>` : ""}</b><small>${tr("Best", x.best)}</small><small>${tr("Worst", x.worst)}</small></span>
+      <span class="px"><b>${usd(x.total)}</b><small class="${dirCls(x.pl)}">${pct(x.plPct * 100)}</small></span>
+    </button>`).join("")}</div>`;
+}
+
+function botFeedHTML() {
+  const recent = BOTS.flatMap(b => b.pf.trades.slice(-5).map(t => [b, t])).sort((a, b) => b[1].t - a[1].t).slice(0, 4);
+  if (!recent.length) return `<div class="empty sm">The bots trade only while the app is open. Their first moves show up here.</div>`;
+  return `<div class="list">${recent.map(([b, t]) => `<button class="feed" data-bot="${esc(b.id)}"><b>${esc(b.name)}</b> ${t.side === "buy" ? "bought" : "sold"} ${esc(t.sym)} · ${usd(t.usd)}${t.side === "sell" ? ` · <span class="${dirCls(t.pl)}">${usd(t.pl, { sign: true })}</span>` : ""} <small>${clock(t.t)}</small></button>`).join("")}</div>`;
+}
+
+function rivalsHome() {
+  if (!BOTS.length) return "";
+  return `<h2>Leaderboard</h2><div id="lbSlot">${leaderboardHTML()}</div><h2>Rival moves</h2><div id="botFeed">${botFeedHTML()}</div>`;
+}
+
+function addBot(style) {
+  if (BOTS.length >= MAX_BOTS || !STYLES[style]) return;
+  const now = Date.now();
+  const b = newBot(style, { id: "bot" + now.toString(36) + Math.floor(Math.random() * 1296).toString(36), name: botName(style, BOTS), start: S.start, now, seed: Math.floor(Math.random() * 2147483647) });
+  BOTS.push(b); saveBots();
+  toast(`🤖 ${b.name} joined with ${usd0(b.pf.start)}`, "up");
+  kick("meme"); kick("stock");
+}
+
+/** Bots restart with the owner's starting balance (same-size race). */
+function resetBots(start, now) {
+  BOTS = BOTS.map(b => ({ ...b, pf: E.newPortfolio(now, start), lastBuy: 0 }));
+  saveBots();
+}
+
+function botSheetHTML(b) {
+  const x = standing(b.pf, quoteFor);
+  const tr = t => t ? `<b class="${dirCls(t.pl)}">${usd(t.pl, { sign: true })}</b><small>${esc(t.sym)} · ${pct(t.plPct * 100, 1)}</small>` : "<b>—</b>";
+  const pos = Object.values(b.pf.pos).sort((a, c) => c.cost - a.cost).map(p => {
+    const v = E.positionView(p, quoteFor(p.key));
+    return `<button class="row" data-open="${esc(p.key)}">${icon(p.inst)}
+      <span class="nm"><b>${esc(p.inst.sym)} <i class="mk-tag">${MARKET_LABEL[p.inst.m]}</i></b><small>Invested ${usd(p.cost)}${v.live ? "" : " · last saved price"}</small></span>
+      <span class="px"><b>${usd(v.value)}</b><small class="${dirCls(v.pl)}">${usd(v.pl, { sign: true })} (${pct(v.plPct * 100, 1)})</small></span></button>`;
+  }).join("");
+  const hist = b.pf.trades.slice().reverse().slice(0, 200).map(t => tradeItem(t)).join("");
+  return `<div class="sh-head"><span class="ico ico-bot" aria-hidden="true">🤖</span><div class="sh-title"><h2>${esc(b.name)}</h2><small>${STYLES[b.style].name} · rival bot</small></div>
+      <button class="close" data-close aria-label="Close">✕</button></div>
+    <div class="sh-body">
+      <div class="big">${usd(x.total)}</div>
+      <div class="chg"><span class="${dirCls(x.pl)}">${usd(x.pl, { sign: true })} (${pct(x.plPct * 100)})</span> from ${usd0(b.pf.start)}</div>
+      <p class="foot">${esc(STYLES[b.style].desc)} It trades only while the app is open, with the same costs and market hours as you.</p>
+      <div class="sb-grid card">
+        <div><small>Cash</small><b>${usd(b.pf.cash)}</b></div>
+        <div><small>Win rate</small><b>${x.winRate == null ? "—" : Math.round(x.winRate * 100) + "%"}</b><small>${x.closed} closed</small></div>
+        <div><small>Best trade</small>${tr(x.best)}</div>
+        <div><small>Worst trade</small>${tr(x.worst)}</div>
+      </div>
+      <h3 class="sec">Positions (${Object.keys(b.pf.pos).length})</h3>
+      <div class="list">${pos || `<div class="empty sm">No open positions.</div>`}</div>
+      <h3 class="sec">History (${b.pf.trades.length})</h3>
+      <div class="list">${hist || `<div class="empty sm">No trades yet. It trades only while the app is open.</div>`}</div>
+    </div>`;
+}
+
+function openBot(id) {
+  if (!BOTS.some(b => b.id === id)) return;
+  const wasOpen = !!ui.sheet;
+  if (chart?.key?.startsWith("crypto:")) crypto.watchChart(null);
+  chart = null; chartToken = null;
+  ui.sheet = { kind: "bot", id };
+  if (!wasOpen) history.pushState({ sheet: 1 }, "");
+  $("#scrim").hidden = false; $("#sheet").hidden = false;
+  document.body.classList.add("noscroll");
+  renderSheet();
+}
+
+function botsSettingsHTML() {
+  const full = BOTS.length >= MAX_BOTS;
+  return `<h3>Rival bots</h3>
+      <p class="mut">Each bot gets its own portfolio, as big as yours (${usd0(S.start)}), and decides by itself what to buy, how much and when to sell, with your same costs and market hours. Bots trade only while the app is open: nothing is made up for the time it was closed.</p>
+      ${BOTS.map(b => { const x = standing(b.pf, quoteFor); return `<div class="bot-row"><span class="nm"><b>${esc(b.name)}</b><small>${STYLES[b.style].name} · ${usd(x.total)} · <span class="${dirCls(x.pl)}">${pct(x.plPct * 100)}</span></small></span><button class="btn ghost sm" data-delbot="${esc(b.id)}">Remove</button></div>`; }).join("")}
+      <p class="lbl">Add a bot${full ? ` (max ${MAX_BOTS})` : ""}</p>
+      <div class="bot-add">${STYLE_IDS.map(id => `<button class="bot-style" data-addbot="${id}" ${full ? "disabled" : ""}><b>+ ${STYLES[id].name}</b><small>${esc(STYLES[id].desc)}</small></button>`).join("")}</div>`;
+}
+function renderBotsBox() { const el = $("#botsBox"); if (el) el.innerHTML = botsSettingsHTML(); }
 
 function clockTick() {
   const now = Date.now();
   const tot = E.totals(S, quoteFor);
   E.recordDay(S, localDay(now), tot.total, now);
-  const got = evaluate(A, [], { trades: S.trades, total: tot.total, now, stockOpenSince: null });
-  for (const id of got) { const a = achievementById(id); toast(`${a.icon} Logro: ${a.name}`, "gold"); }
+  const got = evaluate(A, [], { trades: S.trades, total: tot.total, start: S.start, now, stockOpenSince: null });
+  for (const id of got) { const a = achievementById(id); toast(`${a.icon} Achievement: ${a.name}`, "gold"); }
   if (got.length) saveAch();
   dailySummary(now);
   saveSoon(1000);
@@ -457,7 +588,7 @@ function secondTick() {
     if (left <= 0 && !el.dataset.done) { el.dataset.done = 1; setTimeout(() => { renderView(); renderSheet(); }, 1200); }
   }
   for (const el of $$("[data-age]")) el.textContent = ago(+el.dataset.age, now);
-  if (ui.tab === "inicio") { updateLastChance(now); updateMovers(now); }
+  if (ui.tab === "home") { updateLastChance(now); updateMovers(now); }
   renderTape();
 }
 
@@ -467,16 +598,28 @@ function fmtPx(inst, px) {
   if (inst.m === "fx") return price(px, inst.dp ?? FX_BY_ID[inst.id]?.dp ?? 5);
   return price(px);
 }
+/** Whole dollars when there are no cents: $100,000 instead of $100,000.00. */
+const usd0 = n => usd(n).replace(/\.00$/, "");
+/** Short chip label: $100, $2.5K, $1M. */
+function chipLabel(n) {
+  if (n >= 1e6) return "$" + +(n / 1e6).toFixed(2) + "M";
+  if (n >= 1e3) return "$" + +(n / 1e3).toFixed(2) + "K";
+  return "$" + +n.toFixed(2);
+}
+function amountChips(start) {
+  return CHIP_FRACS.map(f => { const v = start * f; return v >= 10 ? +v.toPrecision(2) : Math.round(v * 100) / 100; }).filter(v => v > 0);
+}
 function icon(inst) {
   if (inst.img) return `<img class="ico" src="${esc(inst.img)}" alt="" loading="lazy" referrerpolicy="no-referrer">`;
   const t = inst.m === "fx" ? inst.base : (inst.sym || "?").slice(0, 4);
   return `<span class="ico ico-${inst.m}" aria-hidden="true">${esc(t)}</span>`;
 }
 const offline = () => navigator.onLine === false;
+const plural = (n, one, many) => `${n} ${n === 1 ? one : many}`;
 
 function chHTML(key) {
   const L = live.get(key);
-  if (offline()) return `<small class="flat">sin conexión</small>`;
+  if (offline()) return `<small class="flat">offline</small>`;
   const v = L?.ch24;
   return `<small data-c="${esc(key)}" class="${dirCls(v)}">${pct(v)}</small>`;
 }
@@ -507,12 +650,12 @@ function updateHeader() {
   const day = S.days[localDay(now)];
   const dd = day ? t.total - day.first : null;
   const tp = $("#totalPl");
-  tp.innerHTML = `<span class="${dirCls(t.pl)}">${usd(t.pl, { sign: true })} (${pct(t.plPct * 100)})</span> desde $10,000` +
-    (dd != null && Math.abs(dd) >= 0.01 ? ` · <span class="${dirCls(dd)}">${usd(dd, { sign: true })} hoy</span>` : "");
+  tp.innerHTML = `<span class="${dirCls(t.pl)}">${usd(t.pl, { sign: true })} (${pct(t.plPct * 100)})</span> from ${usd0(S.start)}` +
+    (dd != null && Math.abs(dd) >= 0.01 ? ` · <span class="${dirCls(dd)}">${usd(dd, { sign: true })} today</span>` : "");
   const ok = Object.values(src).some(s => s.ok && now - s.ok < 90e3);
   const dot = $("#liveDot");
   dot.className = "live " + (offline() ? "off" : ok ? "on" : "wait");
-  dot.textContent = offline() ? "Sin conexión" : ok ? "En vivo" : "Conectando";
+  dot.textContent = offline() ? "Offline" : ok ? "Live" : "Connecting";
 }
 
 function flash(el, dir) {
@@ -549,35 +692,35 @@ function renderTape(force) {
   const movers = [];
   for (let i = 0; i < 5; i++) for (const list of per) if (list[i]) movers.push(list[i]);
   const el = $("#tape");
-  if (!movers.length) { el.innerHTML = `<span class="tk mut">Esperando precios en vivo…</span>`; el.style.animationDuration = "0s"; return; }
+  if (!movers.length) { el.innerHTML = `<span class="tk mut">Waiting for live prices…</span>`; el.style.animationDuration = "0s"; return; }
   const one = movers.map(L => `<button class="tk" data-open="${esc(L.inst.key)}"><b>${esc(L.inst.sym)}</b> <span data-c="${esc(L.inst.key)}" class="${dirCls(L.ch24)}">${pct(L.ch24, 1)}</span></button>`).join("");
   el.innerHTML = `<div class="tape-run">${one}</div><div class="tape-run" aria-hidden="true">${one}</div>`;
   el.style.animationDuration = Math.max(20, movers.length * 3.2) + "s";
 }
 
-const SRC_NAME = { dexscreener: "DexScreener", geckoterminal: "GeckoTerminal", binance: "Binance", coinbase: "Coinbase", coingecko: "CoinGecko", finnhub: "Finnhub", twelvedata: "Twelve Data", "coinbase-fx": "Coinbase (divisas)" };
+const SRC_NAME = { dexscreener: "DexScreener", geckoterminal: "GeckoTerminal", binance: "Binance", coinbase: "Coinbase", coingecko: "CoinGecko", finnhub: "Finnhub", twelvedata: "Twelve Data", "coinbase-fx": "Coinbase (forex)" };
 function renderBanners() {
   const out = [];
   const now = Date.now();
-  if (offline()) out.push(["warn", "Sin conexión: ves tu cartera y tu historial con los últimos precios guardados. Las órdenes se revisan en cuanto vuelva el internet."]);
-  if (usingMemory()) out.push(["warn", "Este navegador no deja guardar datos en el teléfono (¿modo privado?). Exporta tu cartera en Ajustes antes de cerrar."]);
+  if (offline()) out.push(["warn", "Offline: you're seeing your portfolio and history with the last saved prices. Orders are checked as soon as the connection is back."]);
+  if (usingMemory()) out.push(["warn", "This browser won't let the app save data on the phone (private mode?). Export your portfolio in Settings before closing."]);
   const f = src.finnhub?.err;
   if (CFG.finnhubKey && f && !offline()) {
-    if (f.kind === "auth") out.push(["err", `Finnhub rechazó tu clave. Revísala en <button class="lnk" data-settings>Ajustes</button>. Las acciones usan el último precio guardado.`]);
-    else if (f.kind === "limit" && now - src.finnhub.errAt < 120e3) out.push(["warn", "Finnhub llegó a su límite de peticiones por minuto. Los precios de acciones siguen en cuanto se libere (menos de un minuto)."]);
+    if (f.kind === "auth") out.push(["err", `Finnhub rejected your key. Check it in <button class="lnk" data-settings>Settings</button>. Stocks are using the last saved price.`]);
+    else if (f.kind === "limit" && now - src.finnhub.errAt < 120e3) out.push(["warn", "Finnhub hit its per-minute request limit. Stock prices resume as soon as it frees up (under a minute)."]);
   }
   if (!CFG.finnhubKey && Object.values(S.pos).some(p => p.inst.m === "stock")) {
-    out.push(["warn", `Tienes acciones pero falta tu clave de Finnhub: su valor es el último precio guardado. <button class="lnk" data-settings>Poner clave</button>`]);
+    out.push(["warn", `You hold stocks but your Finnhub key is missing: they're valued at the last saved price. <button class="lnk" data-settings>Add key</button>`]);
   }
   const t = src.twelvedata?.err;
   if (CFG.twelveKey && t && !offline()) {
-    if (t.kind === "auth") out.push(["err", `Twelve Data rechazó tu clave. Revísala en <button class="lnk" data-settings>Ajustes</button>. Mientras, las gráficas usan precios en vivo.`]);
-    else if (t.kind === "limit" && t.body === "day") out.push(["warn", "Se acabaron las velas de hoy de Twelve Data (800 al día). Las gráficas de acciones y divisas usan precios en vivo hasta mañana."]);
+    if (t.kind === "auth") out.push(["err", `Twelve Data rejected your key. Check it in <button class="lnk" data-settings>Settings</button>. Meanwhile, charts use live prices.`]);
+    else if (t.kind === "limit" && t.body === "day") out.push(["warn", "Today's Twelve Data candles are used up (800 a day). Stock and forex charts use live prices until tomorrow."]);
   }
   if (!offline()) {
     for (const name of ["dexscreener", "binance", "coinbase", "coinbase-fx"]) {
       const s = src[name];
-      if (s?.err && now - s.errAt < 180e3 && (!s.ok || s.ok < s.errAt)) out.push(["warn", `No llegan precios de ${SRC_NAME[name]} (${esc(s.err.message.toLowerCase())}). Reintentando…`]);
+      if (s?.err && now - s.errAt < 180e3 && (!s.ok || s.ok < s.errAt)) out.push(["warn", `No prices coming from ${SRC_NAME[name]} (${esc(s.err.message.toLowerCase())}). Retrying…`]);
     }
   }
   if (cryptoNote) out.push(["info", cryptoNote]);
@@ -590,11 +733,11 @@ function renderView() {
   const scroll = window.scrollY;
   const focused = document.activeElement?.id;
   const selStart = document.activeElement?.selectionStart;
-  if (ui.tab === "inicio") v.innerHTML = viewInicio();
-  else if (ui.tab === "mercados") v.innerHTML = viewMercados();
-  else if (ui.tab === "cartera") v.innerHTML = viewCartera();
-  else if (ui.tab === "historial") v.innerHTML = viewHistorial();
-  else if (ui.tab === "logros") v.innerHTML = viewLogros();
+  if (ui.tab === "home") v.innerHTML = viewHome();
+  else if (ui.tab === "markets") v.innerHTML = viewMarkets();
+  else if (ui.tab === "portfolio") v.innerHTML = viewPortfolio();
+  else if (ui.tab === "history") v.innerHTML = viewHistory();
+  else if (ui.tab === "achievements") v.innerHTML = viewAchievements();
   if (focused) { const el = document.getElementById(focused); if (el) { el.focus(); try { el.setSelectionRange(selStart, selStart); } catch {} } }
   window.scrollTo(0, scroll);
   for (const b of $$("nav.tabs button")) b.setAttribute("aria-current", b.dataset.tab === ui.tab ? "page" : "false");
@@ -603,14 +746,14 @@ function renderView() {
 
 function marketCards(now) {
   const st = mstatus("stock", now), fs = mstatus("fx", now);
-  const reason = { pre: "Antes de la apertura", post: "Ya cerró por hoy", weekend: "Fin de semana", holiday: "Feriado" + (st.holiday ? ": " + st.holiday : "") };
+  const reason = { pre: "Before the open", post: "Closed for the day", weekend: "Weekend", holiday: "Holiday" + (st.holiday ? ": " + st.holiday : "") };
   const ws = st.open
-    ? `<div class="cd-card open"><small>Wall Street abierto${st.early ? " · cierre temprano" : ""}</small><span>Cierra en</span><b data-cd="${st.closesAt}">${countdown(st.closesAt - now)}</b></div>`
-    : `<div class="cd-card"><small>${esc(reason[st.reason] || "Cerrado")}</small><span>Wall Street abre en</span><b data-cd="${st.nextOpen}">${countdown(st.nextOpen - now)}</b><small>${esc(weekdayTime(st.nextOpen))} tu hora</small></div>`;
+    ? `<div class="cd-card open"><small>Wall Street open${st.early ? " · early close" : ""}</small><span>Closes in</span><b data-cd="${st.closesAt}">${countdown(st.closesAt - now)}</b></div>`
+    : `<div class="cd-card"><small>${esc(reason[st.reason] || "Closed")}</small><span>Wall Street opens in</span><b data-cd="${st.nextOpen}">${countdown(st.nextOpen - now)}</b><small>${esc(weekdayTime(st.nextOpen))} your time</small></div>`;
   const fxc = fs.open
-    ? `<div class="cd-card open"><small>Divisas abierto</small><span>Cierra el viernes en</span><b data-cd="${fs.closesAt}">${countdown(fs.closesAt - now)}</b></div>`
-    : `<div class="cd-card"><small>Divisas cerrado</small><span>Abre el domingo en</span><b data-cd="${fs.nextOpen}">${countdown(fs.nextOpen - now)}</b></div>`;
-  return `<div class="cd-row">${ws}${fxc}</div><div class="cd-strip"><span class="dot"></span>Cripto y memecoins: abiertos 24/7</div>`;
+    ? `<div class="cd-card open"><small>Forex open</small><span>Closes Friday in</span><b data-cd="${fs.closesAt}">${countdown(fs.closesAt - now)}</b></div>`
+    : `<div class="cd-card"><small>Forex closed</small><span>Opens Sunday in</span><b data-cd="${fs.nextOpen}">${countdown(fs.nextOpen - now)}</b></div>`;
+  return `<div class="cd-row">${ws}${fxc}</div><div class="cd-strip"><span class="dot"></span>Crypto and memecoins: open 24/7</div>`;
 }
 
 function lastChances(now) {
@@ -619,24 +762,24 @@ function lastChances(now) {
   const ord = m => S.orders.filter(o => o.inst.m === m).length;
   const pos = m => Object.values(S.pos).filter(p => p.inst.m === m).length;
   if (st.open && st.closesAt - now <= 15 * 60e3 && (ord("stock") || pos("stock"))) {
-    out.push({ title: "Wall Street cierra en", cd: st.closesAt, text: `${ord("stock")} órdenes abiertas · ${pos("stock")} posiciones en acciones` });
+    out.push({ title: "Wall Street closes in", cd: st.closesAt, text: `${plural(ord("stock"), "open order", "open orders")} · ${plural(pos("stock"), "stock position", "stock positions")}` });
   }
   if (fs.open && fs.closesAt - now <= 60 * 60e3 && (ord("fx") || pos("fx"))) {
-    out.push({ title: "Divisas cierra el fin de semana en", cd: fs.closesAt, text: `${ord("fx")} órdenes abiertas · ${pos("fx")} posiciones en divisas` });
+    out.push({ title: "Forex closes for the weekend in", cd: fs.closesAt, text: `${plural(ord("fx"), "open order", "open orders")} · ${plural(pos("fx"), "forex position", "forex positions")}` });
   }
   for (const o of S.orders) {
     if (o.type !== "limit") continue;
     const q = quoteFor(o.key);
     if (!q || !mstatus(o.inst.m, now).open) continue;
     const dist = Math.abs(q.px - o.limit) / o.limit;
-    if (dist <= 0.005) out.push({ title: `Tu orden límite de ${o.inst.sym} está a ${(dist * 100).toFixed(2)}% de llenarse`, text: `Precio ${fmtPx(o.inst, q.px)} · límite ${fmtPx(o.inst, o.limit)}`, key: o.key });
+    if (dist <= 0.005) out.push({ title: `Your ${o.inst.sym} limit order is ${(dist * 100).toFixed(2)}% from filling`, text: `Price ${fmtPx(o.inst, q.px)} · limit ${fmtPx(o.inst, o.limit)}`, key: o.key });
   }
   const seen = new Set();
-  for (const k of [...lists.meme.nuevas, ...lists.meme.trending]) {
+  for (const k of [...lists.meme.new, ...lists.meme.trending]) {
     const L = live.get(k);
     if (seen.has(k) || !L?.inst.born || now - L.inst.born > 15 * 60e3 || now < L.inst.born) continue;
     seen.add(k);
-    out.push({ title: `${L.inst.sym} es nueva`, text: `Nació hace <span data-age="${L.inst.born}">${ago(L.inst.born, now)}</span> · liquidez ${usd(L.liq, { compact: true })}`, key: k });
+    out.push({ title: `${L.inst.sym} is new`, text: `Born <span data-age="${L.inst.born}">${ago(L.inst.born, now)}</span> ago · liquidity ${usd(L.liq, { compact: true })}`, key: k });
     if (seen.size >= 3) break;
   }
   return out;
@@ -644,7 +787,7 @@ function lastChances(now) {
 function lastChanceHTML(now) {
   const lc = lastChances(now);
   if (!lc.length) return "";
-  return `<section class="lc"><h2>Última oportunidad</h2>${lc.map(x => `
+  return `<section class="lc"><h2>Last chance</h2>${lc.map(x => `
     <${x.key ? `button data-open="${esc(x.key)}"` : "div"} class="lc-card">
       <b>${esc(x.title)}${x.cd ? ` <span class="cd" data-cd="${x.cd}">${countdown(x.cd - now)}</span>` : ""}</b>
       <small>${x.text}</small>
@@ -661,23 +804,24 @@ function moversFor(m, n = 3) {
   return keys.map(k => live.get(k)).filter(L => L?.px > 0 && L.ch24 != null).sort((a, b) => Math.abs(b.ch24) - Math.abs(a.ch24)).slice(0, n).map(L => L.inst);
 }
 
-function viewInicio() {
+function viewHome() {
   const now = Date.now();
   lcSig = lastChances(now).map(x => x.title).join("|");
   const streak = greenStreak(S.trades, now);
   const unlocked = Object.keys(A.unlocked).length;
   const todayTrades = S.trades.filter(t => localDay(t.t) === localDay(now)).length;
-  const welcome = !S.trades.length ? `<div class="hello"><b>Tienes $10,000 de dinero falso.</b> Los precios son reales y en vivo. Elige un mercado, compra en dos toques y desliza para confirmar.</div>` : "";
-  const orders = S.orders.length ? `<section><h2>Órdenes esperando (${S.orders.length})</h2><div class="list">${S.orders.map(orderRow).join("")}</div></section>` : "";
+  const welcome = !S.trades.length ? `<div class="hello"><b>You have ${usd0(S.start)} in fake money.</b> Prices are real and live. Pick a market, buy in two taps and slide to confirm.</div>` : "";
+  const orders = S.orders.length ? `<section><h2>Waiting orders (${S.orders.length})</h2><div class="list">${S.orders.map(orderRow).join("")}</div></section>` : "";
   moversSig = moversSignature(); moversAt = now;
   return `${welcome}${marketCards(now)}<div id="lcSlot">${lastChanceHTML(now)}</div>
     <div class="stat-row">
-      <div><small>Racha en verde</small><b>${streak ? "🔥 " + streak + (streak === 1 ? " día" : " días") : "—"}</b></div>
-      <div><small>Operaciones hoy</small><b>${todayTrades}</b></div>
-      <div><small>Logros</small><b>${unlocked}/${ACHIEVEMENTS.length}</b></div>
+      <div><small>Green streak</small><b>${streak ? "🔥 " + plural(streak, "day", "days") : "—"}</b></div>
+      <div><small>Trades today</small><b>${todayTrades}</b></div>
+      <div><small>Achievements</small><b>${unlocked}/${ACHIEVEMENTS.length}</b></div>
     </div>
     ${orders}
-    <h2>Lo que más se mueve (24 h)</h2><div id="moversSlot">${moversHTML()}</div>`;
+    ${rivalsHome()}
+    <h2>Top movers (24h)</h2><div id="moversSlot">${moversHTML()}</div>`;
 }
 
 // The movers block refreshes itself when the instruments in it change (not on every tick).
@@ -688,8 +832,8 @@ function moversHTML() {
     if (m === "stock" && !CFG.finnhubKey) return `<section class="mv"><h3>${MARKET_LABEL[m]}</h3>${noKeyCard()}</section>`;
     if (m === "stock" && src.finnhub?.err?.kind === "auth") return `<section class="mv"><h3>${MARKET_LABEL[m]}</h3>${badKeyCard()}</section>`;
     const list = moversFor(m);
-    return `<section class="mv"><h3>${MARKET_LABEL[m]} <button class="lnk" data-market="${m}">ver todo</button></h3>
-      <div class="list">${list.length ? list.map(rowHTML).join("") : `<div class="empty sm">Cargando precios en vivo…</div>`}</div></section>`;
+    return `<section class="mv"><h3>${MARKET_LABEL[m]} <button class="lnk" data-market="${m}">see all</button></h3>
+      <div class="list">${list.length ? list.map(rowHTML).join("") : `<div class="empty sm">Loading live prices…</div>`}</div></section>`;
   }).join("");
 }
 function updateMovers(now) {
@@ -704,20 +848,20 @@ function updateMovers(now) {
 }
 
 function badKeyCard() {
-  return `<div class="nokey bad"><b>Finnhub rechazó tu clave</b>
-    <p>Revisa que la copiaste completa desde tu panel de <a href="https://finnhub.io/dashboard" target="_blank" rel="noopener">finnhub.io</a> y vuelve a pegarla en Ajustes.</p>
-    <button class="btn" data-settings>Ir a Ajustes</button></div>`;
+  return `<div class="nokey bad"><b>Finnhub rejected your key</b>
+    <p>Make sure you copied all of it from your <a href="https://finnhub.io/dashboard" target="_blank" rel="noopener">finnhub.io</a> dashboard and paste it again in Settings.</p>
+    <button class="btn" data-settings>Go to Settings</button></div>`;
 }
 function noKeyCard() {
-  return `<div class="nokey"><b>Pon tu clave de Finnhub en Ajustes</b>
-    <p>Las acciones necesitan una clave gratis de Finnhub. Créala en <a href="${FINNHUB_SIGNUP}" target="_blank" rel="noopener">finnhub.io/register</a> y pégala en Ajustes; se guarda solo en este teléfono.</p>
-    <button class="btn" data-settings>Ir a Ajustes</button></div>`;
+  return `<div class="nokey"><b>Add your Finnhub key in Settings</b>
+    <p>Stocks need a free Finnhub key. Create one at <a href="${FINNHUB_SIGNUP}" target="_blank" rel="noopener">finnhub.io/register</a> and paste it in Settings; it's saved only on this phone.</p>
+    <button class="btn" data-settings>Go to Settings</button></div>`;
 }
 
-function viewMercados() {
+function viewMarkets() {
   const m = ui.market;
   const seg = MARKETS.map(x => `<button data-market="${x}" aria-pressed="${x === m}">${MARKET_LABEL[x]}</button>`).join("");
-  const ph = { meme: "Nombre, símbolo o dirección de Solana", crypto: "Símbolo: BTC, PEPE…", stock: "Símbolo o nombre: AAPL, Nvidia…", fx: "Par: EUR, MXN, JPY…" }[m];
+  const ph = { meme: "Name, symbol or Solana address", crypto: "Symbol: BTC, PEPE…", stock: "Symbol or name: AAPL, Nvidia…", fx: "Pair: EUR, MXN, JPY…" }[m];
   let body;
   if (m === "stock" && !CFG.finnhubKey) body = noKeyCard();
   else if (m === "stock" && src.finnhub?.err?.kind === "auth") body = badKeyCard();
@@ -726,76 +870,80 @@ function viewMercados() {
     let keys, head = "";
     if (res) {
       keys = res;
-      head = `<div class="res-head">Resultados para «${esc(ui.query[m])}» <button class="lnk" data-clear>Quitar búsqueda</button></div>`;
+      head = `<div class="res-head">Results for “${esc(ui.query[m])}” <button class="lnk" data-clear>Clear search</button></div>`;
     } else if (m === "meme") keys = lists.meme[ui.memeView];
     else keys = lists[m];
-    const sub = m === "meme" && !res ? `<div class="seg sub">${["trending", "nuevas"].map(v => `<button data-memeview="${v}" aria-pressed="${ui.memeView === v}">${v === "trending" ? "Trending" : "Nuevas"}</button>`).join("")}</div>` : "";
+    const sub = m === "meme" && !res ? `<div class="seg sub">${["trending", "new"].map(v => `<button data-memeview="${v}" aria-pressed="${ui.memeView === v}">${v === "trending" ? "Trending" : "New"}</button>`).join("")}</div>` : "";
     const rows = keys.map(k => live.get(k)?.inst || instOf(k)).filter(Boolean).map(rowHTML).join("");
-    body = sub + head + `<div class="list">${rows || `<div class="empty">${ui.searching ? "Buscando…" : res ? "Sin resultados." : "Cargando precios en vivo…"}</div>`}</div>`;
+    body = sub + head + `<div class="list">${rows || `<div class="empty">${ui.searching ? "Searching…" : res ? "No results." : "Loading live prices…"}</div>`}</div>`;
   }
   const foot = {
-    meme: `Precios de DexScreener (Solana) cada 10 s, velas de GeckoTerminal. Comisión 1% + impacto según la liquidez.`,
-    crypto: `Las 30 más grandes por capitalización (CoinGecko, sin stablecoins). Precios en vivo de ${crypto.mode === "coinbase" ? "Coinbase" : "Binance"}. Comisión 0.1% + 0.02% de deslizamiento.`,
-    stock: `Precios en tiempo real de Finnhub. Comisión $0; pagas la mitad del diferencial (máx. de $0.01 o 0.01%). Solo se opera de 9:30 a 16:00 de Nueva York.`,
-    fx: `Tasa media de Coinbase (cambia cada 30–60 s). Comisión $0; pagas el diferencial típico de cada par. Abierto de domingo 17:00 a viernes 17:00 de Nueva York.`,
+    meme: `Prices from DexScreener (Solana) every 10 s, candles from GeckoTerminal. 1% fee + price impact based on liquidity.`,
+    crypto: `The 30 largest by market cap (CoinGecko, no stablecoins). Live prices from ${crypto.mode === "coinbase" ? "Coinbase" : "Binance"}. 0.1% fee + 0.02% slippage.`,
+    stock: `Real-time prices from Finnhub. $0 commission; you pay half the spread (the greater of $0.01 or 0.01%). Trades only 9:30 AM to 4:00 PM New York time.`,
+    fx: `Coinbase mid rate (updates every 30–60 s). $0 commission; you pay each pair's typical spread. Open Sunday 5:00 PM to Friday 5:00 PM New York time.`,
   }[m];
   return `<div class="seg mk">${seg}</div>
-    <form class="search" data-search><input id="q-${m}" type="search" enterkeyhint="search" autocomplete="off" placeholder="${ph}" value="${esc(ui.query[m])}" aria-label="Buscar en ${MARKET_LABEL[m]}"><button class="btn">Buscar</button></form>
+    <form class="search" data-search><input id="q-${m}" type="search" enterkeyhint="search" autocomplete="off" placeholder="${ph}" value="${esc(ui.query[m])}" aria-label="Search ${MARKET_LABEL[m]}"><button class="btn">Search</button></form>
     ${body}<p class="foot">${foot}</p>`;
 }
 
 function orderRow(o) {
-  const what = o.side === "buy" ? `Comprar ${usd(o.amount)}` : `Vender ${Math.round(o.frac * 100)}%`;
-  const how = o.type === "limit" ? `si toca ${fmtPx(o.inst, o.limit)}` : `al abrir el mercado`;
+  const what = o.side === "buy" ? `Buy ${usd(o.amount)}` : `Sell ${Math.round(o.frac * 100)}%`;
+  const how = o.type === "limit" ? `if it hits ${fmtPx(o.inst, o.limit)}` : `at the market open`;
   return `<div class="ord"><button class="ord-main" data-open="${esc(o.key)}">${icon(o.inst)}<span class="nm"><b>${esc(o.inst.sym)}</b><small>${what} ${how}</small></span></button>
-    <button class="x" data-cancel="${o.id}" aria-label="Cancelar orden">Cancelar</button></div>`;
+    <button class="x" data-cancel="${o.id}" aria-label="Cancel order">Cancel</button></div>`;
 }
 
-function viewCartera() {
+function viewPortfolio() {
   const t = E.totals(S, quoteFor);
   const pos = Object.values(S.pos).sort((a, b) => b.cost - a.cost);
   const rows = pos.map(p => {
     const v = E.positionView(p, quoteFor(p.key));
     const badges = [p.sl ? `SL ${fmtPx(p.inst, p.sl)}` : "", p.tp ? `TP ${fmtPx(p.inst, p.tp)}` : ""].filter(Boolean).join(" · ");
     return `<button class="row" data-open="${esc(p.key)}">${icon(p.inst)}
-      <span class="nm"><b>${esc(p.inst.sym)} <i class="mk-tag">${MARKET_LABEL[p.inst.m]}</i></b><small>Invertiste ${usd(p.cost)}${badges ? " · " + badges : ""}${v.live ? "" : " · último precio guardado"}</small></span>
+      <span class="nm"><b>${esc(p.inst.sym)} <i class="mk-tag">${MARKET_LABEL[p.inst.m]}</i></b><small>Invested ${usd(p.cost)}${badges ? " · " + badges : ""}${v.live ? "" : " · last saved price"}</small></span>
       <span class="px"><b data-v="${esc(p.key)}">${usd(v.value)}</b><small data-pl="${esc(p.key)}" class="${dirCls(v.pl)}">${usd(v.pl, { sign: true })} (${pct(v.plPct * 100, 1)})</small></span></button>`;
   }).join("");
   return `<div class="stat-row">
-      <div><small>Efectivo</small><b>${usd(t.cash)}</b></div>
-      <div><small>Disponible</small><b>${usd(t.cash - t.reserved)}</b></div>
-      <div><small>Invertido</small><b>${usd(t.held)}</b></div>
+      <div><small>Cash</small><b>${usd(t.cash)}</b></div>
+      <div><small>Available</small><b>${usd(t.cash - t.reserved)}</b></div>
+      <div><small>Invested</small><b>${usd(t.held)}</b></div>
     </div>
-    <h2>Posiciones (${pos.length})</h2>
-    <div class="list">${rows || `<div class="empty">No tienes posiciones abiertas. Ve a Mercados, abre algo y compra.</div>`}</div>
-    <h2>Órdenes esperando (${S.orders.length})</h2>
-    <div class="list">${S.orders.map(orderRow).join("") || `<div class="empty sm">Sin órdenes límite ni órdenes esperando la apertura.</div>`}</div>
-    <p class="foot">Para pasar esta cartera a otro equipo usa Exportar e Importar en <button class="lnk" data-settings>Ajustes</button>.</p>`;
+    <h2>Positions (${pos.length})</h2>
+    <div class="list">${rows || `<div class="empty">No open positions. Go to Markets, open something and buy.</div>`}</div>
+    <h2>Waiting orders (${S.orders.length})</h2>
+    <div class="list">${S.orders.map(orderRow).join("") || `<div class="empty sm">No limit orders or orders waiting for the open.</div>`}</div>
+    <p class="foot">To move this portfolio to another device, use Export and Import in <button class="lnk" data-settings>Settings</button>.</p>`;
 }
 
-const REASON = { manual: "", limit: "orden límite", open: "al abrir", sl: "stop loss", tp: "take profit" };
-function viewHistorial() {
+const REASON = { manual: "", limit: "limit order", open: "at the open", sl: "stop loss", tp: "take profit", bot: "" };
+function tradeItem(t) {
+  const why = t.why ? esc(t.why) : REASON[t.reason] || "";
+  return `<div class="tr">
+      <span class="side ${t.side}">${t.side === "buy" ? "Buy" : "Sell"}</span>
+      <span class="nm"><b>${esc(t.sym)}</b><small>${qty(t.qty)} at ${fmtPx(instOf(t.key) || { m: t.m, id: t.key.split(":")[1] }, t.px)}</small><small>${dateTime(t.t)}${why ? " · " + why : ""}</small></span>
+      <span class="px"><b>${usd(t.usd)}</b>${t.side === "sell" ? `<small class="${dirCls(t.pl)}">${usd(t.pl, { sign: true })} (${pct(t.plPct * 100, 1)})</small>` : `<small class="flat">costs ${usd((t.fee || 0) + (t.slip || 0))}</small>`}</span>
+    </div>`;
+}
+function viewHistory() {
   const f = ui.hist;
   const trades = S.trades.filter(t => f === "all" || t.m === f).slice().reverse();
   const sb = scoreboard(S.trades.filter(t => f === "all" || t.m === f)).all;
-  const chips = ["all", ...MARKETS].map(m => `<button data-hist="${m}" aria-pressed="${f === m}">${m === "all" ? "Todos" : MARKET_LABEL[m]}</button>`).join("");
-  const items = trades.slice(0, ui.histN).map(t => `<div class="tr">
-      <span class="side ${t.side}">${t.side === "buy" ? "Compra" : "Venta"}</span>
-      <span class="nm"><b>${esc(t.sym)}</b><small>${qty(t.qty)} a ${fmtPx(instOf(t.key) || { m: t.m, id: t.key.split(":")[1] }, t.px)}</small><small>${dateTime(t.t)}${REASON[t.reason] ? " · " + REASON[t.reason] : ""}</small></span>
-      <span class="px"><b>${usd(t.usd)}</b>${t.side === "sell" ? `<small class="${dirCls(t.pl)}">${usd(t.pl, { sign: true })} (${pct(t.plPct * 100, 1)})</small>` : `<small class="flat">costos ${usd((t.fee || 0) + (t.slip || 0))}</small>`}</span>
-    </div>`).join("");
+  const chips = ["all", ...MARKETS].map(m => `<button data-hist="${m}" aria-pressed="${f === m}">${m === "all" ? "All" : MARKET_LABEL[m]}</button>`).join("");
+  const items = trades.slice(0, ui.histN).map(tradeItem).join("");
   return `<div class="seg chips">${chips}</div>
     <div class="stat-row">
-      <div><small>Operaciones</small><b>${trades.length}</b></div>
-      <div><small>% ganadoras</small><b>${sb.winRate == null ? "—" : Math.round(sb.winRate * 100) + "%"}</b></div>
-      <div><small>Ganancia realizada</small><b class="${dirCls(sb.total)}">${usd(sb.total, { sign: true })}</b></div>
+      <div><small>Trades</small><b>${trades.length}</b></div>
+      <div><small>Win rate</small><b>${sb.winRate == null ? "—" : Math.round(sb.winRate * 100) + "%"}</b></div>
+      <div><small>Realized P&amp;L</small><b class="${dirCls(sb.total)}">${usd(sb.total, { sign: true })}</b></div>
     </div>
-    <div class="list">${items || `<div class="empty">Aquí se guarda cada compra y venta.</div>`}</div>
-    ${trades.length > ui.histN ? `<button class="btn ghost wide" data-more>Mostrar más</button>` : ""}
-    <button class="btn wide" data-csv ${trades.length ? "" : "disabled"}>Exportar a CSV${f === "all" ? "" : " (" + MARKET_LABEL[f] + ")"}</button>`;
+    <div class="list">${items || `<div class="empty">Every buy and sell is saved here.</div>`}</div>
+    ${trades.length > ui.histN ? `<button class="btn ghost wide" data-more>Show more</button>` : ""}
+    <button class="btn wide" data-csv ${trades.length ? "" : "disabled"}>Export to CSV${f === "all" ? "" : " (" + MARKET_LABEL[f] + ")"}</button>`;
 }
 
-function viewLogros() {
+function viewAchievements() {
   const now = Date.now();
   const streak = greenStreak(S.trades, now);
   const sb = scoreboard(S.trades);
@@ -803,21 +951,22 @@ function viewLogros() {
   const card = (label, b) => `<div class="sb">
       <h3>${label}</h3>
       <div class="sb-grid">
-        <div><small>Ganancia total</small><b class="${dirCls(b.total)}">${usd(b.total, { sign: true })}</b></div>
-        <div><small>% ganadoras</small><b>${b.winRate == null ? "—" : Math.round(b.winRate * 100) + "%"}</b><small>${b.n} cerradas</small></div>
-        <div><small>Mejor</small>${tr(b.best)}</div>
-        <div><small>Peor</small>${tr(b.worst)}</div>
+        <div><small>Total P&amp;L</small><b class="${dirCls(b.total)}">${usd(b.total, { sign: true })}</b></div>
+        <div><small>Win rate</small><b>${b.winRate == null ? "—" : Math.round(b.winRate * 100) + "%"}</b><small>${b.n} closed</small></div>
+        <div><small>Best</small>${tr(b.best)}</div>
+        <div><small>Worst</small>${tr(b.worst)}</div>
       </div></div>`;
   const grid = ACHIEVEMENTS.map(a => {
     const got = A.unlocked[a.id];
-    return `<div class="ach ${got ? "got" : ""}"><span class="ach-i" aria-hidden="true">${a.icon}</span><b>${esc(a.name)}</b><small>${got ? "Desbloqueado " + dateTime(got) : esc(a.desc)}</small></div>`;
+    return `<div class="ach ${got ? "got" : ""}"><span class="ach-i" aria-hidden="true">${a.icon}</span><b>${esc(a.name)}</b><small>${got ? "Unlocked " + dateTime(got) : esc(a.desc)}</small></div>`;
   }).join("");
-  return `<div class="streak"><span>🔥</span><div><b>${streak} ${streak === 1 ? "día" : "días"} en verde</b><small>Días seguidos cerrando operaciones con ganancia neta.</small></div></div>
-    <h2>Marcadores</h2>
-    <div class="seg chips">${["all", ...MARKETS].map(m => `<button data-sb="${m}" aria-pressed="${ui.sb === m}">${m === "all" ? "Todo" : MARKET_LABEL[m]}</button>`).join("")}</div>
-    ${card(ui.sb === "all" ? "Todos los mercados" : MARKET_LABEL[ui.sb], sb[ui.sb])}
-    <h2>Logros (${Object.keys(A.unlocked).length}/${ACHIEVEMENTS.length})</h2>
-    <p class="foot">Los logros se guardan aparte: siguen aunque reinicies la cartera.</p>
+  const rivals = `<h2>Leaderboard</h2>${BOTS.length ? `<div id="lbSlotFull">${leaderboardHTML()}</div>` : `<div class="empty sm">No rivals yet. <button class="lnk" data-settings>Add a bot in Settings</button> to race against it: Momentum, Contrarian, Degen or Random.</div>`}`;
+  return `${rivals}<div class="streak"><span>🔥</span><div><b>${plural(streak, "green day", "green days")}</b><small>Days in a row closing trades with a net profit.</small></div></div>
+    <h2>Scoreboards</h2>
+    <div class="seg chips">${["all", ...MARKETS].map(m => `<button data-sb="${m}" aria-pressed="${ui.sb === m}">${m === "all" ? "All" : MARKET_LABEL[m]}</button>`).join("")}</div>
+    ${card(ui.sb === "all" ? "All markets" : MARKET_LABEL[ui.sb], sb[ui.sb])}
+    <h2>Achievements (${Object.keys(A.unlocked).length}/${ACHIEVEMENTS.length})</h2>
+    <p class="foot">Achievements are kept separately: they stay even if you reset your portfolio. Money goals are measured against your starting balance.</p>
     <div class="ach-grid">${grid}</div>`;
 }
 
@@ -841,6 +990,7 @@ function openSheet(key) {
 function openSettings() {
   const wasOpen = !!ui.sheet;
   ui.sheet = { kind: "settings" };
+  ui.resetStart = S.start; ui.resetCustom = !START_CHOICES.includes(S.start);
   if (!wasOpen) history.pushState({ sheet: 1 }, "");
   $("#scrim").hidden = false; $("#sheet").hidden = false;
   document.body.classList.add("noscroll");
@@ -858,38 +1008,38 @@ function closeSheet(fromPop) {
 }
 
 function marketLine(inst, now = Date.now()) {
-  if (inst.m === "meme" || inst.m === "crypto") return `<span class="mkt open">Abierto 24/7</span>`;
+  if (inst.m === "meme" || inst.m === "crypto") return `<span class="mkt open">Open 24/7</span>`;
   const st = mstatus(inst.m, now);
-  const name = inst.m === "stock" ? "Wall Street" : "Divisas";
-  if (st.open) return `<span class="mkt open">${name} abierto · cierra en <b data-cd="${st.closesAt}">${countdown(st.closesAt - now)}</b></span>`;
-  return `<span class="mkt closed">${name} cerrado · abre en <b data-cd="${st.nextOpen}">${countdown(st.nextOpen - now)}</b></span>`;
+  const name = inst.m === "stock" ? "Wall Street" : "Forex";
+  if (st.open) return `<span class="mkt open">${name} open · closes in <b data-cd="${st.closesAt}">${countdown(st.closesAt - now)}</b></span>`;
+  return `<span class="mkt closed">${name} closed · opens in <b data-cd="${st.nextOpen}">${countdown(st.nextOpen - now)}</b></span>`;
 }
 
 function statsFor(inst, L) {
   const s = [];
   if (inst.m === "meme") {
-    s.push(["Market cap", usd(L.mc, { compact: true })], ["Liquidez", usd(L.liq, { compact: true })], ["Volumen 24 h", usd(L.vol, { compact: true })]);
-    if (inst.born) s.push(["Edad", `<span data-age="${inst.born}">${ago(inst.born)}</span>`]);
+    s.push(["Market cap", usd(L.mc, { compact: true })], ["Liquidity", usd(L.liq, { compact: true })], ["24h volume", usd(L.vol, { compact: true })]);
+    if (inst.born) s.push(["Age", `<span data-age="${inst.born}">${ago(inst.born)}</span>`]);
   } else if (inst.m === "crypto") {
     const m = crypto.meta[inst.id] || {};
-    s.push(["Volumen 24 h", usd(L.vol, { compact: true })]);
+    s.push(["24h volume", usd(L.vol, { compact: true })]);
     if (m.mc) s.push(["Market cap", usd(m.mc, { compact: true })]);
-    if (m.rank) s.push(["Lugar por tamaño", "#" + m.rank]);
-    s.push(["Costos", "0.1% + 0.02%"]);
+    if (m.rank) s.push(["Rank by size", "#" + m.rank]);
+    s.push(["Costs", "0.1% + 0.02%"]);
   } else if (inst.m === "stock") {
-    s.push(["Apertura", price(L.o)], ["Máximo", price(L.hi)], ["Mínimo", price(L.lo)], ["Cierre anterior", price(L.prev)]);
+    s.push(["Open", price(L.o)], ["High", price(L.hi)], ["Low", price(L.lo)], ["Previous close", price(L.prev)]);
   } else {
     const p = FX_BY_ID[inst.id];
-    const pip = inst.quote === "JPY" ? 0.01 : inst.id === "USDMXN" ? 0.0001 : 0.0001;
-    s.push(["Diferencial típico", `${(p.spread / pip).toFixed(1)} pips`], ["Cambio vs. ayer", pct(L.ch24, 3)], ["Fuente", "Coinbase (media)"]);
+    const pip = inst.quote === "JPY" ? 0.01 : 0.0001;
+    s.push(["Typical spread", `${(p.spread / pip).toFixed(1)} pips`], ["Change vs. yesterday", pct(L.ch24, 3)], ["Source", "Coinbase (mid)"]);
   }
   return `<div class="stats">${s.map(([k, v]) => `<div><small>${k}</small><b>${v}</b></div>`).join("")}</div>`;
 }
 
 function changeLine(inst, L) {
-  if (offline()) return `<div class="chg flat">sin conexión</div>`;
+  if (offline()) return `<div class="chg flat">offline</div>`;
   if (inst.m === "meme") return `<div class="chg">${[["5m", L.ch5m], ["1h", L.ch1h], ["6h", L.ch6h], ["24h", L.ch24]].map(([k, v]) => `<span class="${dirCls(v)}">${pct(v, 1)}</span> ${k}`).join(" · ")}</div>`;
-  const lbl = inst.m === "fx" ? "vs. ayer" : inst.m === "stock" ? "hoy" : "24 h";
+  const lbl = inst.m === "fx" ? "vs. yesterday" : inst.m === "stock" ? "today" : "24h";
   return `<div class="chg"><span data-c="${esc(inst.key)}" class="${dirCls(L.ch24)}">${pct(L.ch24)}</span> ${lbl}</div>`;
 }
 
@@ -897,6 +1047,7 @@ function renderSheet() {
   const el = $("#sheet");
   if (!ui.sheet) return;
   if (ui.sheet.kind === "settings") { el.innerHTML = settingsHTML(); bindSettings(); return; }
+  if (ui.sheet.kind === "bot") { const b = BOTS.find(x => x.id === ui.sheet.id); if (!b) { closeSheet(); return; } const y = el.querySelector(".sh-body")?.scrollTop || 0; el.innerHTML = botSheetHTML(b); const body = el.querySelector(".sh-body"); if (body) body.scrollTop = y; return; }
   const sh = ui.sheet, key = sh.key, inst = instOf(key), L = live.get(key) || {};
   const p = S.pos[key];
   const needKey = inst.m === "stock" && !CFG.finnhubKey;
@@ -906,25 +1057,25 @@ function renderSheet() {
     const v = E.positionView(p, quoteFor(key));
     const avg = inst.m === "fx" ? p.avg : p.cost / p.qty;
     return `<section class="card pos">
-      <h3>Tu posición</h3>
+      <h3>Your position</h3>
       <div class="stats">
-        <div><small>Cantidad</small><b>${qty(p.qty)}</b></div>
-        <div><small>Vale</small><b data-v="${esc(key)}">${usd(v.value)}</b></div>
-        <div><small>Resultado</small><b data-pl="${esc(key)}" class="${dirCls(v.pl)}">${usd(v.pl, { sign: true })} (${pct(v.plPct * 100, 1)})</b></div>
-        <div><small>Precio promedio</small><b>${fmtPx(inst, avg)}</b></div>
+        <div><small>Quantity</small><b>${qty(p.qty)}</b></div>
+        <div><small>Worth</small><b data-v="${esc(key)}">${usd(v.value)}</b></div>
+        <div><small>P&amp;L</small><b data-pl="${esc(key)}" class="${dirCls(v.pl)}">${usd(v.pl, { sign: true })} (${pct(v.plPct * 100, 1)})</b></div>
+        <div><small>Average price</small><b>${fmtPx(inst, avg)}</b></div>
       </div>
       <div class="stops">
-        <label>Stop loss <input id="slIn" type="number" inputmode="decimal" step="any" min="0" placeholder="precio" value="${p.sl ?? ""}"></label>
+        <label>Stop loss <input id="slIn" type="number" inputmode="decimal" step="any" min="0" placeholder="price" value="${p.sl ?? ""}"></label>
         <div class="chips">${[5, 10, 20].map(n => `<button data-sl="${n}">−${n}%</button>`).join("")}</div>
-        <label>Take profit <input id="tpIn" type="number" inputmode="decimal" step="any" min="0" placeholder="precio" value="${p.tp ?? ""}"></label>
+        <label>Take profit <input id="tpIn" type="number" inputmode="decimal" step="any" min="0" placeholder="price" value="${p.tp ?? ""}"></label>
         <div class="chips">${[10, 25, 50].map(n => `<button data-tp="${n}">+${n}%</button>`).join("")}</div>
-        <button class="btn" data-savestops>Guardar stop loss y take profit</button>
-        <small class="mut">Se venden solos cuando el precio en vivo los toca${inst.m === "stock" || inst.m === "fx" ? " (con el mercado abierto)" : ""}. Los % son desde tu precio promedio.</small>
+        <button class="btn" data-savestops>Save stop loss and take profit</button>
+        <small class="mut">They sell automatically when the live price hits them${inst.m === "stock" || inst.m === "fx" ? " (while the market is open)" : ""}. The % are from your average price.</small>
       </div></section>`;
   })() : "";
   el.innerHTML = `
     <div class="sh-head">${icon(inst)}<div class="sh-title"><h2>${esc(inst.sym)}</h2><small>${esc(inst.name)} · ${MARKET_LABEL[inst.m]}</small></div>
-      <button class="close" data-close aria-label="Cerrar">✕</button></div>
+      <button class="close" data-close aria-label="Close">✕</button></div>
     <div class="sh-body">
       <div class="big" data-p="${esc(key)}">${L.px > 0 ? fmtPx(inst, L.px) : "—"}</div>
       ${changeLine(inst, L)}
@@ -932,19 +1083,19 @@ function renderSheet() {
       ${needKey ? noKeyCard() : `
       <div class="chart-bar">
         <div class="seg tiny">${["1m", "5m", "1h", "1d"].map(i => `<button data-ivl="${i}" aria-pressed="${sh.ivl === i}">${i}</button>`).join("")}</div>
-        <div class="seg tiny">${[["candles", "Velas"], ["line", "Línea"]].map(([k, l]) => `<button data-mode="${k}" aria-pressed="${CFG.chartMode === k}">${l}</button>`).join("")}</div>
+        <div class="seg tiny">${[["candles", "Candles"], ["line", "Line"]].map(([k, l]) => `<button data-mode="${k}" aria-pressed="${CFG.chartMode === k}">${l}</button>`).join("")}</div>
       </div>
-      <canvas id="chart" aria-label="Gráfica de ${esc(inst.sym)}"></canvas>
+      <canvas id="chart" aria-label="${esc(inst.sym)} chart"></canvas>
       <div class="chart-note" id="chartNote">${esc(chart?.note || "")}</div>
       ${statsFor(inst, L)}`}
       ${posHTML}
-      ${myOrders.length ? `<section class="card"><h3>Órdenes de ${esc(inst.sym)}</h3><div class="list">${myOrders.map(orderRow).join("")}</div></section>` : ""}
+      ${myOrders.length ? `<section class="card"><h3>${esc(inst.sym)} orders</h3><div class="list">${myOrders.map(orderRow).join("")}</div></section>` : ""}
       ${needKey ? "" : `<section class="card">
-        <h3>Avísame cuando toque</h3>
-        <form class="alert-form" data-alertform><input id="alertIn" type="number" inputmode="decimal" step="any" min="0" placeholder="precio" aria-label="Precio del aviso"><button class="btn">Avisarme</button></form>
-        ${myAlerts.map(a => `<div class="alert-row">${a.dir === "above" ? "Si sube a" : "Si baja a"} ${fmtPx(inst, a.price)} <button class="lnk" data-delalert="${a.id}">quitar</button></div>`).join("")}
+        <h3>Alert me when it hits</h3>
+        <form class="alert-form" data-alertform><input id="alertIn" type="number" inputmode="decimal" step="any" min="0" placeholder="price" aria-label="Alert price"><button class="btn">Alert me</button></form>
+        ${myAlerts.map(a => `<div class="alert-row">${a.dir === "above" ? "If it rises to" : "If it falls to"} ${fmtPx(inst, a.price)} <button class="lnk" data-delalert="${a.id}">remove</button></div>`).join("")}
       </section>`}
-      ${inst.m === "meme" && inst.url ? `<p class="foot"><a href="${esc(inst.url)}" target="_blank" rel="noopener">Ver en DexScreener ↗</a></p>` : ""}
+      ${inst.m === "meme" && inst.url ? `<p class="foot"><a href="${esc(inst.url)}" target="_blank" rel="noopener">View on DexScreener ↗</a></p>` : ""}
     </div>
     <div class="sh-foot" id="tradeBox">${needKey ? "" : tradeBoxHTML()}</div>`;
   bindTradeBox();
@@ -952,25 +1103,25 @@ function renderSheet() {
 }
 
 function tradeBoxHTML() {
-  const sh = ui.sheet, inst = instOf(sh.key), p = S.pos[sh.key];
+  const sh = ui.sheet, p = S.pos[sh.key];
   if (!sh.side) {
     return `<div class="bs">
-      <button class="big-btn buy" data-side="buy">Comprar</button>
-      <button class="big-btn sell" data-side="sell" ${p ? "" : "disabled"}>Vender</button></div>`;
+      <button class="big-btn buy" data-side="buy">Buy</button>
+      <button class="big-btn sell" data-side="sell" ${p ? "" : "disabled"}>Sell</button></div>`;
   }
   const buy = sh.side === "buy";
   const avail = E.available(S);
   const chips = buy
-    ? [50, 100, 250, 500, 1000].map(n => `<button data-amt="${n}" aria-pressed="${sh.amount === n}">$${n >= 1000 ? n / 1000 + "K" : n}</button>`).join("") + `<button data-amt="max" aria-pressed="${Math.abs(sh.amount - Math.floor(avail * 100) / 100) < 0.005}">Todo</button>`
+    ? amountChips(S.start).map(n => `<button data-amt="${n}" aria-pressed="${sh.amount === n}">${chipLabel(n)}</button>`).join("") + `<button data-amt="max" aria-pressed="${Math.abs(sh.amount - Math.floor(avail * 100) / 100) < 0.005}">Max</button>`
     : [0.25, 0.5, 0.75, 1].map(f => `<button data-frac="${f}" aria-pressed="${sh.frac === f}">${f * 100}%</button>`).join("");
   return `<div class="tb ${sh.side}">
-    <div class="tb-top"><button class="lnk" data-back>← Volver</button>
-      <div class="seg tiny">${[["market", "A mercado"], ["limit", "Límite"]].map(([k, l]) => `<button data-type="${k}" aria-pressed="${sh.type === k}">${l}</button>`).join("")}</div></div>
+    <div class="tb-top"><button class="lnk" data-back>← Back</button>
+      <div class="seg tiny">${[["market", "Market"], ["limit", "Limit"]].map(([k, l]) => `<button data-type="${k}" aria-pressed="${sh.type === k}">${l}</button>`).join("")}</div></div>
     <div class="chips amt">${chips}</div>
-    ${buy ? `<label class="amt-in">Monto en dólares <input id="amtIn" type="number" inputmode="decimal" step="any" min="0" value="${sh.amount || ""}"></label>` : ""}
-    ${sh.type === "limit" ? `<label class="amt-in">${buy ? "Comprar si baja a" : "Vender si sube a"} <input id="limIn" type="number" inputmode="decimal" step="any" min="0" value="${sh.limit ?? ""}"></label>` : ""}
+    ${buy ? `<label class="amt-in">Amount in dollars <input id="amtIn" type="number" inputmode="decimal" step="any" min="0" value="${sh.amount || ""}"></label>` : ""}
+    ${sh.type === "limit" ? `<label class="amt-in">${buy ? "Buy if it falls to" : "Sell if it rises to"} <input id="limIn" type="number" inputmode="decimal" step="any" min="0" value="${sh.limit ?? ""}"></label>` : ""}
     <div class="quote" id="quote" aria-live="polite"></div>
-    ${swipeHTML(sh.side, buy ? "Desliza para comprar" : "Desliza para vender")}
+    ${swipeHTML(sh.side, buy ? "Slide to buy" : "Slide to sell")}
   </div>`;
 }
 
@@ -982,27 +1133,28 @@ function tradePreview() {
   const lines = [];
   let ok = true;
   const isLimit = sh.type === "limit";
-  if (isLimit && !(sh.limit > 0)) { lines.push("Pon el precio límite."); ok = false; }
+  if (isLimit && !(sh.limit > 0)) { lines.push("Set the limit price."); ok = false; }
   const qx = isLimit && sh.limit > 0 && q ? { ...q, px: sh.limit } : q;
-  if (!q) { lines.push(offline() ? "Sin conexión: no se puede operar sin precio en vivo." : "Esperando precio en vivo…"); ok = false; }
+  if (!q) { lines.push(offline() ? "Offline: you can't trade without a live price." : "Waiting for a live price…"); ok = false; }
+  const costName = inst.m === "meme" ? "impact" : inst.m === "crypto" ? "slippage" : "spread";
   if (sh.side === "buy") {
     const avail = E.available(S);
-    if (!(sh.amount > 0)) { lines.push("Elige un monto."); ok = false; }
-    else if (sh.amount > avail + 1e-9) { lines.push(`No te alcanza: tienes ${usd(avail)} disponibles.`); ok = false; }
+    if (!(sh.amount > 0)) { lines.push("Choose an amount."); ok = false; }
+    else if (sh.amount > avail + 1e-9) { lines.push(`Not enough cash: you have ${usd(avail)} available.`); ok = false; }
     else if (qx) {
       const r = quoteBuy(inst, sh.amount, qx);
-      if (r) lines.push(`Recibes ~${qty(r.qty)} ${esc(inst.m === "fx" ? inst.base : inst.sym)} a ${fmtPx(inst, r.eff)} · comisión ${usd(r.fee)} · ${inst.m === "meme" ? "impacto" : inst.m === "crypto" ? "deslizamiento" : "diferencial"} ${usd(r.slip)}`);
+      if (r) lines.push(`You get ~${qty(r.qty)} ${esc(inst.m === "fx" ? inst.base : inst.sym)} at ${fmtPx(inst, r.eff)} · fee ${usd(r.fee)} · ${costName} ${usd(r.slip)}`);
     }
   } else if (p && qx) {
     const r = quoteSell(inst, p, sh.frac, qx);
-    if (r) lines.push(`Recibes ~${usd(r.proceeds)} · resultado <span class="${dirCls(r.pl)}">${usd(r.pl, { sign: true })} (${pct(r.plPct * 100, 1)})</span> · comisión ${usd(r.fee)} · ${inst.m === "meme" ? "impacto" : inst.m === "crypto" ? "deslizamiento" : "diferencial"} ${usd(r.slip)}`);
+    if (r) lines.push(`You get ~${usd(r.proceeds)} · P&amp;L <span class="${dirCls(r.pl)}">${usd(r.pl, { sign: true })} (${pct(r.plPct * 100, 1)})</span> · fee ${usd(r.fee)} · ${costName} ${usd(r.slip)}`);
   }
   if (isLimit && sh.limit > 0) {
-    lines.push(`Se llena con el precio en vivo cuando toque ${fmtPx(inst, sh.limit)}, mientras la app esté abierta; al abrirla se revisa con el precio actual.`);
-    if (q && (sh.side === "buy" ? q.px <= sh.limit : q.px >= sh.limit)) lines.push("El precio ya está ahí: se llenará al confirmar.");
+    lines.push(`Fills at the live price when it hits ${fmtPx(inst, sh.limit)}, while the app is open; when you open it, it's checked against the current price.`);
+    if (q && (sh.side === "buy" ? q.px <= sh.limit : q.px >= sh.limit)) lines.push("The price is already there: it will fill when you confirm.");
   }
   if (!mkt.open) {
-    lines.push(`<b>${inst.m === "stock" ? "Wall Street" : "Divisas"} está cerrado:</b> la orden espera a la apertura (en <b data-cd="${mkt.nextOpen}">${countdown(mkt.nextOpen - now)}</b>) y se llena con el primer precio real.`);
+    lines.push(`<b>${inst.m === "stock" ? "Wall Street" : "Forex"} is closed:</b> the order waits for the open (in <b data-cd="${mkt.nextOpen}">${countdown(mkt.nextOpen - now)}</b>) and fills at the first real price.`);
     if (!q) ok = sh.side === "buy" ? sh.amount > 0 && sh.amount <= E.available(S) : !!p;
   }
   return { html: lines.join("<br>"), ok };
@@ -1035,7 +1187,7 @@ function submitTrade() {
     if (r.trade) { celebrate(r.trade); afterTrades([r.trade]); }
     else {
       const o = r.order;
-      toast(o.type === "limit" ? `Orden límite puesta: ${o.side === "buy" ? "comprar" : "vender"} ${inst.sym} a ${fmtPx(inst, o.limit)}` : `Orden puesta: se llena al abrir el mercado`, "");
+      toast(o.type === "limit" ? `Limit order placed: ${o.side === "buy" ? "buy" : "sell"} ${inst.sym} at ${fmtPx(inst, o.limit)}` : `Order placed: it fills at the market open`, "");
       vibrate(15);
       saveSoon(0);
       runChecks(sh.key);
@@ -1057,7 +1209,7 @@ async function loadChart() {
   const token = {};
   chartToken = token;
   const tickBars = () => ticksToBars(ticks.get(sh.key) || [], ivl);
-  chart = { key: sh.key, ivl, bars: tickBars(), src: "live", note: TEST ? "Modo de prueba: gráfica con precios en vivo." : "Cargando velas…", sym: tdSymbol(inst) };
+  chart = { key: sh.key, ivl, bars: tickBars(), src: "live", note: TEST ? "Test mode: chart from live prices." : "Loading candles…", sym: tdSymbol(inst) };
   setChartNote(chart.note); drawChartSoon(true);
   if (TEST) return;
   let bars, srcName, note;
@@ -1066,33 +1218,33 @@ async function loadChart() {
     if (inst.m === "crypto") {
       bars = await crypto.candles(inst.id, ivl);
       srcName = crypto.mode;
-      note = `Velas de ${srcName === "binance" ? "Binance" : "Coinbase"} en vivo.`;
+      note = `Live ${srcName === "binance" ? "Binance" : "Coinbase"} candles.`;
       if (srcName === "binance") crypto.watchChart(inst.id, ivl);
     } else if (inst.m === "meme") {
       bars = await dex.candles(inst.pair, ivl);
       srcName = "geckoterminal";
-      note = "Velas de GeckoTerminal; la última se mueve con el precio en vivo de DexScreener.";
-      if (bars.length < 2) throw new SourceError("geckoterminal", "notfound", "Sin velas");
+      note = "GeckoTerminal candles; the last one moves with DexScreener's live price.";
+      if (bars.length < 2) throw new SourceError("geckoterminal", "notfound", "No candles");
     } else {
-      if (!CFG.twelveKey) throw new SourceError("twelvedata", "nokey", "Sin clave");
+      if (!CFG.twelveKey) throw new SourceError("twelvedata", "nokey", "No key");
       const r = await td.series(tdSymbol(inst), ivl, { now, lastActive: H.lastActivity(inst.m, now) });
       bars = r.bars; srcName = r.src;
       const b = await td.status(now);
-      note = (r.src === "cache" ? "Velas de Twelve Data guardadas en el teléfono (no gastaron crédito)" : "Velas de Twelve Data, guardadas en el teléfono") + ` · hoy usaste ${b.used} de ${DAILY_CAP}.` +
-        (r.stale ? " No se pudieron actualizar; se muestra la copia guardada." : "");
+      note = (r.src === "cache" ? "Twelve Data candles saved on this phone (no credits used)" : "Twelve Data candles, saved on this phone") + ` · ${b.used} of ${DAILY_CAP} used today.` +
+        (r.stale ? " Couldn't refresh them; showing the saved copy." : "");
     }
   } catch (e) {
     if (chartToken !== token) return;
     noteError(e);
-    const fallback = "La gráfica usa los precios en vivo desde que abriste la app.";
+    const fallback = "The chart uses live prices since you opened the app.";
     const msg = {
-      geckoterminal: "GeckoTerminal no tiene velas de esta moneda. " + fallback,
-      twelvedata: e.kind === "nokey" ? "Sin clave de Twelve Data: " + fallback.toLowerCase() + " Ponla en Ajustes para ver velas."
-        : e.kind === "auth" ? "Twelve Data rechazó tu clave (revisa Ajustes). " + fallback
-        : e.kind === "limit" ? (e.body === "day" ? "Se acabaron las 800 velas de hoy de Twelve Data. " : "Twelve Data: espera un minuto para más velas. ") + fallback
-        : e.kind === "premium" ? "Twelve Data no da velas de este símbolo en el plan gratis. " + fallback
-        : "No llegaron velas de Twelve Data. " + fallback,
-    }[e.source] || (e.kind === "offline" ? "Sin conexión. " : "No llegaron velas. ") + fallback;
+      geckoterminal: "GeckoTerminal has no candles for this coin. " + fallback,
+      twelvedata: e.kind === "nokey" ? "No Twelve Data key: " + fallback.charAt(0).toLowerCase() + fallback.slice(1) + " Add it in Settings to see candles."
+        : e.kind === "auth" ? "Twelve Data rejected your key (check Settings). " + fallback
+        : e.kind === "limit" ? (e.body === "day" ? "Today's 800 Twelve Data candles are used up. " : "Twelve Data: wait a minute for more candles. ") + fallback
+        : e.kind === "premium" ? "Twelve Data doesn't give candles for this symbol on the free plan. " + fallback
+        : "No candles came from Twelve Data. " + fallback,
+    }[e.source] || (e.kind === "offline" ? "Offline. " : "No candles came in. ") + fallback;
     chart = { key: sh.key, ivl, bars: tickBars(), src: "live", note: msg, sym: tdSymbol(inst) };
     setChartNote(msg); drawChartSoon(true);
     return;
@@ -1114,7 +1266,7 @@ function drawChartSoon(now) {
     if (!c || !chart || !ui.sheet) return;
     const inst = instOf(chart.key);
     const bars = chart.src === "live" ? ticksToBars(ticks.get(chart.key) || [], chart.ivl) : chart.bars;
-    drawChart(c, bars, { mode: CFG.chartMode, dp: inst?.m === "fx" ? (inst.dp ?? 5) : null, ivl: chart.ivl, empty: chart.src === "live" ? "La gráfica se dibuja con los precios en vivo mientras tienes la app abierta." : "" });
+    drawChart(c, bars, { mode: CFG.chartMode, dp: inst?.m === "fx" ? (inst.dp ?? 5) : null, ivl: chart.ivl, empty: chart.src === "live" ? "The chart is drawn from live prices while you have the app open." : "" });
   };
   if (now) return run();
   if (chartTimer) return;
@@ -1122,56 +1274,65 @@ function drawChartSoon(now) {
 }
 
 // ---------------------------------------------------------------- sheet: settings
+function resetHTML() {
+  const st = ui.resetStart, okAmt = E.validStart(st);
+  return `<h3>Reset portfolio</h3>
+      <p class="mut">Start over with a new balance. Positions, orders and history are erased; achievements stay. Rival bots restart with the same balance. Export first if you want to keep your history.</p>
+      <p class="lbl">Starting balance</p>
+      <div class="chips start" role="group" aria-label="Starting balance">${START_CHOICES.map(n => `<button data-start="${n}" aria-pressed="${!ui.resetCustom && st === n}">${usd0(n)}</button>`).join("")}<button data-start="custom" aria-pressed="${ui.resetCustom}">Custom</button></div>
+      ${ui.resetCustom ? `<label class="amt-in">Amount in dollars (${usd0(START_MIN)} to ${usd0(START_MAX)}) <input id="startIn" type="number" inputmode="decimal" step="any" min="${START_MIN}" max="${START_MAX}" value="${st || ""}"></label>` : ""}
+      <button class="btn danger" data-reset ${okAmt ? "" : "disabled"}>${okAmt ? `Reset to ${usd0(st)}` : "Enter an amount"}</button>`;
+}
+function renderReset() { const el = $("#resetBox"); if (el) el.innerHTML = resetHTML(); }
+
 function settingsHTML() {
   const ns = notifySupport();
-  const perm = ns.ok ? { granted: "Permitidos ✓", denied: "Bloqueados en el navegador", default: "Sin permiso todavía" }[ns.permission] : ns.why;
+  const perm = ns.ok ? { granted: "Allowed ✓", denied: "Blocked in the browser", default: "Not allowed yet" }[ns.permission] : ns.why;
   const tog = (k, label) => `<label class="tog"><input type="checkbox" data-notif="${k}" ${CFG.notif[k] ? "checked" : ""}><span>${label}</span></label>`;
   const keyRow = (id, label, val, link, linkText) => `<div class="keyrow">
       <label for="${id}">${label}</label>
-      <div class="key-in"><input id="${id}" type="password" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="Pega tu clave aquí" value="${val ? "••••••••" + esc(val.slice(-4)) : ""}" data-masked="${val ? 1 : 0}"><button class="btn" data-savekey="${id}">Guardar</button></div>
-      <small>Créala gratis en <a href="${link}" target="_blank" rel="noopener">${linkText}</a>. Se guarda solo en este teléfono; no va en el respaldo ni en ningún archivo. ${val ? `<button class="lnk" data-delkey="${id}">Borrar clave</button>` : ""}</small>
+      <div class="key-in"><input id="${id}" type="password" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="Paste your key here" value="${val ? "••••••••" + esc(val.slice(-4)) : ""}" data-masked="${val ? 1 : 0}"><button class="btn" data-savekey="${id}">Save</button></div>
+      <small>Create one for free at <a href="${link}" target="_blank" rel="noopener">${linkText}</a>. It's saved only on this phone; it never goes in the backup or any file. ${val ? `<button class="lnk" data-delkey="${id}">Delete key</button>` : ""}</small>
       <small class="key-status" id="${id}-st"></small>
     </div>`;
   const isIOS = /iPhone|iPad|iPod/.test(navigator.userAgent);
   const standalone = matchMedia("(display-mode: standalone)").matches || navigator.standalone;
-  return `<div class="sh-head"><div class="sh-title"><h2>Ajustes</h2><small>Todo se guarda solo en este teléfono</small></div><button class="close" data-close aria-label="Cerrar">✕</button></div>
+  return `<div class="sh-head"><div class="sh-title"><h2>Settings</h2><small>Everything is saved only on this phone</small></div><button class="close" data-close aria-label="Close">✕</button></div>
   <div class="sh-body settings">
-    <section class="card"><h3>Claves de precios</h3>
-      ${keyRow("fhKey", "Finnhub (acciones)", CFG.finnhubKey, FINNHUB_SIGNUP, "finnhub.io/register")}
-      ${keyRow("tdKey", "Twelve Data (velas de acciones y divisas, opcional)", CFG.twelveKey, TWELVE_SIGNUP, "twelvedata.com/register")}
+    <section class="card"><h3>Price keys</h3>
+      ${keyRow("fhKey", "Finnhub (stocks)", CFG.finnhubKey, FINNHUB_SIGNUP, "finnhub.io/register")}
+      ${keyRow("tdKey", "Twelve Data (stock and forex candles, optional)", CFG.twelveKey, TWELVE_SIGNUP, "twelvedata.com/register")}
       <small class="mut" id="tdBudget"></small>
     </section>
-    <section class="card"><h3>Avisos al teléfono</h3>
-      <p class="mut">Permiso: <b>${esc(perm)}</b></p>
-      ${ns.ok && ns.permission !== "granted" ? `<button class="btn" data-askperm>Permitir avisos</button>` : ""}
-      ${tog("fills", "Órdenes límite llenadas, stop loss y take profit")}
-      ${tog("moves", "Movimientos fuertes de lo que tienes")}
-      <label class="sel">Avisar si se mueve más de <select id="moveTh">${[3, 5, 10, 20].map(n => `<option value="${n}" ${CFG.moveTh === n ? "selected" : ""}>${n}%</option>`).join("")}</select> en 1 hora</label>
-      ${tog("price", "Mis avisos de precio («NVDA tocó $X»)")}
-      ${tog("summary", "Resumen al cierre de Wall Street")}
-      ${tog("streak", "Rachas («llevas 4 días en verde»)")}
-      <small class="mut">Llegan con la app abierta o recién minimizada. Con la app cerrada del todo haría falta un servidor de avisos, que esta versión no tiene. En iPhone, instala la app en la pantalla de inicio (iOS 16.4 o más).</small>
-      ${CFG.alerts.length ? `<h4>Avisos de precio activos</h4>${CFG.alerts.map(a => `<div class="alert-row">${esc(a.inst.sym)}: ${a.dir === "above" ? "si sube a" : "si baja a"} ${fmtPx(a.inst, a.price)} <button class="lnk" data-delalert="${a.id}">quitar</button></div>`).join("")}` : ""}
+    <section class="card"><h3>Phone notifications</h3>
+      <p class="mut">Permission: <b>${esc(perm)}</b></p>
+      ${ns.ok && ns.permission !== "granted" ? `<button class="btn" data-askperm>Allow notifications</button>` : ""}
+      ${tog("fills", "Limit order fills, stop loss and take profit")}
+      ${tog("moves", "Big moves in what you hold")}
+      <label class="sel">Notify if it moves more than <select id="moveTh">${[3, 5, 10, 20].map(n => `<option value="${n}" ${CFG.moveTh === n ? "selected" : ""}>${n}%</option>`).join("")}</select> in 1 hour</label>
+      ${tog("price", "My price alerts (“NVDA hit $X”)")}
+      ${tog("summary", "Summary at the Wall Street close")}
+      ${tog("streak", "Streaks (“4 green days in a row”)")}
+      <small class="mut">They arrive while the app is open or recently minimized. With the app fully closed it would need a notification server, which this version doesn't have. On iPhone, add the app to the Home Screen (iOS 16.4 or later).</small>
+      ${CFG.alerts.length ? `<h4>Active price alerts</h4>${CFG.alerts.map(a => `<div class="alert-row">${esc(a.inst.sym)}: ${a.dir === "above" ? "if it rises to" : "if it falls to"} ${fmtPx(a.inst, a.price)} <button class="lnk" data-delalert="${a.id}">remove</button></div>`).join("")}` : ""}
     </section>
-    <section class="card"><h3>Sonido</h3>${`<label class="tog"><input type="checkbox" id="soundTog" ${CFG.sound ? "checked" : ""}><span>Sonidos al operar</span></label>`}</section>
-    <section class="card"><h3>Respaldo</h3>
-      <p class="mut">Exporta un archivo con tu cartera, historial y logros, y ábrelo en el otro equipo con «Importar». Las claves no van en el archivo.</p>
-      <div class="two"><button class="btn" data-export>Exportar archivo</button><label class="btn ghost file">Importar archivo<input type="file" id="importIn" accept="application/json,.json" hidden></label></div>
+    <section class="card"><h3>Sound</h3>${`<label class="tog"><input type="checkbox" id="soundTog" ${CFG.sound ? "checked" : ""}><span>Sounds when trading</span></label>`}</section>
+    <section class="card" id="botsBox">${botsSettingsHTML()}</section>
+    <section class="card"><h3>Backup</h3>
+      <p class="mut">Export a file with your portfolio, history, achievements and rival bots, and open it on the other device with “Import”. Keys are not included in the file.</p>
+      <div class="two"><button class="btn" data-export>Export file</button><label class="btn ghost file">Import file<input type="file" id="importIn" accept="application/json,.json" hidden></label></div>
     </section>
-    <section class="card"><h3>Instalar en el teléfono</h3>
-      ${standalone ? `<p class="mut">Ya está instalada ✓</p>` : installPrompt ? `<button class="btn" data-install>Instalar Ghost Desk</button>` :
-        `<p class="mut">${isIOS ? "En Safari toca Compartir ⬆️ y luego «Agregar a pantalla de inicio»." : "En Chrome toca el menú ⋮ y luego «Instalar app» o «Agregar a pantalla de inicio»."}</p>`}
+    <section class="card"><h3>Install on your phone</h3>
+      ${standalone ? `<p class="mut">Already installed ✓</p>` : installPrompt ? `<button class="btn" data-install>Install Ghost Desk</button>` :
+        `<p class="mut">${isIOS ? "In Safari, tap Share ⬆️ and then “Add to Home Screen”." : "In Chrome, tap the ⋮ menu and then “Install app” or “Add to Home screen”."}</p>`}
     </section>
-    <section class="card danger-zone"><h3>Reiniciar cartera</h3>
-      <p class="mut">Vuelves a $10,000 y se borran posiciones, órdenes e historial. Los logros se quedan. Exporta antes si quieres guardar el historial.</p>
-      <button class="btn danger" data-reset>Reiniciar cartera</button>
-    </section>
-    <p class="foot">Fuentes: DexScreener y GeckoTerminal (memecoins), CoinGecko y Binance o Coinbase (cripto), Finnhub (acciones), Twelve Data (velas de acciones y divisas), Coinbase (divisas). Dinero falso, precios reales. Nada aquí es una recomendación.</p>
+    <section class="card danger-zone" id="resetBox">${resetHTML()}</section>
+    <p class="foot">Sources: DexScreener and GeckoTerminal (memecoins), CoinGecko and Binance or Coinbase (crypto), Finnhub (stocks), Twelve Data (stock and forex candles), Coinbase (forex). Fake money, real prices. Nothing here is a recommendation.</p>
   </div>`;
 }
 
 function bindSettings() {
-  td.status().then(b => { const el = $("#tdBudget"); if (el && CFG.twelveKey) el.textContent = `Twelve Data: hoy usaste ${b.used} de ${DAILY_CAP} velas (el límite se reinicia a medianoche UTC).`; }).catch(() => {});
+  td.status().then(b => { const el = $("#tdBudget"); if (el && CFG.twelveKey) el.textContent = `Twelve Data: ${b.used} of ${DAILY_CAP} candles used today (the limit resets at midnight UTC).`; }).catch(() => {});
   for (const id of ["fhKey", "tdKey"]) {
     const inp = $("#" + id);
     inp.addEventListener("focus", () => { if (inp.dataset.masked === "1") { inp.value = ""; inp.dataset.masked = "0"; } });
@@ -1180,23 +1341,23 @@ function bindSettings() {
 
 async function saveKey(id) {
   const inp = $("#" + id), st = $("#" + id + "-st");
-  if (inp.dataset.masked === "1") { st.textContent = "Pega una clave nueva para cambiarla."; return; }
+  if (inp.dataset.masked === "1") { st.textContent = "Paste a new key to change it."; return; }
   const val = inp.value.trim();
-  if (!/^[A-Za-z0-9_-]{8,80}$/.test(val)) { st.textContent = "Eso no parece una clave (solo letras y números)."; st.className = "key-status down"; return; }
-  st.textContent = "Probando la clave…"; st.className = "key-status";
+  if (!/^[A-Za-z0-9_-]{8,80}$/.test(val)) { st.textContent = "That doesn't look like a key (letters and numbers only)."; st.className = "key-status down"; return; }
+  st.textContent = "Testing the key…"; st.className = "key-status";
   const prev = id === "fhKey" ? CFG.finnhubKey : CFG.twelveKey;
   if (id === "fhKey") CFG.finnhubKey = val; else CFG.twelveKey = val;
   try {
     if (id === "fhKey") { await stockQuote("SPY"); okSrc("finnhub"); }
     else { await td._fetchSeries("AAPL", "1d", Date.now()); okSrc("twelvedata"); }
-    st.textContent = "Clave guardada y funcionando ✓"; st.className = "key-status up";
+    st.textContent = "Key saved and working ✓"; st.className = "key-status up";
   } catch (e) {
     if (e.kind === "auth") {
       if (id === "fhKey") CFG.finnhubKey = prev; else CFG.twelveKey = prev;
-      st.textContent = `${id === "fhKey" ? "Finnhub" : "Twelve Data"} rechazó esa clave. Revisa que la copiaste completa.`; st.className = "key-status down";
+      st.textContent = `${id === "fhKey" ? "Finnhub" : "Twelve Data"} rejected that key. Make sure you copied all of it.`; st.className = "key-status down";
       return;
     }
-    st.textContent = e.kind === "limit" ? "Clave guardada. La fuente está en su límite ahora; se probará sola en un minuto." : "Clave guardada. No se pudo probar ahora (¿internet?); se probará sola.";
+    st.textContent = e.kind === "limit" ? "Key saved. The source is at its limit right now; it will be tested again in a minute." : "Key saved. It couldn't be tested right now (connection?); it will be tested again on its own.";
   }
   await saveCfg();
   if (id === "fhKey") { fh.reset(); stockListAt = 0; statusAt = 0; lists.stock = []; kick("stock"); }
@@ -1205,10 +1366,16 @@ async function saveKey(id) {
   setTimeout(() => { if (ui.sheet?.kind === "settings") renderSheet(); }, 1500);
 }
 
+/** MM-DD-YYYY for file names (US order, no slashes). */
+function fileDay(ms) {
+  const [y, m, d] = localDay(ms).split("-");
+  return `${m}-${d}-${y}`;
+}
+
 function exportBackup() {
-  const text = buildBackup({ portfolio: S, achievements: A, settings: CFG });
-  download(`ghost-desk-respaldo-${localDay(Date.now())}.json`, text, "application/json");
-  toast("Respaldo exportado", "up");
+  const text = buildBackup({ portfolio: S, achievements: A, settings: CFG, bots: BOTS });
+  download(`ghost-desk-backup-${fileDay(Date.now())}.json`, text, "application/json");
+  toast("Backup exported", "up");
 }
 async function importBackup(file) {
   try {
@@ -1216,15 +1383,16 @@ async function importBackup(file) {
     const d = parseBackup(text);
     S = d.portfolio;
     if (d.achievements) A = mergeAchievements(A, d.achievements);
+    if (d.bots) { BOTS = d.bots; saveBots(); }
     const keep = { finnhubKey: CFG.finnhubKey, twelveKey: CFG.twelveKey };
     CFG = { ...DEFAULT_CFG, ...d.settings, ...keep, notif: { ...DEFAULT_CFG.notif, ...(d.settings.notif || {}) } };
     await Promise.all([flushSave(), saveAch(), saveCfg()]);
-    toast(`Respaldo importado: ${Object.keys(S.pos).length} posiciones, ${S.trades.length} operaciones`, "up");
+    toast(`Backup imported: ${plural(Object.keys(S.pos).length, "position", "positions")}, ${plural(S.trades.length, "trade", "trades")}${BOTS.length ? ", " + plural(BOTS.length, "bot", "bots") : ""}`, "up");
     closeSheet();
     renderAll();
     for (const m of MARKETS) kick(m === "stock" ? "stock" : m);
   } catch (e) {
-    toast(e.message || "No se pudo importar", "down");
+    toast(e.message || "Could not import", "down");
   }
 }
 function download(name, text, type) {
@@ -1272,10 +1440,10 @@ async function runSearch(m, q) {
     }
   } catch (e) {
     noteError(e);
-    toast(e.kind === "offline" ? "Sin conexión" : `No se pudo buscar: ${e.message?.toLowerCase() || "error"}`, "down");
+    toast(e.kind === "offline" ? "Offline" : `Search failed: ${e.message?.toLowerCase() || "error"}`, "down");
   }
   ui.searching = false;
-  if (ui.tab === "mercados" && ui.market === m) renderView();
+  if (ui.tab === "markets" && ui.market === m) renderView();
 }
 
 // ---------------------------------------------------------------- events
@@ -1284,8 +1452,21 @@ function onClick(e) {
   if (!t) return;
   const d = t.dataset;
   if (d.open) { openSheet(d.open); return; }
+  if (d.bot) { openBot(d.bot); return; }
+  if (d.addbot) { addBot(d.addbot); renderBotsBox(); return; }
+  if (d.delbot) {
+    if (!t.dataset.sure) {
+      t.dataset.sure = "1"; t.textContent = "Tap again";
+      setTimeout(() => { if (t.isConnected) { delete t.dataset.sure; t.textContent = "Remove"; } }, 5000);
+      return;
+    }
+    const b = BOTS.find(x => x.id === d.delbot);
+    BOTS = BOTS.filter(x => x.id !== d.delbot); saveBots();
+    if (b) toast(`${b.name} removed`);
+    renderBotsBox(); renderView(); return;
+  }
   if (d.tab) { setTab(d.tab); return; }
-  if (d.market) { ui.market = d.market; if (ui.tab !== "mercados") setTab("mercados"); else renderView(); ensureMarketLoaded(); return; }
+  if (d.market) { ui.market = d.market; if (ui.tab !== "markets") setTab("markets"); else renderView(); ensureMarketLoaded(); return; }
   if (d.memeview) { ui.memeView = d.memeview; renderView(); kick("meme"); return; }
   if (d.clear !== undefined) { lists.search[ui.market] = null; ui.query[ui.market] = ""; renderView(); return; }
   if (d.hist) { ui.hist = d.hist; ui.histN = 100; renderView(); return; }
@@ -1293,10 +1474,10 @@ function onClick(e) {
   if (d.more !== undefined) { ui.histN += 200; renderView(); return; }
   if (d.csv !== undefined) {
     const list = S.trades.filter(x => ui.hist === "all" || x.m === ui.hist);
-    download(`ghost-desk-historial-${ui.hist === "all" ? "todo" : ui.hist}-${localDay(Date.now())}.csv`, toCSV(list), "text/csv;charset=utf-8");
+    download(`ghost-desk-history-${ui.hist}-${fileDay(Date.now())}.csv`, toCSV(list), "text/csv;charset=utf-8");
     return;
   }
-  if (d.cancel) { if (E.cancelOrder(S, +d.cancel)) { toast("Orden cancelada"); saveSoon(0); renderView(); renderSheet(); } return; }
+  if (d.cancel) { if (E.cancelOrder(S, +d.cancel)) { toast("Order canceled"); saveSoon(0); renderView(); renderSheet(); } return; }
   if (d.settings !== undefined) { openSettings(); return; }
   if (d.close !== undefined) { closeSheet(); return; }
   if (d.ivl) { ui.sheet.ivl = d.ivl; CFG.ivl = d.ivl; saveCfg(); $$("[data-ivl]").forEach(b => b.setAttribute("aria-pressed", b.dataset.ivl === d.ivl)); if (ui.sheet.key.startsWith("crypto:")) crypto.watchChart(null); loadChart(); return; }
@@ -1325,10 +1506,10 @@ function onClick(e) {
   if (d.savestops !== undefined) {
     const key = ui.sheet.key, q = quoteFor(key);
     const sl = +$("#slIn").value || null, tp = +$("#tpIn").value || null;
-    if (q && sl && sl >= q.px) { toast("El stop loss tiene que estar abajo del precio actual.", "down"); return; }
-    if (q && tp && tp <= q.px) { toast("El take profit tiene que estar arriba del precio actual.", "down"); return; }
+    if (q && sl && sl >= q.px) { toast("The stop loss has to be below the current price.", "down"); return; }
+    if (q && tp && tp <= q.px) { toast("The take profit has to be above the current price.", "down"); return; }
     E.setStops(S, key, { sl, tp }); saveSoon(0);
-    toast(sl || tp ? "Stop loss y take profit guardados" : "Stop loss y take profit quitados", "up");
+    toast(sl || tp ? "Stop loss and take profit saved" : "Stop loss and take profit removed", "up");
     renderSheet(); renderView(); return;
   }
   if (d.delalert) { CFG.alerts = CFG.alerts.filter(a => a.id !== +d.delalert); saveCfg(); renderSheet(); return; }
@@ -1340,14 +1521,23 @@ function onClick(e) {
   if (d.askperm !== undefined) { askPermission().then(() => renderSheet()); return; }
   if (d.export !== undefined) { exportBackup(); return; }
   if (d.install !== undefined) { installPrompt?.prompt(); installPrompt = null; return; }
+  if (d.start) {
+    if (d.start === "custom") { ui.resetCustom = true; renderReset(); $("#startIn")?.focus(); }
+    else { ui.resetCustom = false; ui.resetStart = +d.start; renderReset(); }
+    return;
+  }
   if (d.reset !== undefined) {
+    const start = ui.resetStart;
+    if (!E.validStart(start)) { toast(`Enter a starting balance between ${usd0(START_MIN)} and ${usd0(START_MAX)}.`, "down"); return; }
     if (!t.dataset.sure) {
-      t.dataset.sure = "1"; t.textContent = "Toca otra vez para borrar todo";
-      setTimeout(() => { if (t.isConnected) { delete t.dataset.sure; t.textContent = "Reiniciar cartera"; } }, 5000);
+      t.dataset.sure = "1"; t.textContent = `Tap again to erase everything and start with ${usd0(start)}`;
+      setTimeout(() => { if (t.isConnected) { delete t.dataset.sure; t.textContent = `Reset to ${usd0(ui.resetStart)}`; } }, 5000);
       return;
     }
-    S = E.newPortfolio(Date.now()); saveSoon(0);
-    toast("Cartera reiniciada: $10,000. Tus logros siguen.", "up");
+    S = E.newPortfolio(Date.now(), start); saveSoon(0);
+    resetBots(S.start, Date.now());
+    CFG.lastBuy = defaultBuy(S.start); saveCfg();
+    toast(`Portfolio reset: ${usd0(S.start)}. Your achievements stay.`, "up");
     closeSheet(); renderAll(); return;
   }
 }
@@ -1358,12 +1548,12 @@ function onSubmit(e) {
   if (f.matches("[data-search]")) { clearTimeout(searchTimer); runSearch(ui.market, f.querySelector("input").value); return; }
   if (f.matches("[data-alertform]")) {
     const v = +$("#alertIn").value, key = ui.sheet.key, q = quoteFor(key), inst = instOf(key);
-    if (!(v > 0)) { toast("Pon un precio.", "down"); return; }
-    if (!q) { toast("Espera el precio en vivo para crear el aviso.", "down"); return; }
+    if (!(v > 0)) { toast("Enter a price.", "down"); return; }
+    if (!q) { toast("Wait for the live price to create the alert.", "down"); return; }
     CFG.alerts.push({ id: Date.now(), key, inst: E.slimInst(inst), dir: v >= q.px ? "above" : "below", price: v, createdAt: Date.now() });
     saveCfg();
     const ns = notifySupport();
-    toast(`Aviso creado: ${inst.sym} a ${fmtPx(inst, v)}` + (ns.ok && ns.permission !== "granted" ? ". Permite avisos en Ajustes para que te llegue al teléfono." : ""), "up");
+    toast(`Alert set: ${inst.sym} at ${fmtPx(inst, v)}` + (ns.ok && ns.permission !== "granted" ? ". Allow notifications in Settings to get it on your phone." : ""), "up");
     renderSheet();
   }
 }
@@ -1375,6 +1565,11 @@ function onInput(e) {
     const m = ui.market, v = t.value;
     ui.query[m] = v;
     if (m === "fx" || v.trim().length >= 2 || !v.trim()) searchTimer = setTimeout(() => runSearch(m, v), m === "fx" ? 50 : 500);
+  }
+  if (t.id === "startIn") {
+    ui.resetStart = +t.value;
+    const b = $("[data-reset]"), okAmt = E.validStart(ui.resetStart);
+    if (b) { delete b.dataset.sure; b.disabled = !okAmt; b.textContent = okAmt ? `Reset to ${usd0(ui.resetStart)}` : "Enter an amount"; }
   }
 }
 
@@ -1395,8 +1590,8 @@ function setTab(tab) {
 }
 function ensureMarketLoaded() {
   if (TEST) return;
-  if (ui.tab === "mercados" || ui.tab === "inicio") {
-    if (ui.market === "meme" || ui.tab === "inicio") kick("meme");
+  if (ui.tab === "markets" || ui.tab === "home") {
+    if (ui.market === "meme" || ui.tab === "home") kick("meme");
     if (ui.market === "stock" && !lists.stock.length) kick("stock");
   }
 }
@@ -1428,11 +1623,13 @@ async function boot() {
   await openStore(TEST ? "ghost-desk-test" : undefined);
   S = (await kv.get("portfolio")) || E.newPortfolio(Date.now());
   A = (await kv.get("achievements")) || newAchievements();
+  const savedBots = await kv.get("bots");
+  BOTS = Array.isArray(savedBots?.list) ? savedBots.list : [];
   const saved = (await kv.get("settings")) || {};
   CFG = { ...DEFAULT_CFG, ...saved, notif: { ...DEFAULT_CFG.notif, ...(saved.notif || {}) } };
   for (const k in S.pos) { const p = S.pos[k]; if (!live.get(k) && p.lastPx) live.set(k, { inst: { ...p.inst }, px: null }); }
   const h = location.hash.slice(1);
-  if (["inicio", "mercados", "cartera", "historial", "logros"].includes(h)) ui.tab = h;
+  if (TABS.includes(h)) ui.tab = h;
   document.addEventListener("click", onClick);
   document.addEventListener("submit", onSubmit);
   document.addEventListener("input", onInput);
@@ -1460,6 +1657,7 @@ async function boot() {
 function setupTestHooks() {
   window.ghostDesk = {
     state: () => S, setLive, openSheet, openSettings, closeSheet, setTab, renderAll,
+    bots: () => BOTS, botTick, addBot, openBot,
     chooseSide: side => $(`[data-side="${side}"]`)?.click(),
     lists, live,
   };
@@ -1468,5 +1666,5 @@ function setupTestHooks() {
 
 boot().catch(e => {
   console.error(e);
-  $("#view").innerHTML = `<div class="banner err">No se pudo iniciar Ghost Desk: ${esc(e?.message || e)}. Recarga la página.</div>`;
+  $("#view").innerHTML = `<div class="banner err">Ghost Desk couldn't start: ${esc(e?.message || e)}. Reload the page.</div>`;
 });

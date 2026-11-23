@@ -131,7 +131,7 @@ export function createCrypto({ onTick, onKline, onState }) {
     }
     const prod = id.replace(/USDT$/, "") + "-USD";
     const d = await getJSON(`${CB}/products/${encodeURIComponent(prod)}/candles?granularity=${IVL_CB[ivl]}`, { source: "coinbase" });
-    if (!Array.isArray(d)) throw new SourceError("coinbase", "http", "Sin velas");
+    if (!Array.isArray(d)) throw new SourceError("coinbase", "http", "No candles");
     return d.map(r => ({ t: r[0] * 1000, l: +r[1], h: +r[2], o: +r[3], c: +r[4] })).sort((a, b) => a.t - b.t);
   }
 

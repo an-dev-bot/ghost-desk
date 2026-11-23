@@ -70,7 +70,7 @@ const GT_TF = { "1m": ["minute", 1], "5m": ["minute", 5], "1h": ["hour", 1], "1d
 
 /** Candles for a pool from GeckoTerminal. Throws notfound if the pool is not indexed there. */
 export async function candles(pool, ivl) {
-  if (!pool) throw new SourceError("geckoterminal", "notfound", "Sin pool");
+  if (!pool) throw new SourceError("geckoterminal", "notfound", "No pool");
   const [tf, agg] = GT_TF[ivl];
   await gtLim.take();
   const d = await getJSON(`${GT}/networks/solana/pools/${encodeURIComponent(pool)}/ohlcv/${tf}?aggregate=${agg}&limit=300&currency=usd&token=base`, { source: "geckoterminal" });

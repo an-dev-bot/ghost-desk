@@ -5,7 +5,7 @@
 export function notifySupport() {
   if (!("Notification" in window)) {
     const ios = /iPhone|iPad|iPod/.test(navigator.userAgent);
-    return { ok: false, why: ios ? "En iPhone los avisos solo funcionan con la app instalada en la pantalla de inicio (iOS 16.4 o más)." : "Este navegador no permite avisos." };
+    return { ok: false, why: ios ? "On iPhone, notifications only work with the app added to the Home Screen (iOS 16.4 or later)." : "This browser does not allow notifications." };
   }
   return { ok: true, permission: Notification.permission };
 }
