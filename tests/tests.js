@@ -13,6 +13,7 @@ import { setFetch } from "../js/sources/http.js";
 import { createTwelve } from "../js/sources/twelve.js";
 import { createFinnhub } from "../js/sources/stocks.js";
 import { fxInst } from "../js/sources/fx.js";
+import { newBot, step as botStep, freshQuotes, standing, botName, STYLE_IDS, MAX_AGE } from "../js/core/bots.js";
 
 const results = [];
 async function test(name, fn) {
@@ -404,6 +405,116 @@ await test("Start · money achievements scale with the starting balance", () => 
   ok(!run(100000, 115).includes("profit_10"), "+7.5% is not enough");
   ok(run(100000, 201).includes("value_150"), "doubling half the balance reaches 1.5×");
   ok(!evaluate(newAchievements(), [], { trades: [], total: 15000, start: 100000, now: T0 }).includes("value_150"), "$15,000 is no longer a goal on $100,000");
+});
+
+// ---------------------------------------------------------------- rival bots
+const statusAt = now => m => H.marketStatus(m, now);
+const L = (inst, px, t, extra = {}) => ({ inst, px, t, ...extra });
+const MEMEX = { key: "meme:PUMP", m: "meme", id: "PUMP", sym: "PUMP", name: "Pump", pair: "POOL2" };
+
+await test("Bots · own portfolio as big as mine and separate from mine", () => {
+  const me = E.newPortfolio(T0, 250000);
+  const b = newBot("momentum", { id: "b1", start: me.start, now: T0, seed: 1 });
+  eq(b.pf.start, 250000, "same starting balance"); eq(b.pf.cash, 250000, "own cash");
+  ok(b.pf !== me && b.pf.trades !== me.trades, "separate objects");
+  const tr = botStep(b, { entries: [L(BTC, 60000, T0, { ch24: 5 })], now: T0, status: statusAt(T0), bootAt: T0 - 60e3 });
+  eq(tr.length, 1, "the bot bought"); eq(me.cash, 250000, "my cash untouched"); eq(me.trades.length, 0, "my history untouched");
+  deepEq(STYLE_IDS, ["momentum", "contrarian", "degen", "random"], "four styles");
+  eq(botName("momentum", [b]), "Momentum 2", "several bots of one style get numbered");
+});
+
+await test("Bots · Momentum picks the fastest riser in the 4 markets, with my costs and my hours", () => {
+  const entries = [L(BTC, 60000, T0, { ch24: 5 }), L(AAPL, 200, T0, { ch24: 4 }), L(EURUSD, 1.1, T0, { ch24: 0.2, quoteUsd: 1 }), L(MEMEX, 0.001, T0, { ch24: 300, ch1h: 20, liq: 50000 })];
+  const b = newBot("momentum", { id: "m", start: 100000, now: T0, seed: 1 });
+  const [t] = botStep(b, { entries, now: T0, status: statusAt(T0), bootAt: 0 });
+  eq(t?.sym, "AAPL", "AAPL +4% beats BTC +5% (stocks move half as much); EURUSD +0.2% too small; thin memecoin skipped");
+  near(t.usd, 6000, "6% of its $100,000");
+  const mine = E.executeBuy(E.newPortfolio(T0), AAPL, 6000, { px: 200, t: T0 }, T0);
+  eq(t.px, mine.px, "same effective price as my trade"); eq(t.fee, mine.fee, "same commission"); eq(t.slip, mine.slip, "same spread");
+  eq(botStep(b, { entries, now: T0 + 30e3, status: statusAt(T0 + 30e3), bootAt: 0 }).length, 0, "waits its cooldown before the next buy");
+  const sat = H.nyToUtc(2026, 11, 28, 12, 0);
+  const b2 = newBot("momentum", { id: "m2", start: 100000, now: sat, seed: 1 });
+  const [t2] = botStep(b2, { entries: entries.map(x => ({ ...x, t: sat })), now: sat, status: statusAt(sat), bootAt: 0 });
+  eq(t2?.sym, "BTC", "Saturday: stocks and forex closed, so it buys crypto");
+});
+
+await test("Bots · no made-up trades for the time the app was closed", () => {
+  const boot = T0;
+  const b = newBot("momentum", { id: "x", start: 100000, now: T0 - 86400e3, seed: 1 });
+  E.executeBuy(b.pf, BTC, 6000, { px: 60000, t: T0 - 86400e3 }, T0 - 86400e3);
+  const before = JSON.stringify(b.pf);
+  // prices from before the app opened (e.g. the last price saved yesterday) are not used, even if they would trigger a sale
+  eq(botStep(b, { entries: [L(BTC, 40000, boot - 1000, { ch24: -30 }), L(AAPL, 200, boot - 1000, { ch24: 9 })], now: boot + 1000, status: statusAt(boot + 1000), bootAt: boot }).length, 0, "nothing with pre-open prices");
+  eq(JSON.stringify(b.pf), before, "portfolio untouched");
+  eq(freshQuotes([L(BTC, 60000, boot + 1000)], boot + 1000 + MAX_AGE + 1, statusAt(boot), boot).size, 0, "a price older than 10 min is not live");
+  const mon = H.nyToUtc(2026, 11, 30, 9, 31);
+  eq(freshQuotes([L(AAPL, 200, H.nyToUtc(2026, 11, 27, 12, 59))], mon, statusAt(mon), 0).size, 0, "Friday's stock price is not used after Monday's open");
+  eq(freshQuotes([L(AAPL, 200, mon - 1000)], mon, statusAt(mon), 0).size, 1, "a price from after the bell is");
+  const [s] = botStep(b, { entries: [L(BTC, 40000, boot + 2000, { ch24: -30 })], now: boot + 3000, status: statusAt(boot + 3000), bootAt: boot });
+  eq(s?.side, "sell", "once a live price arrives it acts on it"); near(s.mid, 40000, "at that live price");
+});
+
+await test("Bots · exits: take profit, stop loss, faded momentum; Contrarian buys the drop", () => {
+  const b = newBot("momentum", { id: "e", start: 100000, now: T0, seed: 1 });
+  botStep(b, { entries: [L(BTC, 60000, T0, { ch24: 5 })], now: T0, status: statusAt(T0), bootAt: 0 });
+  const up = botStep(b, { entries: [L(BTC, 64200, T0 + 60e3, { ch24: 7 })], now: T0 + 60e3, status: statusAt(T0), bootAt: 0 });
+  ok(up[0]?.side === "sell" && up[0].pl > 0 && /take profit/.test(up[0].why), "+6.7% after costs → take profit");
+  const b2 = newBot("momentum", { id: "e2", start: 100000, now: T0, seed: 1 });
+  botStep(b2, { entries: [L(BTC, 60000, T0, { ch24: 5 })], now: T0, status: statusAt(T0), bootAt: 0 });
+  const dn = botStep(b2, { entries: [L(BTC, 57500, T0 + 60e3, { ch24: 1 })], now: T0 + 60e3, status: statusAt(T0), bootAt: 0 });
+  ok(dn[0]?.side === "sell" && dn[0].pl < 0 && /stop loss/.test(dn[0].why), "−4.2% → stop loss");
+  const b3 = newBot("momentum", { id: "e3", start: 100000, now: T0, seed: 1 });
+  botStep(b3, { entries: [L(BTC, 60000, T0, { ch24: 5 })], now: T0, status: statusAt(T0), bootAt: 0 });
+  const fd = botStep(b3, { entries: [L(BTC, 60500, T0 + 60e3, { ch24: -0.5 })], now: T0 + 60e3, status: statusAt(T0), bootAt: 0 });
+  ok(fd[0]?.side === "sell" && /faded/.test(fd[0].why), "24h turned negative → sells");
+  const c = newBot("contrarian", { id: "c", start: 100000, now: T0, seed: 1 });
+  const [ct] = botStep(c, { entries: [L(BTC, 60000, T0, { ch24: -6 }), L(AAPL, 200, T0, { ch24: -2.5 }), L(EURUSD, 1.1, T0, { ch24: -0.3, quoteUsd: 1 })], now: T0, status: statusAt(T0), bootAt: 0 });
+  eq(ct?.sym, "BTC", "−6% crypto (score 6) beats −2.5% stock (score 5); −0.3% forex is too small");
+});
+
+await test("Bots · Degen: memecoins only, big bets capped by the pool's liquidity", () => {
+  const d = newBot("degen", { id: "d", start: 100000, now: T0, seed: 1 });
+  const NEWC = { ...MEMEX, key: "meme:NEW", id: "NEW", sym: "NEW", born: T0 - 5 * 60e3 };
+  const entries = [L(BTC, 60000, T0, { ch24: 20 }), L(MEMEX, 0.001, T0, { ch24: 80, ch1h: 25, liq: 1e6 }), L(NEWC, 0.0002, T0, { ch24: 0, ch1h: 3, liq: 400000 }), L({ ...MEMEX, key: "meme:THIN", id: "THIN", sym: "THIN", born: T0 - 60e3 }, 0.01, T0, { liq: 5000 })];
+  const [t] = botStep(d, { entries, now: T0, status: statusAt(T0), bootAt: 0 });
+  eq(t?.sym, "NEW", "a 5-minute-old coin beats a pump; BTC and a $5K pool are ignored");
+  near(t.usd, 10000, "min(25% of $100,000, 2.5% of $400,000 liquidity)");
+  near(t.px, 0.0002 * 1.05, "pays the same 5% price impact I would");
+  near(t.fee, 100, "and the same 1% fee");
+  const [t2] = botStep(d, { entries, now: T0 + 61e3, status: statusAt(T0), bootAt: 0 });
+  eq(t2?.sym, "PUMP", "next bet: the pumping coin");
+  ok(t2.usd > 24000 && t2.usd <= 25000, "about 25% of its value: " + t2.usd);
+});
+
+await test("Bots · Random: reproducible from its seed, sizes 2–10%, trades only open markets", () => {
+  const run = () => {
+    const r = newBot("random", { id: "r", start: 100000, now: T0, seed: 12345 });
+    const out = [];
+    const sat = H.nyToUtc(2026, 11, 28, 12, 0);
+    for (let i = 0; i < 60; i++) {
+      const now = sat + i * 60e3;
+      for (const t of botStep(r, { entries: [L(BTC, 60000 + i * 10, now, { ch24: 1 }), L(AAPL, 200, now, { ch24: 1 }), L(EURUSD, 1.1, now, { ch24: 0, quoteUsd: 1 })], now, status: statusAt(now), bootAt: 0 })) out.push(t);
+    }
+    return out;
+  };
+  const a = run(), b = run();
+  ok(a.length > 3, "it trades (" + a.length + " trades in an hour)");
+  deepEq(a.map(t => [t.side, t.sym, t.usd]), b.map(t => [t.side, t.sym, t.usd]), "same seed, same decisions");
+  ok(a.every(t => t.sym === "BTC"), "Saturday: only crypto, stocks and forex are closed");
+  ok(a.filter(t => t.side === "buy").every(t => t.usd >= 1900 && t.usd <= 10500), "sizes between 2% and 10% of its value");
+});
+
+await test("Bots · leaderboard numbers and backup round-trip", () => {
+  const b = newBot("momentum", { id: "lb", start: 100000, now: T0, seed: 1 });
+  E.executeBuy(b.pf, BTC, 1000, { px: 60000, t: T0 }, T0); E.executeSell(b.pf, BTC.key, 1, { px: 66000, t: T0 }, T0);
+  E.executeBuy(b.pf, AAPL, 1000, { px: 200, t: T0 }, T0); E.executeSell(b.pf, AAPL.key, 1, { px: 190, t: T0 }, T0);
+  const x = standing(b.pf, () => null);
+  near(x.total, b.pf.cash, "total = cash with no positions"); near(x.plPct, (b.pf.cash - 100000) / 100000, "gain %");
+  eq(x.best.sym, "BTC", "best trade"); eq(x.worst.sym, "AAPL", "worst trade"); eq(x.closed, 2, "closed trades");
+  const text = buildBackup({ portfolio: E.newPortfolio(T0), achievements: newAchievements(), settings: {}, bots: [b] });
+  deepEq(parseBackup(text).bots, [b], "bots come back from the file");
+  const old = JSON.parse(text); delete old.bots;
+  eq(parseBackup(JSON.stringify(old)).bots, null, "an older backup without bots leaves this phone's bots alone");
 });
 
 // ---------------------------------------------------------------- extras: achievements, candles

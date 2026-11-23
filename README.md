@@ -89,6 +89,14 @@ picks up the new version. If you change app files, also bump the `VERSION` strin
   ($100 to $10K on $100,000), plus Max.
 - **Achievements**: the money goals (+10% realized, portfolio +50%) are measured against your starting balance.
   Achievements stay when you reset.
+- **Rival bots** (Settings → Rival bots, up to 6 at once): each bot has its own portfolio, as big as yours,
+  and decides by itself what to buy, how much and when to sell, with your same costs and market hours.
+  Styles: **Momentum** (buys the fastest risers in all 4 markets, cuts losers early), **Contrarian** (buys the
+  biggest drops and sells the bounce), **Degen** (memecoins only, big bets on new and pumping coins, sized to the
+  pool's liquidity) and **Random**. They trade only while the app is on screen and only on live prices seen after
+  it opened: nothing is made up for the time it was closed. The leaderboard (Trophies, and Home when you have bots)
+  shows you vs. each bot: total, % gain, best and worst trade; tap a bot for its positions and history.
+  Resetting your portfolio restarts the bots with the same balance. Bots are included in the backup file.
 - **Real hours**: stocks 9:30 AM to 4:00 PM New York time (with NYSE holidays and early closes);
   outside hours the order waits and fills at the first price after the open.
   Forex Sunday 5:00 PM to Friday 5:00 PM New York time. Crypto and memecoins always.
@@ -110,5 +118,5 @@ python tests/run.py "C:/Program Files/Google/Chrome/Application/chrome.exe" http
 
 This runs the spec tests with hand-made prices (math, hours, orders, backup, keys, starting balance) and
 checks the app at 375 px wide, buying for real with the slide gesture and resetting from Settings.
-With a fourth argument it runs against the real sources: `live`, `badkeys`, `tddemo` or `offline` (see `tests/run.py`).
+With a fourth argument it runs against the real sources: `live`, `badkeys`, `tddemo`, `offline` or `bots` (see `tests/run.py`).
 You can also open `http://127.0.0.1:8765/tests/` in the browser.

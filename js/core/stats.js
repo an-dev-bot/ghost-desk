@@ -62,7 +62,7 @@ export function winStreak(trades) {
   return best;
 }
 
-const REASON = { manual: "manual", limit: "limit order", open: "waiting order (market open)", sl: "stop loss", tp: "take profit" };
+const REASON = { manual: "manual", limit: "limit order", open: "waiting order (market open)", sl: "stop loss", tp: "take profit", bot: "bot" };
 
 /** US format a spreadsheet reads as a date: 11/23/2026 4:05:09 PM (phone's local time). */
 export function usDateTime(ms) {

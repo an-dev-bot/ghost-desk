@@ -241,6 +241,19 @@ h4{font-size:13px;margin:14px 0 6px;color:var(--muted)}
 .chips.start{margin-bottom:10px}
 .chips.start button{flex:1 1 auto}
 .danger-zone .btn.danger{margin-top:12px;width:100%}
+.ico-rank{background:none;font:800 18px var(--mono)}
+.ico-bot{font-size:22px}
+.row.lb{min-height:72px}
+.row.lb.me{border-color:rgba(143,123,255,.45)}
+.feed{display:block;width:100%;text-align:left;background:var(--panel);border-radius:12px;padding:10px 12px;font-size:13px;line-height:1.45}
+.feed small{color:var(--muted);font:12px var(--mono);margin-left:4px}
+.bot-row{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:10px 0;border-bottom:1px solid var(--line)}
+.btn.sm{min-height:40px;padding:8px 12px;font-size:13px;flex:none}
+.bot-add{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}
+.bot-style{display:flex;flex-direction:column;gap:4px;text-align:left;background:var(--panel3);border:1px solid var(--line);border-radius:12px;padding:10px;min-height:44px}
+.bot-style small{color:var(--muted);font-size:12px;line-height:1.35}
+.bot-style:disabled{opacity:.45}
+h3.sec{margin-top:18px}
 .danger-zone{border:1px solid rgba(255,77,109,.35)}
 
 /* results: confetti, big number, shake */

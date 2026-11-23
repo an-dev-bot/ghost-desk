@@ -9,6 +9,7 @@
 Extra modes against the real price sources (4th argument):
   live     the real app with no keys: memecoins, crypto and FX must show live prices
   offline  installs the app, stops its server and the network: portfolio and history still open
+  bots     the real app with 4 rival bots for ~2 minutes on real prices: what they trade and why
   badkeys  wrong Finnhub / Twelve Data keys: clear notices, nothing blank, nothing cached
   tddemo   Twelve Data's public "demo" key: real EUR/USD candles, saved and reused without a credit
 """
@@ -98,6 +99,8 @@ async def main():
                 ok = await twelve_demo_check(p)
             elif MODE == "offline":
                 ok = await offline_check(p)
+            elif MODE == "bots":
+                ok = await bots_live_check(p)
             else:
                 ok1 = await unit_tests(p)
                 ok2 = await layout_tests(p)
@@ -226,6 +229,7 @@ async def layout_tests(p):
     await asyncio.sleep(0.5)
     await check("settings")
     fails += await reset_tests(p, check)
+    fails += await rival_tests(p, check)
     if p.events:
         print("Console errors:", *p.events[:10], sep="\n  ")
     return not fails and not p.events
@@ -282,6 +286,109 @@ async def reset_tests(p, check):
     if not ok2:
         fails.append("custom start")
     return fails
+
+
+async def rival_tests(p, check):
+    """Settings → add bots through the real buttons; bots trade on the live prices; leaderboard and bot history."""
+    fails = []
+    await p.js("ghostDesk.closeSheet(true), ghostDesk.openSettings(), true")
+    await asyncio.sleep(0.4)
+    for style in ["momentum", "degen", "random", "contrarian"]:
+        await p.js(f"document.querySelector('[data-addbot={style}]').scrollIntoView(), document.querySelector('[data-addbot={style}]').click(), true")
+        await asyncio.sleep(0.2)
+    await p.js("document.querySelector('[data-addbot=momentum]').click(), true")
+    await asyncio.sleep(0.3)
+    names = await p.js("ghostDesk.bots().map(b => b.name + ':' + b.pf.start)")
+    await check("settings bots")
+    ok1 = names == ["Momentum:25000", "Degen:25000", "Random:25000", "Contrarian:25000", "Momentum 2:25000"]
+    print(("PASS " if ok1 else "FAIL ") + f" Bots added from Settings, each as big as my portfolio: {names}")
+    if not ok1:
+        fails.append("add bots")
+    # fresh live prices (as the app would receive them), then the bots take turns
+    await p.js("""(() => { const g = ghostDesk, now = Date.now();
+      for (const L of g.live.values()) if (L.px > 0) g.setLive(L.inst, { px: L.px, t: now }, { check: false });
+      return true; })()""")
+    made = await p.js("ghostDesk.botTick(Date.now()).map(([b, t]) => b.name + ' ' + t.side + ' ' + t.sym + ' $' + t.usd.toFixed(2) + ' (' + t.why + ')')")
+    print("  Bot turns:", *made, sep="\n    ")
+    mine = await p.js("ghostDesk.state().trades.length")
+    ok2 = any(m.startswith("Momentum ") for m in made) and any(m.startswith("Degen ") for m in made) and mine == 0
+    print(("PASS " if ok2 else "FAIL ") + f" Bots trade on their own portfolios (my trades still {mine})")
+    if not ok2:
+        fails.append("bot trades")
+    await p.js("ghostDesk.closeSheet(true), ghostDesk.setTab('home'), true")
+    await asyncio.sleep(0.4)
+    lb = await p.js("[...document.querySelectorAll('#lbSlot .row.lb')].map(r => r.querySelector('.nm b').textContent.trim())")
+    await check("home leaderboard")
+    await p.js("ghostDesk.setTab('achievements'), true")
+    await asyncio.sleep(0.4)
+    await check("trophies leaderboard")
+    rows = await p.js("[...document.querySelectorAll('#lbSlotFull .row.lb')].map(r => r.innerText.replace(/\\n/g, ' | '))")
+    print("  Leaderboard:", *rows, sep="\n    ")
+    ok3 = len(lb) == 6 and "You" in lb and all(("Best" in r and "Worst" in r and "%" in r and "$" in r) for r in rows)
+    print(("PASS " if ok3 else "FAIL ") + " Leaderboard: me vs each bot with total, % gain, best and worst trade")
+    if not ok3:
+        fails.append("leaderboard")
+    await p.js("[...document.querySelectorAll('#lbSlotFull [data-bot]')].find(r => r.textContent.includes('Degen')).click(), true")
+    await asyncio.sleep(0.5)
+    sheet = await p.js("document.querySelector('.sheet .sh-title h2')?.textContent + ' / ' + document.querySelectorAll('.sheet .tr').length + ' trades in its history'")
+    print("  Bot sheet:", sheet)
+    await check("bot sheet")
+    ok4 = "trades in its history" in sheet and not sheet.endswith(" 0 trades in its history")
+    print(("PASS " if ok4 else "FAIL ") + " Bot history sheet opens from the leaderboard")
+    if not ok4:
+        fails.append("bot sheet")
+    # removing a bot takes two taps
+    await p.js("ghostDesk.closeSheet(true), ghostDesk.openSettings(), true")
+    await asyncio.sleep(0.3)
+    await p.js("document.querySelector('[data-delbot]').click(), true")
+    n1 = await p.js("ghostDesk.bots().length")
+    await p.js("document.querySelector('[data-delbot]').click(), true")
+    n2 = await p.js("ghostDesk.bots().length")
+    ok5 = n1 == 5 and n2 == 4
+    print(("PASS " if ok5 else "FAIL ") + f" Remove a bot with two taps ({n1} → {n2})")
+    if not ok5:
+        fails.append("remove bot")
+    await p.js("ghostDesk.closeSheet(true), true")
+    return fails
+
+
+async def bots_live_check(p):
+    """Real app, real prices, four bots: they trade only on live prices seen after the app opened."""
+    await p.send("Emulation.setDeviceMetricsOverride", width=375, height=812, deviceScaleFactor=2, mobile=True)
+    await p.goto(BASE + "/index.html#home", "!!document.querySelector('#view .cd-card')")
+    await p.js("""(async () => {
+      const st = await import('./js/store.js'), B = await import('./js/core/bots.js'), E = await import('./js/core/engine.js');
+      await st.openStore();
+      const now = Date.now(), old = now - 3 * 86400e3;
+      const list = ['momentum', 'contrarian', 'degen', 'random'].map((s, i) => B.newBot(s, { id: 'live' + i, start: 100000, now: old, seed: 99 + i }));
+      // a position bought three days ago: its old price must not be used for anything when the app opens
+      E.executeBuy(list[0].pf, { key: 'crypto:BTCUSDT', m: 'crypto', id: 'BTCUSDT', sym: 'BTC', name: 'Bitcoin' }, 5000, { px: 20000, t: old }, old);
+      await st.kv.set('bots', { v: 1, list });
+      await st.kv.set('portfolio', E.newPortfolio(now));
+      return true; })()""")
+    t_open = await p.js("Date.now()")
+    await p.goto(BASE + "/index.html?r=3#achievements", "!!document.getElementById('lbSlotFull')")
+    await asyncio.sleep(120)
+    res = await p.js("""(async () => {
+      const st = await import('./js/store.js'); const d = await st.kv.get('bots');
+      return d.list.map(b => ({ name: b.name, trades: b.pf.trades.filter(t => t.t > %d).map(t => [new Date(t.t).toISOString().slice(11, 19), t.side, t.sym, t.m, Math.round(t.usd), +t.mid.toPrecision(6), t.why]), cash: Math.round(b.pf.cash), btc: b.pf.trades.filter(t => t.sym === 'BTC' && t.side === 'sell').map(t => [t.mid, new Date(t.t).toISOString()]) }));
+    })()""" % t_open)
+    total = 0
+    for b in res:
+        print(f"{b['name']}: {len(b['trades'])} trades, cash ${b['cash']:,}")
+        for t in b["trades"]:
+            print("   ", *t)
+        total += len(b["trades"])
+    rows = await p.js("[...document.querySelectorAll('#lbSlotFull .row.lb')].map(r => r.innerText.replace(/\\n/g, ' | '))")
+    print("Leaderboard:", *rows, sep="\n  ")
+    await p.shot("live-bots-leaderboard")
+    old_px = [x for b in res for x in b["btc"] if x[0] == 20000]
+    ok = total > 0 and not old_px and not p.events
+    print(("PASS " if ok else "FAIL ") + f" bots traded {total} times on real prices; none at the 3-day-old $20,000 BTC price")
+    if p.events:
+        print("Console:", *p.events[:10], sep=chr(10) + "  ")
+    await p.js("(async () => { const st = await import('./js/store.js'); await st.kv.set('bots', { v: 1, list: [] }); return true; })()")
+    return ok
 
 
 async def live_check(p):

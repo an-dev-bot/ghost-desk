@@ -1,6 +1,8 @@
 // Backup file: move the portfolio from the PC to the phone (or back).
 // API keys are never written to the file: each device keeps its own.
 
+import { validBots } from "./bots.js";
+
 export const BACKUP_APP = "ghost-desk";
 const SECRET_FIELDS = ["finnhubKey", "twelveKey"];
 
@@ -10,10 +12,10 @@ export function publicSettings(settings) {
   return s;
 }
 
-export function buildBackup({ portfolio, achievements, settings }, now = Date.now()) {
+export function buildBackup({ portfolio, achievements, settings, bots }, now = Date.now()) {
   return JSON.stringify({
     app: BACKUP_APP, format: 1, exportedAt: new Date(now).toISOString(),
-    portfolio, achievements, settings: publicSettings(settings),
+    portfolio, achievements, settings: publicSettings(settings), bots: bots || [],
   }, null, 1);
 }
 
@@ -36,7 +38,9 @@ export function parseBackup(text) {
   for (const t of p.trades) if (!isNum(t.t) || !isNum(t.usd) || !t.m) throw new BackupError("A trade in the backup is damaged.");
   p.days ||= {};
   p.seq = Math.max(p.seq || 0, ...p.trades.map(t => t.id || 0), ...p.orders.map(o => o.id || 0));
-  return { portfolio: p, achievements: d.achievements || null, settings: publicSettings(d.settings) };
+  // Older backups have no bots: keep the ones on this phone. A damaged bot list is ignored, not imported.
+  const bots = d.bots === undefined ? null : validBots(d.bots) ? d.bots : null;
+  return { portfolio: p, achievements: d.achievements || null, settings: publicSettings(d.settings), bots };
 }
 
 /** Union of two achievement records: keeps the earliest unlock and the larger counters. */

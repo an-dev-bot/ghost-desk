@@ -476,7 +476,7 @@ function leaderboardHTML() {
   return `<div class="list">${participants().map((x, i) => `
     <button class="row lb ${x.id === "me" ? "me" : ""}" ${x.id === "me" ? `data-tab="history"` : `data-bot="${esc(x.id)}"`}>
       <span class="ico ico-rank" aria-label="Rank ${i + 1}">${medal[i] || i + 1}</span>
-      <span class="nm"><b>${esc(x.name)}${x.style ? ` <i class="mk-tag">${STYLES[x.style].name}</i>` : ""}</b><small>${tr("Best", x.best)}</small><small>${tr("Worst", x.worst)}</small></span>
+      <span class="nm"><b>${esc(x.name)}${x.style && !x.name.startsWith(STYLES[x.style].name) ? ` <i class="mk-tag">${STYLES[x.style].name}</i>` : ""}</b><small>${tr("Best", x.best)}</small><small>${tr("Worst", x.worst)}</small></span>
       <span class="px"><b>${usd(x.total)}</b><small class="${dirCls(x.pl)}">${pct(x.plPct * 100)}</small></span>
     </button>`).join("")}</div>`;
 }
