@@ -80,6 +80,7 @@ export function cleanPortfolio(p, now, issues) {
     else {
       let n = 0;
       for (const k of ["on", "armed", "whale", "used"]) if (!obj(c[k])) { c[k] = {}; n++; }
+      if (c.always !== undefined && !obj(c.always)) { delete c.always; n++; }
       if (!Array.isArray(c.log)) { c.log = []; n++; }
       if (!num(c.lev) || c.lev < 1) { c.lev = 1; n++; }
       const b = c.boost;

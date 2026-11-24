@@ -7,7 +7,7 @@ import { scoreboard, greenStreak, localDay, toCSV, MARKET_LABEL, realizedByDay, 
 import { ACHIEVEMENTS, newAchievements, evaluate, achievementById } from "./core/achievements.js";
 import { applyTick, ticksToBars, INTERVALS } from "./core/candles.js";
 import { buildBackup, parseBackup, mergeAchievements } from "./core/backup.js";
-import { STYLES, STYLE_IDS, MAX_BOTS, newBot, botName, step as botStep, cheatTick as botCheatTick, cheatFeed as botCheatFeed, BOT_CHEATS, standing, byRank, preview as botPreview } from "./core/bots.js";
+import { STYLES, STYLE_IDS, MAX_BOTS, newBot, botName, step as botStep, cheatTick as botCheatTick, cheatFeed as botCheatFeed, BOT_CHEATS, DIFFS, DIFF_IDS, standing, byRank, preview as botPreview } from "./core/bots.js";
 import * as C from "./core/cheats.js";
 import * as RP from "./core/replay.js";
 import * as SW from "./sim/world.js";
@@ -43,7 +43,8 @@ const CHIP_FRACS = [0.001, 0.005, 0.01, 0.05, 0.1];
 const DEFAULT_CFG = {
   finnhubKey: "", twelveKey: "", sound: false, simSound: false,
   lc: { pct: 10, warn: true, trail: false }, // Last chance: warn (or sell with the trailing stop) at −pct% from the high since you bought
-  notif: { fills: true, moves: true, price: true, summary: true, streak: true }, moveTh: 5, botCheats: true,
+  notif: { fills: true, moves: true, price: true, summary: true, streak: true }, moveTh: 5, botCheats: true, botDiff: "normal", showMarks: false,
+  notice: { quiet: false, trades: true, cheats: true, bots: true, sim: true, price: true, saved: true }, // notices inside the app
   oracleAuto: { on: false, pct: 10, scope: "view" }, frontPct: 10,
   alerts: [], lastBuy: defaultBuy(START_CASH), chartMode: "candles", ivl: "5m", lastSummary: "", lastStreakDay: "",
 };
@@ -160,7 +161,7 @@ function trackedKeys(m) {
   for (const x of E.marginPositions(S)) set.add(x.key);
   for (const o of S.orders) set.add(o.key);
   for (const a of CFG.alerts) set.add(a.key);
-  for (const b of BOTS) for (const k in b.pf.pos) set.add(k);
+  for (const b of BOTS) { for (const k in b.pf.pos) set.add(k); for (const x of E.marginPositions(b.pf)) set.add(x.key); }
   if (ui.sheet?.kind === "inst") set.add(ui.sheet.key);
   return [...set].filter(k => !m || k.startsWith(m + ":"));
 }
@@ -205,7 +206,7 @@ const richDate = () => new Date(RICH.AS_OF).toLocaleDateString("en-US", { month:
 const levelSource = i => [`${RICH.SOURCE}, ${richDate()}`, `GDP of ${RICH.GDP_YEAR}, ${RICH.GDP_SOURCE}`, `${RICH.WEALTH_SOURCE}, end of ${RICH.WEALTH_YEAR} (56 markets, over 92% of the world's wealth)`][i];
 function capNotice(cut) {
   const l = RICH.LEVELS[RICH.levelOf(S)];
-  toast(`${l.icon} Your ${SIM ? "Sim " : ""}portfolio stops at ${$usd(l.cap)}, ${l.what}. ${$usd(cut)} stayed out.`, "gold");
+  toast(`${l.icon} Your ${SIM ? "Sim " : ""}portfolio stops at ${$usd(l.cap)}, ${l.what}. ${$usd(cut)} stayed out.`, "gold", "important");
   vibrate([60, 40, 60]);
 }
 let fxQueue = [], fxBusy = false;
@@ -238,7 +239,7 @@ function levelCheck(now = appNow(), qf = quoteFor) {
 }
 function botLevelCheck(b, now, qf) {
   const l = E.checkLevel(b.pf, now, qf);
-  if (l >= 0) { toast(`${RICH.LEVELS[l].icon} ${esc(b.name)} reached ${$usd(RICH.LEVELS[l].cap)}`, "gold"); saveBots(false); }
+  if (l >= 0) { toast(`${RICH.LEVELS[l].icon} ${esc(b.name)} reached ${$usd(RICH.LEVELS[l].cap)}`, "gold", "bots"); saveBots(false); }
 }
 const prestigeN = () => A.prestige?.length || 0;
 const prestigeReady = () => S.reached?.[RICH.LAST] != null;
@@ -263,7 +264,7 @@ async function prestige() {
 function prestigeHTML() {
   const list = A.prestige || [];
   if (!list.length) return "";
-  return `<h2>Prestige</h2><div class="ach-grid">${list.map((p, i) => `<div class="ach got prest"><span class="ach-i" aria-hidden="true">🎖️</span><b>Prestige ${i + 1}${p.cheat ? ` <span class="star">★</span>` : ""}</b><small>${dateTime(p.t)}</small></div>`).join("")}</div>`;
+  return `<h2>Prestige</h2><div class="ach-grid">${list.map((p, i) => `<div class="ach got prest"><span class="ach-i" aria-hidden="true">🎖️</span><b>Prestige ${i + 1}${p.cheat ? star() : ""}</b><small>${dateTime(p.t)}</small></div>`).join("")}</div>`;
 }
 function ladderHTML() {
   const total = E.totals(S, quoteFor).total, lv = RICH.levelOf(S);
@@ -338,7 +339,7 @@ function lastChanceSell() {
     const p = S.pos[x.key]; if (!p) return;
     const r = E.placeOrder(S, p.inst, { side: "sell", type: "market", frac: 1 }, quoteFor(x.key), now, mstatus(p.inst.m, now));
     if (r.trade) { celebrate(r.trade); afterTrades([r.trade]); }
-    else { toast(`The market is closed: your ${esc(p.inst.sym)} sale fills at the open.`); saveSoon(0); renderView(); renderSheet(); }
+    else { toast(`The market is closed: your ${esc(p.inst.sym)} sale fills at the open.`, "", "trades"); saveSoon(0); renderView(); renderSheet(); }
   } catch (e) { toast(e.message, "down"); vibrate(80); }
 }
 
@@ -350,28 +351,28 @@ function handleEvents(events) {
       trades.push(t);
       const kind = e.order.type === "limit" ? "Your limit order filled" : "Your order filled at the market open";
       const body = `${t.side === "buy" ? "Bought" : "Sold"} ${t.sym} at ${$px(instOf(t.key), t.px)} · ${$usd(t.usd)}${t.side === "sell" ? " · " + usd(t.pl, { sign: true }) : ""}`;
-      toast(kind + ": " + body, t.side === "sell" ? (t.pl >= 0 ? "up" : "down") : "");
+      toast(kind + ": " + body, t.side === "sell" ? (t.pl >= 0 ? "up" : "down") : "", "trades");
       alertPhone("fills", kind, body, "fill-" + t.id);
     } else if (e.type === "sl" || e.type === "tp") {
       trades.push(t);
       const kind = e.type === "sl" ? "Your stop loss triggered" : "Your take profit triggered";
       const body = `Sold ${t.sym} at ${$px(instOf(t.key), t.px)} · ${$usd(t.pl, { sign: true })} (${$pct(t.plPct * 100, 1)})`;
-      toast(kind + ": " + body, t.pl >= 0 ? "up" : "down");
+      toast(kind + ": " + body, t.pl >= 0 ? "up" : "down", "trades");
       alertPhone("fills", kind, body, "stop-" + t.id);
     } else if (e.type === "trail") {
       trades.push(t);
       const body = `Sold ${t.sym} at ${$px(instOf(t.key) || { m: t.m }, t.px)} · ${$usd(t.pl, { sign: true })} (${$pct(t.plPct * 100, 1)}), ${CFG.lc.pct}% off its best since you bought (${$px(instOf(t.key) || { m: t.m }, e.best)})`;
-      toast("📉 Trailing stop: " + body, t.pl >= 0 ? "up" : "down");
+      toast("📉 Trailing stop: " + body, t.pl >= 0 ? "up" : "down", "trades");
       alertPhone("fills", "Your trailing stop sold", body, "trail-" + t.id);
     } else if (e.type === "cancel") {
-      toast(`Your ${e.order.inst.sym} order was canceled: ${e.reason}`, "down");
+      toast(`Your ${e.order.inst.sym} order was canceled: ${e.reason}`, "down", "trades");
     } else if (e.type === "liq") {
       trades.push(t);
       const body = `${t.sym} ${t.lev}x ${t.dir === -1 ? "short" : "long"}: the loss reached your ${$usd(t.cost)} margin` + (t.usd > 0 ? ` · Insurance paid back ${$usd(t.usd)}` : "");
-      toast("💥 Liquidated: " + body, "down");
+      toast("💥 Liquidated: " + body, "down", "important");
       alertPhone("fills", "Liquidated", body, "liq-" + t.id);
     } else if (e.type === "saved") {
-      toast(`❤️‍🩹 Second chance: your ${esc(e.pos.inst.sym)} ${e.pos.lev}x position was saved from liquidation`, "gold");
+      toast(`❤️‍🩹 Second chance: your ${esc(e.pos.inst.sym)} ${e.pos.lev}x position was saved from liquidation`, "gold", "important");
     }
   }
   if (trades.length) {
@@ -392,7 +393,7 @@ function afterTrades(trades) {
   const got = evaluate(A, kept, { trades: S.trades, total: tot, start: S.start, now: appNow(), stockOpenSince: st.open ? st.since : null, cheated: E.isCheated(S) });
   for (const id of got) {
     const a = achievementById(id);
-    setTimeout(() => toast(`${a.icon} Achievement: ${a.name}${A.cheated?.[id] ? " ★ (with cheats)" : ""}`, "gold"), 1400);
+    setTimeout(() => toast(`${a.icon} Achievement: ${a.name}${A.cheated?.[id] ? star() : ""}`, "gold", "trades"), 1400);
   }
   if (got.length) saveAch();
   saveSoon(0);
@@ -402,17 +403,19 @@ function afterTrades(trades) {
   frame();
 }
 
-const cheatTxt = t => (t.cheat?.length ? " ★ " + t.cheat.join(", ") : "");
+/** Cheat marks (the ★): hidden unless Settings → Cheats → "Show cheat marks" is on. */
+const star = (title = "Cheats used") => (CFG.showMarks ? ` <span class="star" title="${esc(title)}">★</span>` : "");
+const cheatTxt = t => (t.cheat?.length ? (CFG.showMarks ? " ★ " : " · ") + t.cheat.join(", ") : "");
 function celebrate(t) {
   if (!t) return;
-  if (t.ghosted) { toast(`👻 Ghost trade: the ${$usd(t.ghosted)} loss on ${esc(t.sym)} never happened`, "gold"); vibrate(30); return; }
+  if (t.ghosted) { toast(`👻 Ghost trade: the ${$usd(t.ghosted)} loss on ${esc(t.sym)} never happened`, "gold", "cheats"); vibrate(30); return; }
   if (t.side === "sell") {
     const win = t.pl >= 0;
-    bigResult($("#result"), { text: usd(t.pl, { sign: true }), sub: `${t.sym} · ${$pct(t.plPct * 100, 1)}${cheatTxt(t)}`, win });
+    if (noticeOn(t.reason === "liq" ? "important" : "trades")) bigResult($("#result"), { text: usd(t.pl, { sign: true }), sub: `${t.sym} · ${$pct(t.plPct * 100, 1)}${cheatTxt(t)}`, win });
     if (win) { confetti($("#confetti"), { big: SIM }); vibrate(SIM ? [40, 30, 40, 30, 40, 30, 120] : [25, 40, 25, 40, 60]); sfx(SIM ? "sell" : "win"); if (SIM) sfx("win"); }
     else { shake($("#app")); vibrate(220); sfx("loss"); }
   } else {
-    if (t.reason === "manual") toast(`${t.dir === -1 ? "Shorted" : "Bought"} ${$usd(t.usd)} of ${esc(t.sym)}${t.lev > 1 ? ` at ${t.lev}x` : ""}${cheatTxt(t)}`, "up");
+    if (t.reason === "manual") toast(`${t.dir === -1 ? "Shorted" : "Bought"} ${$usd(t.usd)} of ${esc(t.sym)}${t.lev > 1 ? ` at ${t.lev}x` : ""}${cheatTxt(t)}`, "up", "trades");
     vibrate(20);
     sfx(SIM ? "buy" : "fill");
   }
@@ -435,7 +438,7 @@ function priceAlerts(k) {
   saveCfg();
   for (const a of hit) {
     const text = `${L.inst.sym} hit ${$px(L.inst, a.price)}`;
-    toast("🔔 " + text, "gold");
+    toast("🔔 " + text, "gold", "price");
     sfx(SIM ? "buy" : "fill");
     alertPhone("price", text, `Live price: ${fmtPx(L.inst, L.px)}`, "alert-" + a.id);
   }
@@ -462,7 +465,7 @@ function moveAlert(k) {
   moveSent[id] = Date.now();
   const L = live.get(k);
   const text = `${L.inst.sym} ${ch > 0 ? "rose" : "fell"} ${Math.abs(ch).toFixed(1)}% in 1 hour`;
-  toast((ch > 0 ? "📈 " : "📉 ") + text, ch > 0 ? "up" : "down");
+  toast((ch > 0 ? "📈 " : "📉 ") + text, ch > 0 ? "up" : "down", "price");
   alertPhone("moves", text, `Now ${fmtPx(L.inst, L.px)}. You have an open position.`, "move-" + k);
 }
 
@@ -474,7 +477,7 @@ function streakCheck() {
   if (real > 0 && n >= 2) {
     CFG.lastStreakDay = today; saveCfg();
     const text = `${n} green days in a row 🔥`;
-    setTimeout(() => toast(text, "gold"), 2600);
+    setTimeout(() => toast(text, "gold", "trades"), 2600);
     alertPhone("streak", text, "Keep it going: close in the green again tomorrow.", "streak");
   }
 }
@@ -495,7 +498,7 @@ function dailySummary(now) {
   const n = todayTrades.length;
   const text = `Your portfolio is worth ${$usd(tot)}` + (day ? ` (${$usd(tot - day.first, { sign: true })} since ${clock(day.firstT)})` : "") +
     ` · ${n} ${n === 1 ? "trade" : "trades"} today · realized ${$usd(real, { sign: true })}`;
-  toast("🔔 Wall Street closed. " + text);
+  toast("🔔 Wall Street closed. " + text, "", "trades");
   alertPhone("summary", "Closing summary", text, "summary");
 }
 
@@ -574,6 +577,7 @@ function saveOnExit() {
   return flushSave();
 }
 function showSaved() {
+  if (!noticeOn("saved")) return;
   const el = $("#saved");
   el.hidden = false;
   clearTimeout(pillTimer);
@@ -744,7 +748,7 @@ function startSources() {
 // ---------------------------------------------------------------- Sim mode
 async function setMode(m) {
   if ((m === "sim") === SIM) return;
-  toast(m === "sim" ? "🎰 Switching to Sim…" : "Switching to Live…");
+  toast(m === "sim" ? "🎰 Switching to Sim…" : "Switching to Live…", "", "info");
   const saved = await saveOnExit();
   if (!saved) return; // the banner says why
   try { await kv.set("mode", m); } catch (e) { saveErr = e; renderBanners(); return; }
@@ -764,7 +768,7 @@ async function loadSim() {
   W = await loadClean("sim.world", (v, is) => (v && v.v === SW.VERSION ? CLEAN.cleanWorld(v, newWorld, is) : null));
   if (!W) W = newWorld();
   const capped = capSim();
-  if (capped) setTimeout(() => toast(`${plural(capped, "Sim coin was", "Sim coins were")} above the market cap limit ($10T, memecoins $1T) and came back to it.`), 1200);
+  if (capped) setTimeout(() => toast(`${plural(capped, "Sim coin was", "Sim coins were")} above the market cap limit ($10T, memecoins $1T) and came back to it.`, "", "sim"), 1200);
   W.off = W.t - Date.now(); // the Sim clock continues exactly where it stopped
   bootAt = appNow();
   try { await loadPoints(); } catch (e) { console.warn("Rewind points", e?.message); PTS = []; FINE = []; lastPt = null; }
@@ -848,6 +852,7 @@ function simEvents(out, before = new Map()) {
   for (const e of out) {
     const i = e.key ? W.insts[e.key] : null, sym = esc(i?.sym || "");
     if (e.kind === "event") {
+      if (!noticeOn("sim")) continue;
       renderBanners(); shake($("#app")); vibrate([80, 50, 80, 50, 160]); sfx("event");
       const b = $(".sim-event"); if (b) { b.classList.remove("pop"); void b.offsetWidth; b.classList.add("pop"); }
     } else if (e.kind === "end") renderBanners();
@@ -855,17 +860,17 @@ function simEvents(out, before = new Map()) {
       const after = [...Object.values(S.pos), ...E.marginPositions(S)].filter(p => p.key === e.key).reduce((a, p) => a + (E.positionValue(S, p, quoteFor(p.key)) || 0), 0);
       const lost = Math.max(0, (before.get(e.key) || 0) - after);
       FUN.onRug(REC, { sym: i.sym, usd: lost, pct: e.drop }, now); saveRec();
-      bigResult($("#result"), { text: "RUG PULL", sub: `${sym} −${Math.round(e.drop * 100)}% · you lost ${$usd(lost)}`, win: false });
+      if (noticeOn("sim")) bigResult($("#result"), { text: "RUG PULL", sub: `${sym} −${Math.round(e.drop * 100)}% · you lost ${$usd(lost)}`, win: false });
       shake($("#app")); vibrate([300, 80, 300]); sfx("rug");
-    } else if (e.kind === "rug" && watching(e.key)) { toast(`💀 ${sym} got rugged: −${Math.round(e.drop * 100)}%`, "down"); sfx("rug"); }
+    } else if (e.kind === "rug" && watching(e.key)) { toast(`💀 ${sym} got rugged: −${Math.round(e.drop * 100)}%`, "down", "sim"); sfx("rug"); }
     else if ((e.kind === "pump" || e.kind === "moonshot") && (watching(e.key) || e.kind === "moonshot")) {
-      toast(e.kind === "moonshot" ? `🌕 MOONSHOT: ${sym} is going vertical` : `🚀 ${sym} is pumping`, "gold"); sfx("pump");
+      toast(e.kind === "moonshot" ? `🌕 MOONSHOT: ${sym} is going vertical` : `🚀 ${sym} is pumping`, "gold", "sim"); sfx("pump");
     } else if (e.kind === "whale" && watching(e.key)) {
-      toast(`🐋 A whale ${e.up ? "bought" : "dumped"} ${sym}: ${$pct(e.move * 100, 0)}`, e.up ? "up" : "down");
+      toast(`🐋 A whale ${e.up ? "bought" : "dumped"} ${sym}: ${$pct(e.move * 100, 0)}`, e.up ? "up" : "down", "sim");
       if (heldKey(e.key)) { shake($("#app")); vibrate(e.up ? [30, 30, 30] : 200); }
-    } else if ((e.kind === "crash" || e.kind === "rally") && watching(e.key)) toast(e.kind === "crash" ? `📉 ${sym} is crashing` : `📈 ${sym} is rallying`, e.kind === "crash" ? "down" : "up");
-    else if (e.kind === "news") toast(`📰 News: the ${esc(W.cur[e.cur].name)} ${e.move > 0 ? "jumps" : "drops"} ${pct(Math.abs(e.move) * 100, 1).replace("+", "")}`, e.move > 0 ? "up" : "down");
-    else if (e.kind === "cascade") { toast(`💥 Liquidation cascade: ${$usd(e.usd, { compact: true })} of ${sym} longs liquidated`, "down"); shake($("#app")); vibrate([120, 40, 120]); sfx("loss"); }
+    } else if ((e.kind === "crash" || e.kind === "rally") && watching(e.key)) toast(e.kind === "crash" ? `📉 ${sym} is crashing` : `📈 ${sym} is rallying`, e.kind === "crash" ? "down" : "up", "sim");
+    else if (e.kind === "news") toast(`📰 News: the ${esc(W.cur[e.cur].name)} ${e.move > 0 ? "jumps" : "drops"} ${pct(Math.abs(e.move) * 100, 1).replace("+", "")}`, e.move > 0 ? "up" : "down", "sim");
+    else if (e.kind === "cascade") { toast(`💥 Liquidation cascade: ${$usd(e.usd, { compact: true })} of ${sym} longs liquidated`, "down", "sim"); shake($("#app")); vibrate([120, 40, 120]); sfx("loss"); }
   }
 }
 
@@ -957,7 +962,7 @@ function autoNext() {
 function dropSignal(key, why) {
   const g = signals()[key];
   delete S.cheats.auto[key];
-  if (why && g) toast(`🔮 ${esc(g.sym)}: ${why}`, "down");
+  if (why && g) toast(`🔮 ${esc(g.sym)}: ${why}`, "down", "cheats");
   saveSoon(0);
 }
 function signalBuy(key, g, usd) {
@@ -1035,7 +1040,7 @@ function autoTrades() {
 function autoNotice(trades) {
   if (!trades.length) return;
   const one = t => (t.side === "buy" ? `bought ${$usd(t.usd)} of ${esc(t.sym)}` : `sold ${esc(t.sym)}: ${$usd(t.pl, { sign: true })}`);
-  toast("🔮 Oracle " + trades.slice(0, 3).map(one).join(" · ") + (trades.length > 3 ? ` · and ${trades.length - 3} more` : ""), trades.some(t => t.side === "sell" && t.pl < 0) ? "down" : "up");
+  toast("🔮 Oracle " + trades.slice(0, 3).map(one).join(" · ") + (trades.length > 3 ? ` · and ${trades.length - 3} more` : ""), trades.some(t => t.side === "sell" && t.pl < 0) ? "down" : "up", "cheats");
   if (!skipping) afterTrades(trades);
   drawChartSoon();
 }
@@ -1062,7 +1067,7 @@ function doIt(key) {
   if (!g) return;
   (C.state(S).auto ||= {})[key] = g;
   C.mark(S, "oracle", `Oracle: armed ${g.sym} with $${g.usd.toFixed(2)}`, W.t);
-  toast(`🔮 Armed: ${esc(g.sym)} with ${$usd(g.usd)}`, "gold");
+  toast(`🔮 Armed: ${esc(g.sym)} with ${$usd(g.usd)}`, "gold", "cheats");
   autoRun();
   cheatChanged(); drawChartSoon(true);
 }
@@ -1185,7 +1190,7 @@ async function rewind(id) {
     publishSim(false);
     if (ui.sheet?.kind === "inst" && !W.insts[ui.sheet.key]) closeSheet(true);
     renderAll(); refreshStandings(); renderSheet(); drawChartSoon(true); showSaved(); frame();
-    toast(`⏪ Back to ${dateTime(to)} (Sim clock, −${countdown(from - to)}) ★`, "gold");
+    toast(`⏪ Back to ${dateTime(to)} (Sim clock, −${countdown(from - to)})${star()}`, "gold", "cheats");
     return { from, to };
   } catch (e) {
     ({ W, S, BOTS, PTS, FINE, lastPt, bootAt } = before);
@@ -1249,8 +1254,8 @@ async function playAhead(plan, title, exact, label = "") {
           sinceBots = 0;
           const entries = Object.values(W.insts).map(i => ({ inst: SW.instOf(i), ...SW.quote(W, i) }));
           for (const b of BOTS) {
-            botCheatTick(b, now, { allowed: CFG.botCheats, quoteFor: k => { const i = W.insts[k]; return i ? { px: i.px, t: now, liq: i.liq, quoteUsd: i.m === "fx" ? W.cur[i.quote].usd : undefined } : null; } });
-            for (const t of botStep(b, { entries, now, status: () => OPEN, bootAt, extreme: botExtreme, cheats: CFG.botCheats })) botMade.push([b, t]);
+            botCheatTick(b, now, { ...botCtx(b), allowed: CFG.botCheats, quoteFor: k => { const i = W.insts[k]; return i ? { px: i.px, t: now, liq: i.liq, quoteUsd: i.m === "fx" ? W.cur[i.quote].usd : undefined } : null; } });
+            for (const t of botStep(b, { entries, now, status: () => OPEN, bootAt, extreme: botExtreme, cheats: CFG.botCheats, ...botCtx(b) })) botMade.push([b, t]);
             botLevelCheck(b, now, simQ);
           }
         }
@@ -1301,12 +1306,13 @@ async function playAhead(plan, title, exact, label = "") {
 
 function simEventHTML() {
   const ev = W?.event;
-  if (!ev || appNow() > ev.until) return "";
+  if (!ev || appNow() > ev.until || !noticeOn("sim")) return "";
   return `<div class="sim-event ev-${ev.type}" role="status"><span class="se-i" aria-hidden="true">${ev.icon}</span><div class="se-t"><b>${esc(ev.title)}</b><small>${esc(ev.text)}</small></div><b class="se-cd" data-cd="${ev.until}">${countdown(ev.until - appNow())}</b></div>`;
 }
 
 function showJackpot(sym, mult, gain, now) {
   FUN.onJackpot(REC, { sym, mult, usd: gain }, now); saveRec();
+  if (!noticeOn("sim")) return;
   jackpotFx($("#jackpot"), { mult: mult.toFixed(1) + "x", sym: esc(sym), usd: usd(gain, { sign: true }) });
   confetti($("#confetti"), { big: true }); shake($("#app")); vibrate([100, 50, 100, 50, 100, 50, 400]); sfx("jackpot");
 }
@@ -1317,7 +1323,7 @@ function simAfterTrades(trades) {
     if (t.side !== "sell" || t.reason === "bot" || t.ghosted) continue;
     const r = FUN.onSale(REC, t, now);
     if (r.up && r.mult > 1) { const el = $("#combo"); updateCombo(); el?.classList.remove("pop"); void el?.offsetWidth; el?.classList.add("pop"); }
-    else if (r.broke) toast("Combo broken 💔");
+    else if (r.broke) toast("Combo broken 💔", "", "sim");
     if (t.plPct >= FUN.JACKPOT_X - 1 && !jpKeys.has(t.key)) showJackpot(t.sym, t.plPct + 1, t.pl, now);
     if (!S.pos[t.key]) jpKeys.delete(t.key);
   }
@@ -1351,8 +1357,8 @@ function botTick(now = appNow()) {
   const made = [];
   let cheated = 0;
   for (const b of BOTS) {
-    cheated += botCheatTick(b, now, { allowed: CFG.botCheats, quoteFor }).length;
-    const trades = botStep(b, { entries, now, status: m => mstatus(m, now), bootAt: TEST ? 0 : bootAt, extreme: botExtreme, cheats: CFG.botCheats });
+    cheated += botCheatTick(b, now, { ...botCtx(b), allowed: CFG.botCheats, quoteFor }).length;
+    const trades = botStep(b, { entries, now, status: m => mstatus(m, now), bootAt: TEST ? 0 : bootAt, extreme: botExtreme, cheats: CFG.botCheats, ...botCtx(b) });
     for (const t of trades) made.push([b, t]);
     botLevelCheck(b, now, quoteFor);
   }
@@ -1368,6 +1374,10 @@ function botTick(now = appNow()) {
  */
 function botExtreme(key, from, kind) {
   let xs = [];
+  if (kind === "first") { // Sniper: the first candle, when it is really the coin's first
+    const wi = SIM ? W?.insts[key] : null, b = wi?.b1[0];
+    return b && wi.born && b[0] <= wi.born + 10 * 60e3 ? b[1] : null;
+  }
   if (SIM) { const wi = W?.insts[key]; if (wi) for (const b of wi.b1) if (b[0] + 60e3 > from) xs.push(kind === "low" ? b[3] : b[2]); }
   else xs = (ticks.get(key) || []).filter(x => x.t >= from).map(x => x.px);
   if (!xs.length) return null;
@@ -1390,20 +1400,20 @@ function leaderboardHTML() {
   return `<div class="list">${participants().map((x, i) => `
     <button class="row lb ${x.id === "me" ? "me" : ""}" ${x.id === "me" ? `data-tab="history"` : `data-bot="${esc(x.id)}"`}>
       <span class="ico ico-rank" aria-label="Rank ${i + 1}">${medal[i] || i + 1}</span>
-      <span class="nm"><b>${esc(x.name)}${x.cheat ? ` <span class="star" title="Cheats used">★</span>` : ""}${x.style && !x.name.startsWith(STYLES[x.style].name) ? ` <i class="mk-tag">${STYLES[x.style].name}</i>` : ""}</b>${x.reached != null ? `<small class="gold">👑 ${$usd(x.total)} reached ${dateTime(x.reached)}</small>` : ""}<small>${tr("Best", x.best)}</small><small>${tr("Worst", x.worst)}</small>${x.id !== "me" && C.isOn(S, "xray") ? `<small class="xray">${xrayText(x.id)}</small>` : ""}</span>
+      <span class="nm"><b>${esc(x.name)}${x.cheat ? star() : ""}${x.style && !x.name.startsWith(STYLES[x.style].name) ? ` <i class="mk-tag">${STYLES[x.style].name}</i>` : ""}</b>${x.reached != null ? `<small class="gold">👑 ${$usd(x.total)} reached ${dateTime(x.reached)}</small>` : ""}<small>${tr("Best", x.best)}</small><small>${tr("Worst", x.worst)}</small>${x.id !== "me" && C.isOn(S, "xray") ? `<small class="xray">${xrayText(x.id)}</small>` : ""}</span>
       <span class="px"><b>${$usd(x.total)}</b><small class="${dirCls(x.pl)}">${$pct(x.plPct * 100)}</small></span>
     </button>${x.id !== "me" && C.isOn(S, "xray") ? frontBtns(x.id) : ""}`).join("")}</div>${BOTS.length && C.isOn(S, "xray") ? frontPctHTML() : ""}`;
 }
 const frontPctHTML = () => `<div class="chips front-pct"><small>Front-run with</small>${[5, 10, 25, 50, 100].map(n => `<button data-frpct="${n}" aria-pressed="${CFG.frontPct === n}">${n}%</button>`).join("")}<small>of your cash</small></div>`;
 function nextMoves(b) {
-  return botPreview(b, { entries: [...live.values()], now: appNow(), status: m => mstatus(m, appNow()), bootAt: TEST ? 0 : bootAt });
+  return botPreview(b, { entries: [...live.values()], now: appNow(), status: m => mstatus(m, appNow()), bootAt: TEST ? 0 : bootAt, cheats: CFG.botCheats, ...botCtx(b) });
 }
 /** Front-run / Sell first, next to a bot's X-ray line. */
 function frontBtns(id) {
   const b = BOTS.find(x => x.id === id);
   if (!b) return "";
   const v = nextMoves(b), out = [];
-  if (v.buy) out.push(`<button class="btn sm" data-front="${esc(id)}" data-key="${esc(v.buy.key)}">Front-run ${esc(v.buy.sym)}</button>`);
+  if (v.buy && v.buy.dir !== -1) out.push(`<button class="btn sm" data-front="${esc(id)}" data-key="${esc(v.buy.key)}">Front-run ${esc(v.buy.sym)}</button>`);
   for (const s of v.sells) out.push(`<button class="btn sm ghost" data-sellfirst="${esc(id)}" data-key="${esc(s.key)}" ${S.pos[s.key] ? "" : "disabled"}>Sell first ${esc(s.sym)}</button>`);
   return out.length ? `<div class="front">${out.join("")}</div>` : "";
 }
@@ -1425,7 +1435,7 @@ function frontRun(id, sell, key) {
       t = E.executeBuy(S, inst, usd, q, now, "front", false, opts);
     }
     C.mark(S, "xray", sell ? `Sold ${t.sym} before ${b.name}` : `Front-ran ${b.name} on ${t.sym}`, now);
-    toast(sell ? `🩻 Sold ${esc(t.sym)} before ${esc(b.name)}: ${$usd(t.pl, { sign: true })}` : `🩻 Bought ${$usd(t.usd)} of ${esc(t.sym)} before ${esc(b.name)}`, "up");
+    toast(sell ? `🩻 Sold ${esc(t.sym)} before ${esc(b.name)}: ${$usd(t.pl, { sign: true })}` : `🩻 Bought ${$usd(t.usd)} of ${esc(t.sym)} before ${esc(b.name)}`, "up", "cheats");
     afterTrades([t]); refreshStandings();
   } catch (e) { toast(esc(e.message), "down"); }
 }
@@ -1436,7 +1446,7 @@ function xrayText(id) {
   if (!b) return "";
   const v = nextMoves(b);
   const parts = v.sells.map(x => `sell ${esc(x.sym)} (${esc(x.why)})`);
-  if (v.buy) parts.push(`buy ${esc(v.buy.sym)} ~${$usd0(Math.round(v.buy.usd))} (${esc(v.buy.why)})${v.wait > 0 ? ` in ${Math.ceil(v.wait / 1000)} s` : ""}`);
+  if (v.buy) parts.push(`${v.buy.dir === -1 ? "short" : "buy"} ${esc(v.buy.sym)} ~${$usd0(Math.round(v.buy.usd))} (${esc(v.buy.why)})${v.wait > 0 ? ` in ${Math.ceil(v.wait / 1000)} s` : ""}`);
   return "🩻 " + (parts.length ? "Next: " + parts.join(" · ") : "Nothing it would buy right now");
 }
 
@@ -1446,8 +1456,8 @@ function botFeedHTML() {
   const recent = [...trades, ...cheats].sort((a, b) => b.t - a.t).slice(0, 5);
   if (!recent.length) return `<div class="empty sm">The bots trade only while the app is open. Their first moves show up here.</div>`;
   return `<div class="list">${recent.map(x => x.ch
-    ? `<button class="feed cheat" data-bot="${esc(x.b.id)}"><b>${esc(x.b.name)} <span class="star">★</span></b> used a cheat: ${esc(x.ch.text)} <small>${clock(x.t)}</small></button>`
-    : `<button class="feed" data-bot="${esc(x.b.id)}"><b>${esc(x.b.name)}</b> ${sideLabel(x.tr) === "short" ? "shorted" : x.tr.side === "buy" ? (x.tr.lev > 1 ? `bought ${x.tr.lev}x` : "bought") : "sold"} ${esc(x.tr.sym)} · ${$usd(x.tr.usd)}${x.tr.side === "sell" ? ` · <span class="${dirCls(x.tr.pl)}">${$usd(x.tr.pl, { sign: true })}</span>` : ""}${x.tr.cheat?.length ? ` <span class="star" title="${esc(x.tr.cheat.join(", "))}">★</span>` : ""} <small>${clock(x.t)}</small></button>`).join("")}</div>`;
+    ? `<button class="feed cheat" data-bot="${esc(x.b.id)}"><b>${esc(x.b.name)}${star()}</b> used a cheat: ${esc(x.ch.text)} <small>${clock(x.t)}</small></button>`
+    : `<button class="feed" data-bot="${esc(x.b.id)}"><b>${esc(x.b.name)}</b> ${sideLabel(x.tr) === "short" ? "shorted" : x.tr.side === "buy" ? (x.tr.lev > 1 ? `bought ${x.tr.lev}x` : "bought") : "sold"} ${esc(x.tr.sym)} · ${$usd(x.tr.usd)}${x.tr.side === "sell" ? ` · <span class="${dirCls(x.tr.pl)}">${$usd(x.tr.pl, { sign: true })}</span>` : ""}${x.tr.cheat?.length ? star(x.tr.cheat.join(", ")) : ""} <small>${clock(x.t)}</small></button>`).join("")}</div>`;
 }
 
 function rivalsHome() {
@@ -1460,7 +1470,7 @@ function addBot(style) {
   const now = appNow();
   const b = newBot(style, { id: "bot" + now.toString(36) + Math.floor(Math.random() * 1296).toString(36), name: botName(style, BOTS), start: S.start, now, seed: Math.floor(Math.random() * 2147483647) });
   BOTS.push(b); saveBots();
-  toast(`🤖 ${b.name} joined with ${$usd0(b.pf.start)}`, "up");
+  toast(`🤖 ${b.name} joined with ${$usd0(b.pf.start)}`, "up", "bots");
   kick("meme"); kick("stock");
 }
 
@@ -1485,7 +1495,7 @@ function botSheetHTML(b) {
     <div class="sh-body">
       <div class="big">${$usd(x.total)}</div>
       <div class="chg"><span class="${dirCls(x.pl)}">${$usd(x.pl, { sign: true })} (${$pct(x.plPct * 100)})</span> from ${$usd0(b.pf.start)}</div>
-      <p class="foot">${esc(STYLES[b.style].desc)} It trades only while the app is open, with the same costs and market hours as you. ${CFG.botCheats ? "It arms cheats from the bots' list (Settings → Rival bots) whenever they suit it; Money printer once a day." : "Bot cheats are off in Settings."}${E.isCheated(b.pf) ? ` ★ It has cheated: ${esc((b.pf.cheats.log || []).slice(-3).map(x => x.text).join(" · "))}` : ""}</p>
+      <p class="foot">${esc(STYLES[b.style].desc)} It trades only while the app is open, with the same costs and market hours as you. ${CFG.botCheats ? `Difficulty: ${DIFFS[diffId()].name}. ${botCheatsText()}` : "Bot cheats are off in Settings."}${E.isCheated(b.pf) && CFG.showMarks ? ` ★ It has cheated: ${esc((b.pf.cheats.log || []).slice(-3).map(x => x.text).join(" · "))}` : ""}</p>
       ${C.isOn(S, "xray") ? `<p class="xray card">${xrayText(b.id)}</p>${frontBtns(b.id)}${frontPctHTML()}` : ""}
       <div class="sb-grid card">
         <div><small>Cash</small><b>${$usd(b.pf.cash)}</b></div>
@@ -1493,8 +1503,8 @@ function botSheetHTML(b) {
         <div><small>Best trade</small>${tr(x.best)}</div>
         <div><small>Worst trade</small>${tr(x.worst)}</div>
       </div>
-      <h3 class="sec">Positions (${Object.keys(b.pf.pos).length})</h3>
-      <div class="list">${pos || `<div class="empty sm">No open positions.</div>`}</div>
+      <h3 class="sec">Positions (${Object.keys(b.pf.pos).length + E.marginPositions(b.pf).length})</h3>
+      <div class="list">${pos + E.marginPositions(b.pf).map(m => marginRow(m, b.pf)).join("") || `<div class="empty sm">No open positions.</div>`}</div>
       <h3 class="sec">History (${b.pf.trades.length})</h3>
       <div class="list">${hist || `<div class="empty sm">No trades yet. It trades only while the app is open.</div>`}</div>
     </div>`;
@@ -1512,13 +1522,24 @@ function openBot(id) {
   renderSheet();
 }
 
+const diffId = () => (DIFFS[CFG.botDiff] ? CFG.botDiff : "normal");
+function botCheatsText() {
+  const d = DIFFS[diffId()];
+  if (d.all) return `Every cheat of yours except Undo, Oracle and Time machine (with its Time skip), on Always on. Money printer: once a day, 10% of its balance. Double or nothing: only when it has almost nothing left to lose.`;
+  return `Each bot arms cheats whenever they suit it${d.always ? ", and those it uses stay on Always on" : ""} (Money printer: once a day): ${BOT_CHEATS.map(c => c.name).join(", ")}. Never Undo, Ghost trade, Oracle, X-ray, Time machine or Skip ahead. What they use shows in Rival moves.`;
+}
+/** What every bot turn needs to know about the settings and its rivals. */
+const botCtx = b => ({ diff: diffId(), peers: BOTS.filter(x => x !== b), memeMax: SIM ? SW.MEME_MAX_PX : null });
 function botsSettingsHTML() {
   const full = BOTS.length >= MAX_BOTS;
   return `<h3>Rival bots</h3>
       <p class="mut">Each bot gets its own portfolio, as big as yours (${$usd0(S.start)}), and decides by itself what to buy, how much and when to sell, with your same costs and market hours. Bots trade only while the app is open: nothing is made up for the time it was closed.</p>
-      ${BOTS.map(b => { const x = standing(b.pf, quoteFor); return `<div class="bot-row"><span class="nm"><b>${esc(b.name)}</b><small>${STYLES[b.style].name} · ${$usd(x.total)} · <span class="${dirCls(x.pl)}">${$pct(x.plPct * 100)}</span></small></span><button class="btn ghost sm" data-delbot="${esc(b.id)}">Remove</button></div>`; }).join("")}
+      ${BOTS.map(b => `<div class="bot-row"><span class="nm"><b>${esc(b.name)}</b><small data-botline="${esc(b.id)}">${botLineHTML(b)}</small></span><button class="btn ghost sm" data-delbot="${esc(b.id)}">Remove</button></div>`).join("")}
+      <p class="lbl">Bot difficulty</p>
+      <div class="chips" role="group" aria-label="Bot difficulty">${DIFF_IDS.map(k => `<button data-botdiff="${k}" aria-pressed="${diffId() === k}">${DIFFS[k].name}</button>`).join("")}</div>
+      <small class="mut">${esc(DIFFS[diffId()].desc)} Leverage and the other cheats need “Bots can cheat”.</small>
       <label class="tog"><input type="checkbox" id="botCheatsTog" ${CFG.botCheats ? "checked" : ""}><span>Bots can cheat</span></label>
-      <small class="mut">Each bot arms cheats whenever they suit it, with no daily limit (Money printer: once a day): ${BOT_CHEATS.map(c => c.name).join(", ")}. Never Undo, Ghost trade, Oracle, X-ray, Time machine, Skip ahead or Always on. A bot that cheats gets a ★ on the leaderboard, and its cheats show in Rival moves.</small>
+      <small class="mut">${botCheatsText()}</small>
       <p class="lbl">Add a bot${full ? ` (max ${MAX_BOTS})` : ""}</p>
       <div class="bot-add">${STYLE_IDS.map(id => `<button class="bot-style" data-addbot="${id}" ${full ? "disabled" : ""}><b>+ ${STYLES[id].name}</b><small>${esc(STYLES[id].desc)}</small></button>`).join("")}</div>`;
 }
@@ -1529,7 +1550,7 @@ function clockTick() {
   const tot = E.totals(S, quoteFor);
   E.recordDay(S, localDay(now), tot.total, now);
   const got = evaluate(A, [], { trades: S.trades, total: tot.total, start: S.start, now, stockOpenSince: null, cheated: E.isCheated(S) });
-  for (const id of got) { const a = achievementById(id); toast(`${a.icon} Achievement: ${a.name}${A.cheated?.[id] ? " ★ (with cheats)" : ""}`, "gold"); }
+  for (const id of got) { const a = achievementById(id); toast(`${a.icon} Achievement: ${a.name}${A.cheated?.[id] ? star() : ""}`, "gold", "trades"); }
   if (got.length) saveAch();
   dailySummary(now);
   saveSoon(1000);
@@ -1553,11 +1574,12 @@ function secondTick() {
     el.textContent = countdown(left);
     if (left <= 0 && !el.dataset.done) { el.dataset.done = 1; setTimeout(() => { renderView(); renderSheet(); }, 1200); }
   }
+  updateSettings();
   for (const el of $$("[data-age]")) el.textContent = ago(+el.dataset.age, now);
   if (ui.tab === "home") { updateLastChance(now); updateMovers(now); }
   const sb = C.settleBoost(S, now);
   if (sb) {
-    toast(sb.extra > 0 ? `🌙 Moon boost paid ${$usd(sb.extra, { sign: true })} on ${esc(sb.sym)}` : `🌙 Moon boost on ${esc(sb.sym || "your coin")} ended with no gain to triple`, sb.extra > 0 ? "gold" : "");
+    toast(sb.extra > 0 ? `🌙 Moon boost paid ${$usd(sb.extra, { sign: true })} on ${esc(sb.sym)}` : `🌙 Moon boost on ${esc(sb.sym || "your coin")} ended with no gain to triple`, sb.extra > 0 ? "gold" : "", "cheats");
     saveSoon(0); renderView(); if (ui.sheet?.kind === "cheats") renderSheet(); frame();
   }
   renderTape();
@@ -1638,7 +1660,7 @@ function updateHeader() {
   const tp = $("#totalPl");
   tp.innerHTML = `<span class="${dirCls(t.pl)}">${$usd(t.pl, { sign: true })} (${$pct(t.plPct * 100)})</span> from ${$usd0(S.start)}` +
     (dd != null && Math.abs(dd) >= 0.01 ? ` · <span class="${dirCls(dd)}">${$usd(dd, { sign: true })} today</span>` : "") +
-    (E.isCheated(S) ? ` <span class="star" title="Cheats used in this portfolio">★</span>` : "") +
+    (E.isCheated(S) ? star("Cheats used in this portfolio") : "") +
     (RICH.levelOf(S) || t.capped ? ` <span class="rich-tag">${t.capped && RICH.levelOf(S) === RICH.LAST ? "👑 Owns the world" : RICH.levelOf(S) === 1 ? "💎 World's richest" : "🏛️ Beyond countries"}</span>` : "") +
     (prestigeN() ? ` <span class="rich-tag prest" title="Prestige ${prestigeN()}">🎖️ ${prestigeN()}</span>` : "");
   const ok = Object.values(src).some(s => s.ok && now - s.ok < 90e3);
@@ -1733,17 +1755,19 @@ function renderBanners() {
 }
 
 // ---------------------------------------------------------------- views
+let tabShown = "";
 function renderView() {
   const v = $("#view");
   const scroll = window.scrollY;
-  const focused = document.activeElement?.id;
-  const selStart = document.activeElement?.selectionStart;
-  if (ui.tab === "home") v.innerHTML = viewHome();
-  else if (ui.tab === "markets") v.innerHTML = viewMarkets();
-  else if (ui.tab === "portfolio") v.innerHTML = viewPortfolio();
-  else if (ui.tab === "history") v.innerHTML = viewHistory();
-  else if (ui.tab === "achievements") v.innerHTML = viewAchievements();
-  if (focused) { const el = document.getElementById(focused); if (el) { el.focus(); try { el.setSelectionRange(selStart, selStart); } catch {} } }
+  const same = tabShown === ui.tab;
+  tabShown = ui.tab;
+  keepUI(v, same, () => {
+    if (ui.tab === "home") v.innerHTML = viewHome();
+    else if (ui.tab === "markets") v.innerHTML = viewMarkets();
+    else if (ui.tab === "portfolio") v.innerHTML = viewPortfolio();
+    else if (ui.tab === "history") v.innerHTML = viewHistory();
+    else if (ui.tab === "achievements") v.innerHTML = viewAchievements();
+  });
   window.scrollTo(0, scroll);
   for (const b of $$("nav.tabs button")) b.setAttribute("aria-current", b.dataset.tab === ui.tab ? "page" : "false");
   renderTape();
@@ -1926,18 +1950,18 @@ function viewPortfolio() {
     </div>
     <h2>Positions (${pos.length})</h2>
     <div class="list">${rows || `<div class="empty">No open positions. Go to Markets, open something and buy.</div>`}</div>
-    ${mpos.length ? `<h2>Leveraged and short (${mpos.length})</h2><div class="list">${mpos.map(marginRow).join("")}</div>` : ""}
+    ${mpos.length ? `<h2>Leveraged and short (${mpos.length})</h2><div class="list">${mpos.map(m => marginRow(m)).join("")}</div>` : ""}
     <h2>Waiting orders (${S.orders.length})</h2>
     <div class="list">${S.orders.map(orderRow).join("") || `<div class="empty sm">No limit orders or orders waiting for the open.</div>`}</div>
     <p class="foot">To move this portfolio to another device, use Export and Import in <button class="lnk" data-settings>Settings</button>.</p>`;
 }
 
-function marginRow(p) {
-  const q = quoteFor(p.key), v = E.positionView(p, q, S), liq = E.liqPrice(p, q);
-  const safe = C.isOn(S, "diamond") ? "💎 no liquidation" : C.isOn(S, "rugShield") ? "🛡️ shielded" : liq > 0 ? `liq. ${$px(p.inst, liq)}` : "";
+function marginRow(p, pf = S) {
+  const mine = pf === S, q = quoteFor(p.key), v = E.positionView(p, q, pf), liq = E.liqPrice(p, q);
+  const safe = C.isOn(pf, "diamond") ? "💎 no liquidation" : C.isOn(pf, "rugShield") ? "🛡️ shielded" : liq > 0 ? `liq. ${$px(p.inst, liq)}` : "";
   return `<button class="row" data-open="${esc(p.key)}">${icon(p.inst)}
       <span class="nm"><b>${esc(p.inst.sym)} <i class="mk-tag lev">${p.lev}x ${p.dir > 0 ? "Long" : "Short"}</i></b><small>Margin ${$usd(p.cost)}${safe ? " · " + safe : ""}${p.ghost ? " · 👻" : ""}${v.live ? "" : " · last saved price"}</small></span>
-      <span class="px"><b data-mv="${esc(p.id)}">${$usd(v.value)}</b><small data-mpl="${esc(p.id)}" class="${dirCls(v.pl)}">${$usd(v.pl, { sign: true })} (${$pct(v.plPct * 100, 1)})</small></span></button>`;
+      <span class="px"><b ${mine ? `data-mv="${esc(p.id)}"` : ""}>${$usd(v.value)}</b><small ${mine ? `data-mpl="${esc(p.id)}"` : ""} class="${dirCls(v.pl)}">${$usd(v.pl, { sign: true })} (${$pct(v.plPct * 100, 1)})</small></span></button>`;
 }
 
 const REASON = { manual: "", limit: "limit order", open: "at the open", sl: "stop loss", tp: "take profit", bot: "", liq: "liquidated", airdrop: "airdrop", replay: "", trail: "trailing stop" };
@@ -1946,16 +1970,16 @@ function tradeItem(t) {
   const lbl = sideLabel(t);
   const right = t.reason === "airdrop" ? `<b>Free</b><small class="flat">worth ${$usd(t.worth || 0)}</small>`
     : `<b>${$usd(t.usd)}</b>${t.side === "sell" ? `<small class="${dirCls(t.pl)}">${$usd(t.pl, { sign: true })} (${$pct(t.plPct * 100, 1)})</small>` : `<small class="flat">costs ${$usd((t.fee || 0) + (t.slip || 0))}</small>`}`;
-  return `<div class="tr${t.cheat?.length ? " cheat" : ""}">
+  return `<div class="tr${CFG.showMarks && t.cheat?.length ? " cheat" : ""}">
       <span class="side ${t.side}${t.dir === -1 ? " short" : ""}">${lbl}</span>
-      <span class="nm"><b>${esc(t.sym)}${t.lev > 1 ? ` <i class="mk-tag lev">${t.lev}x</i>` : ""}</b><small>${$qty(t.qty)} at ${$px(instOf(t.key) || { m: t.m, id: t.key.split(":")[1] }, t.reason === "airdrop" ? t.mid : t.px)}</small><small>${dateTime(t.t)}${why ? " · " + why : ""}</small>${t.cheat?.length ? `<small class="cheat-tag">★ ${esc(t.cheat.join(", "))}</small>` : ""}</span>
+      <span class="nm"><b>${esc(t.sym)}${t.lev > 1 ? ` <i class="mk-tag lev">${t.lev}x</i>` : ""}</b><small>${$qty(t.qty)} at ${$px(instOf(t.key) || { m: t.m, id: t.key.split(":")[1] }, t.reason === "airdrop" ? t.mid : t.px)}</small><small>${dateTime(t.t)}${why ? " · " + why : ""}</small>${CFG.showMarks && t.cheat?.length ? `<small class="cheat-tag">★ ${esc(t.cheat.join(", "))}</small>` : ""}</span>
       <span class="px">${right}</span>
     </div>`;
 }
 
 /** The star on a portfolio's history: what was used and since when. */
 function cheatNoteHTML(pf) {
-  if (!E.isCheated(pf)) return "";
+  if (!CFG.showMarks || !E.isCheated(pf)) return "";
   const log = pf.cheats.log.slice().reverse().slice(0, 60);
   return `<div class="cheat-note"><b><span class="star">★</span> Cheats used in this portfolio</b><small>Since ${dateTime(pf.cheats.since)}. Resetting the portfolio removes the star.</small>
     <details><summary>What was used (${pf.cheats.log.length})</summary>${log.map(l => `<div class="cl"><small>${dateTime(l.t)}</small> ${esc(l.text)}</div>`).join("")}</details></div>`;
@@ -1990,24 +2014,18 @@ function viewAchievements() {
         <div><small>Best</small>${tr(b.best)}</div>
         <div><small>Worst</small>${tr(b.worst)}</div>
       </div></div>`;
-  const cheated = id => A.unlocked[id] && A.cheated?.[id];
   const grid = ACHIEVEMENTS.map(a => {
-    const got = A.unlocked[a.id] && !cheated(a.id);
-    return `<div class="ach ${got ? "got" : ""}"><span class="ach-i" aria-hidden="true">${a.icon}</span><b>${esc(a.name)}</b><small>${got ? "Unlocked " + dateTime(A.unlocked[a.id]) : esc(a.desc)}</small></div>`;
+    const got = A.unlocked[a.id];
+    return `<div class="ach ${got ? "got" : ""}"><span class="ach-i" aria-hidden="true">${a.icon}</span><b>${esc(a.name)}${got && A.cheated?.[a.id] ? star("Earned with cheats") : ""}</b><small>${got ? "Unlocked " + dateTime(got) : esc(a.desc)}</small></div>`;
   }).join("");
-  const withCheats = ACHIEVEMENTS.filter(a => cheated(a.id));
-  const cheatGrid = withCheats.map(a => `<div class="ach got cheat"><span class="ach-i" aria-hidden="true">${a.icon}</span><b>${esc(a.name)} <span class="star">★</span></b><small>With cheats · ${dateTime(A.unlocked[a.id])}</small></div>`).join("");
   const rivals = `<h2>Leaderboard</h2>${BOTS.length ? `<div id="lbSlotFull">${leaderboardHTML()}</div>` : `<div class="empty sm">No rivals yet. <button class="lnk" data-settings>Add a bot in Settings</button> to race against it: Momentum, Contrarian, Degen or Random.</div>`}`;
   return `${SIM ? recordsHTML() : ""}${ladderHTML()}${rivals}<div class="streak"><span>🔥</span><div><b>${plural(streak, "green day", "green days")}</b><small>Days in a row closing trades with a net profit.</small></div></div>
     <h2>Scoreboards</h2>
     <div class="seg chips">${["all", ...MARKETS].map(m => `<button data-sb="${m}" aria-pressed="${ui.sb === m}">${m === "all" ? "All" : MARKET_LABEL[m]}</button>`).join("")}</div>
     ${card(ui.sb === "all" ? "All markets" : MARKET_LABEL[ui.sb], sb[ui.sb])}
-    <h2>Achievements (${Object.keys(A.unlocked).length - withCheats.length}/${ACHIEVEMENTS.length})</h2>
+    <h2>Achievements (${Object.keys(A.unlocked).length}/${ACHIEVEMENTS.length})</h2>
     <p class="foot">Achievements are kept separately: they stay even if you reset your portfolio. Money goals are measured against your starting balance.</p>
-    <div class="ach-grid">${grid}</div>
-    ${withCheats.length ? `<h2><span class="star">★</span> Earned with cheats (${withCheats.length})</h2>
-    <p class="foot">Unlocked while your portfolio was using cheats, so they're kept apart. Earn one again without cheats to move it up.</p>
-    <div class="ach-grid">${cheatGrid}</div>` : ""}`;
+    <div class="ach-grid">${grid}</div>`;
 }
 
 // ---------------------------------------------------------------- sheet: instrument
@@ -2046,7 +2064,7 @@ function openSettings() {
   if (!wasOpen) history.pushState({ sheet: 1 }, "");
   $("#scrim").hidden = false; $("#sheet").hidden = false;
   document.body.classList.add("noscroll");
-  renderSheet();
+  renderSheet(true);
 }
 function closeSheet(fromPop) {
   if (!ui.sheet) return;
@@ -2055,7 +2073,7 @@ function closeSheet(fromPop) {
   if (chart?.key?.startsWith("crypto:")) crypto.watchChart(null);
   chart = null; chartToken = null;
   ui.sheet = null;
-  $("#scrim").hidden = true; $("#sheet").hidden = true; $("#sheet").innerHTML = "";
+  $("#scrim").hidden = true; $("#sheet").hidden = true; $("#sheet").innerHTML = ""; sheetShown = "";
   document.body.classList.remove("noscroll");
   if (!fromPop && history.state?.sheet) history.back();
 }
@@ -2097,13 +2115,50 @@ function changeLine(inst, L) {
   return `<div class="chg"><span data-c="${esc(inst.key)}" class="${dirCls(L.ch24)}">${$pct(L.ch24)}</span> ${lbl}</div>`;
 }
 
-function renderSheet() {
-  const el = $("#sheet");
+/**
+ * Rebuild part of the screen without losing what you were doing in it: scroll positions, what you typed or chose
+ * and the focus. `same` is false when it shows something else now (nothing to keep).
+ */
+function keepUI(root, same, build) {
+  if (!same) { build(); return; }
+  const boxes = () => [...root.querySelectorAll(".sh-body, .skip-row, .seg")];
+  const scroll = boxes().map(b => [b.className, b.scrollTop, b.scrollLeft]);
+  const open = [...root.querySelectorAll("details")].map(x => x.open);
+  const edited = [...root.querySelectorAll("input[id]:not([type=checkbox]):not([type=file]), select[id]")]
+    .filter(x => (x.tagName === "SELECT" ? x.selectedIndex !== Math.max(0, [...x.options].findIndex(o => o.defaultSelected)) : x.value !== x.defaultValue))
+    .map(x => [x.id, x.value, x.dataset.masked]);
+  const f = document.activeElement, fid = f && root.contains(f) ? f.id : "";
+  const sel = fid ? [f.selectionStart, f.selectionEnd] : null;
+  build();
+  for (const [id, v, masked] of edited) {
+    const el = document.getElementById(id);
+    if (!el || !root.contains(el) || (el.tagName === "SELECT" && ![...el.options].some(o => o.value === v))) continue;
+    el.value = v;
+    if (masked !== undefined) el.dataset.masked = masked;
+  }
+  root.querySelectorAll("details").forEach((x, i) => { if (open[i]) x.open = true; });
+  if (fid) { const el = document.getElementById(fid); if (el) { el.focus({ preventScroll: true }); try { el.setSelectionRange(...sel); } catch {} } }
+  boxes().forEach((b, i) => { const o = scroll[i]; if (o && o[0] === b.className) { b.scrollTop = o[1]; b.scrollLeft = o[2]; } });
+}
+
+let sheetShown = ""; // what #sheet has on screen now
+/** full: rebuild Settings too (you changed something in it). Prices and the Sim world only update its values. */
+function renderSheet(full = false) {
   if (!ui.sheet) return;
-  if (ui.sheet.kind === "settings") { el.innerHTML = settingsHTML(); bindSettings(); return; }
-  if (ui.sheet.kind === "cheats") { const y = el.querySelector(".sh-body")?.scrollTop || 0; el.innerHTML = cheatsHTML(); const body = el.querySelector(".sh-body"); if (body) body.scrollTop = y; return; }
-  if (ui.sheet.kind === "replay") { if (!ui.replay) { closeSheet(); return; } const y = el.querySelector(".sh-body")?.scrollTop || 0; el.innerHTML = replayHTML(); const body = el.querySelector(".sh-body"); if (body) body.scrollTop = y; drawReplay(); return; }
-  if (ui.sheet.kind === "bot") { const b = BOTS.find(x => x.id === ui.sheet.id); if (!b) { closeSheet(); return; } const y = el.querySelector(".sh-body")?.scrollTop || 0; el.innerHTML = botSheetHTML(b); const body = el.querySelector(".sh-body"); if (body) body.scrollTop = y; return; }
+  const sh = ui.sheet;
+  if (sh.kind === "replay" && !ui.replay) { closeSheet(); return; }
+  if (sh.kind === "bot" && !BOTS.some(b => b.id === sh.id)) { closeSheet(); return; }
+  const what = `${sh.kind}|${sh.key || sh.id || ""}`, same = what === sheetShown;
+  if (sh.kind === "settings" && same && !full) { updateSettings(); return; }
+  sheetShown = what;
+  keepUI($("#sheet"), same, buildSheet);
+}
+function buildSheet() {
+  const el = $("#sheet");
+  if (ui.sheet.kind === "settings") { el.innerHTML = settingsHTML(); bindSettings(); updateSettings(); return; }
+  if (ui.sheet.kind === "cheats") { el.innerHTML = cheatsHTML(); return; }
+  if (ui.sheet.kind === "replay") { el.innerHTML = replayHTML(); drawReplay(); return; }
+  if (ui.sheet.kind === "bot") { el.innerHTML = botSheetHTML(BOTS.find(x => x.id === ui.sheet.id)); return; }
   const sh = ui.sheet, key = sh.key, inst = instOf(key), L = live.get(key) || {};
   const p = S.pos[key];
   const needKey = inst.m === "stock" && needFinnhub();
@@ -2147,7 +2202,7 @@ function renderSheet() {
       <div class="chart-note" id="chartNote">${esc(chart?.note || "")}</div>
       ${SIM ? `<div class="oracle-note" id="oracleNote"></div>` : ""}
       <div class="skip${SIM ? "" : " off"}" role="group" aria-label="Skip ahead"><span>⏩ Skip ahead${SIM ? "" : ` <small class="sim-only">Sim only</small>`}</span><div class="skip-row">${Object.keys(SW.SKIPS).map(k => `<button class="btn sm ghost" data-skip="${k}" ${SIM ? "" : "disabled"}>+${k}</button>`).join("")}</div></div>
-      <div class="skip${SIM ? "" : " off"}" role="group" aria-label="Rewind"><span>⏪ Rewind ★${SIM ? "" : ` <small class="sim-only">Sim only</small>`}</span><div class="skip-row">${Object.keys(RW.REWINDS).map(k => `<button class="btn sm ghost" data-rewind="${k}" ${SIM ? "" : "disabled"}>−${k}</button>`).join("")}</div></div>
+      <div class="skip${SIM ? "" : " off"}" role="group" aria-label="Rewind"><span>⏪ Rewind${star()}${SIM ? "" : ` <small class="sim-only">Sim only</small>`}</span><div class="skip-row">${Object.keys(RW.REWINDS).map(k => `<button class="btn sm ghost" data-rewind="${k}" ${SIM ? "" : "disabled"}>−${k}</button>`).join("")}</div></div>
       ${statsFor(inst, L)}`}
       ${posHTML}
       ${marginCardHTML(key)}
@@ -2307,7 +2362,7 @@ async function submitTrade() {
     if (r.trade) { celebrate(r.trade); afterTrades([r.trade]); }
     else {
       const o = r.order;
-      toast(o.type === "limit" ? `Limit order placed: ${o.side === "buy" ? "buy" : "sell"} ${inst.sym} at ${$px(inst, o.limit)}` : `Order placed: it fills at the market open`, "");
+      toast(o.type === "limit" ? `Limit order placed: ${o.side === "buy" ? "buy" : "sell"} ${inst.sym} at ${$px(inst, o.limit)}` : `Order placed: it fills at the market open`, "", "trades");
       vibrate(15);
       saveSoon(0);
       runChecks(sh.key);
@@ -2436,8 +2491,8 @@ function cheatsHTML() {
   const alwaysList = C.ALWAYS.filter(id => C.isAlways(S, id)).map(id => C.CHEAT[id].name);
   return `<div class="sh-head"><span class="ico ico-bot" aria-hidden="true">🎮</span><div class="sh-title"><h2>Cheats</h2><small>Bots have their own list (Settings → Rival bots)</small></div><button class="close" data-close aria-label="Close">✕</button></div>
   <div class="sh-body cheats">
-    <div class="cheat-note">${E.isCheated(S) ? `<b><span class="star">★</span> This portfolio is marked</b><small>Cheats used since ${dateTime(S.cheats.since)}. The star shows on the leaderboard and in your history, and achievements earned now are kept apart. Resetting the portfolio removes it.</small>`
-      : `<b>Clean portfolio</b><small>Turning on, arming or using any cheat marks it with a ★ on the leaderboard and in your history, and achievements earned with cheats are kept apart. Resetting the portfolio removes the star.</small>`}</div>
+    ${CFG.showMarks ? `<div class="cheat-note">${E.isCheated(S) ? `<b><span class="star">★</span> This portfolio is marked</b><small>Cheats used since ${dateTime(S.cheats.since)}. Resetting the portfolio removes the star.</small>`
+      : `<b>Clean portfolio</b><small>Using any cheat marks it with a ★. Resetting the portfolio removes the star.</small>`}</div>` : ""}
     ${alwaysList.length ? `<div class="always-list">♾️ <b>Always on:</b> ${alwaysList.map(esc).join(", ")}</div>` : ""}
     ${groups.map(g => `<h3 class="sec">${esc(g)}</h3>${C.CHEATS.filter(c => c.group === g).map(card).join("")}`).join("")}
   </div>`;
@@ -2473,7 +2528,7 @@ function doAirdrop() {
   const L = pool[Math.floor(rand() * pool.length)];
   try {
     const t = C.airdrop(S, L.inst, quoteFor(L.inst.key), now);
-    toast(`🪂 Airdrop: ${$qty(t.qty)} ${esc(t.sym)} worth ${$usd(t.worth)}, free`, "gold");
+    toast(`🪂 Airdrop: ${$qty(t.qty)} ${esc(t.sym)} worth ${$usd(t.worth)}, free`, "gold", "cheats");
     confetti($("#confetti")); vibrate([20, 30, 20]);
     afterTrades([t]);
   } catch (e) { toast(e.message, "down"); }
@@ -2506,7 +2561,7 @@ async function startReplay(key, day, testBars) {
     let bars = testBars;
     if (!bars) {
       if (SIM) { const wi = W.insts[key]; bars = wi ? SW.minuteHistory(wi, w.from, w.to) : []; }
-      else { toast("⏪ Loading real 1-minute candles…"); }
+      else { toast("⏪ Loading real 1-minute candles…", "", "info"); }
       if (SIM) { /* Sim candles above */ }
       else if (inst.m === "crypto") bars = await crypto.history(inst.id, w.from, w.to);
       else if (inst.m === "meme") bars = await dex.history(inst.pair, w.from, w.to);
@@ -2538,7 +2593,7 @@ function rpStatsHTML(rp) {
 function replayHTML() {
   const rp = ui.replay, inst = rp.inst, q = RP.quote(rp), p = rp.pf.pos[inst.key];
   const speeds = RP.SPEEDS.map(x => `<button data-rpspeed="${x}" aria-pressed="${rp.speed === x}">${x}x</button>`).join("");
-  return `<div class="sh-head">${icon(inst)}<div class="sh-title"><h2>⏪ ${esc(inst.sym)}</h2><small><span class="star">★</span> Time machine · replay portfolio, separate from yours</small></div><button class="close" data-close aria-label="Close">✕</button></div>
+  return `<div class="sh-head">${icon(inst)}<div class="sh-title"><h2>⏪ ${esc(inst.sym)}</h2><small>Time machine${star()} · replay portfolio, separate from yours</small></div><button class="close" data-close aria-label="Close">✕</button></div>
   <div class="sh-body replay">
     <div class="rp-clock" id="rpClock">${esc(rpClock(rp))}${rp.playing ? ` · ▶ ${rp.speed}x` : " · paused"}</div>
     <div class="big" id="rpPx">${q ? fmtPx(inst, q.px) : "—"}</div>
@@ -2585,12 +2640,12 @@ function replayAction(a) {
     rp.playing = false;
     const end = RP.skip(rp, a === "hour" ? 3600e3 : 86400e3);
     const t = RP.totals(rp);
-    toast(`⏩ ${a === "hour" ? "+1 hour" : "+1 day"}: ${esc(rpClock(rp))} · replay portfolio ${$usd(t.total)} (${$usd(t.pl, { sign: true })})${end ? " · you reached the present" : ""}`, t.pl >= 0 ? "up" : "down");
+    toast(`⏩ ${a === "hour" ? "+1 hour" : "+1 day"}: ${esc(rpClock(rp))} · replay portfolio ${$usd(t.total)} (${$usd(t.pl, { sign: true })})${end ? " · you reached the present" : ""}`, t.pl >= 0 ? "up" : "down", "cheats");
     renderSheet(); return;
   }
   try {
     if (a === "sell") { const t = RP.sell(rp); celebrate(t); }
-    else { const usdAmt = Math.min(E.available(rp.pf), Math.round(rp.pf.start * +a * 100) / 100); const t = RP.buy(rp, usdAmt); toast(`Replay: bought ${$usd(t.usd)} of ${esc(t.sym)} at ${$px(rp.inst, t.px)}`, "up"); }
+    else { const usdAmt = Math.min(E.available(rp.pf), Math.round(rp.pf.start * +a * 100) / 100); const t = RP.buy(rp, usdAmt); toast(`Replay: bought ${$usd(t.usd)} of ${esc(t.sym)} at ${$px(rp.inst, t.px)}`, "up", "trades"); }
   } catch (e) { toast(e.message, "down"); }
   renderSheet();
 }
@@ -2688,13 +2743,33 @@ function drawChartSoon(now) {
 function resetHTML() {
   const st = ui.resetStart, okAmt = E.validStart(st);
   return `<h3>Reset portfolio</h3>
-      <p class="mut">${SIM ? "This resets your <b>Sim</b> portfolio only; Live is not touched. " : ""}Start over with a new balance. Positions, orders, history and the cheats ★ are erased; achievements stay. Rival bots restart with the same balance. Export first if you want to keep your history.</p>
+      <p class="mut">${SIM ? "This resets your <b>Sim</b> portfolio only; Live is not touched. " : ""}Start over with a new balance. Positions, orders, history and cheats are erased; achievements stay. Rival bots restart with the same balance. Export first if you want to keep your history.</p>
       <p class="lbl">Starting balance</p>
       <div class="chips start" role="group" aria-label="Starting balance">${START_CHOICES.map(n => `<button data-start="${n}" aria-pressed="${!ui.resetCustom && st === n}">${$usd0(n)}</button>`).join("")}<button data-start="custom" aria-pressed="${ui.resetCustom}">Custom</button></div>
       ${ui.resetCustom ? `<label class="amt-in">Amount in dollars (${$usd0(START_MIN)} to ${$usd0(START_MAX)}) <input id="startIn" type="number" inputmode="decimal" step="any" min="${START_MIN}" max="${START_MAX}" value="${st || ""}"></label>` : ""}
       <button class="btn danger" data-reset ${okAmt ? "" : "disabled"}>${okAmt ? `Reset to ${$usd0(st)}` : "Enter an amount"}</button>`;
 }
 function renderReset() { const el = $("#resetBox"); if (el) el.innerHTML = resetHTML(); }
+
+const alertsHTML = () => (CFG.alerts.length ? `<h4>Active price alerts</h4>${CFG.alerts.map(a => `<div class="alert-row">${esc(a.inst.sym)}: ${a.dir === "above" ? "if it rises to" : "if it falls to"} ${$px(a.inst, a.price)} <button class="lnk" data-delalert="${a.id}">remove</button></div>`).join("")}` : "");
+/** Cheats working right now, by name. */
+function activeCheats() {
+  const out = C.CHEATS.filter(c => C.isOn(S, c.id) || C.isArmed(S, c.id) || C.isAlways(S, c.id)).map(c => c.name + (C.isAlways(S, c.id) ? " (always on)" : ""));
+  if (C.leverage(S) > 1) out.push(`Leverage ${C.leverage(S)}x`);
+  return out;
+}
+const botLineHTML = b => { const x = standing(b.pf, quoteFor); return `${STYLES[b.style].name} · ${$usd(x.total)} · <span class="${dirCls(x.pl)}">${$pct(x.plPct * 100)}</span>`; };
+/** Settings is drawn once, when it opens. After that only these values change, each in its place. */
+function updateSettings() {
+  if (ui.sheet?.kind !== "settings") return;
+  const put = (el, html) => { if (el && el._h !== html) { el._h = html; el.innerHTML = html; } };
+  const cheats = activeCheats();
+  put($("#setBal"), `Your ${SIM ? "Sim " : ""}portfolio: <b>${$usd(E.totals(S, quoteFor).total)}</b> · cash ${$usd(S.cash)}`);
+  put($("#setCheats"), cheats.length ? `Active now: <b>${cheats.map(esc).join(", ")}</b>` : "None active right now.");
+  put($("#alertsBox"), alertsHTML());
+  if ($$("#botsBox [data-botline]").map(e => e.dataset.botline).join() !== BOTS.map(b => b.id).join()) renderBotsBox();
+  for (const b of BOTS) put(document.querySelector(`#botsBox [data-botline="${CSS.escape(b.id)}"]`), botLineHTML(b));
+}
 
 function settingsHTML() {
   const ns = notifySupport();
@@ -2715,7 +2790,12 @@ function settingsHTML() {
       ${keyRow("tdKey", "Twelve Data (stock and forex candles, optional)", CFG.twelveKey, TWELVE_SIGNUP, "twelvedata.com/register")}
       <small class="mut" id="tdBudget"></small>
     </section>
-    <section class="card"><h3>Phone notifications</h3>
+    <section class="card" id="noticeBox"><h3>Notifications</h3>
+      <h4>Inside the app</h4>
+      <label class="tog"><input type="checkbox" data-notice="quiet" ${CFG.notice.quiet ? "checked" : ""}><span><b>Quiet</b>: only liquidations, Last chance, Double or nothing and levels</span></label>
+      <div id="noticeTypes" class="${CFG.notice.quiet ? "dim" : ""}">${NOTICES.map(([k, l]) => `<label class="tog"><input type="checkbox" data-notice="${k}" ${CFG.notice[k] ? "checked" : ""} ${CFG.notice.quiet ? "disabled" : ""}><span>${l}</span></label>`).join("")}</div>
+      <small class="mut">The important ones always show, and so do errors in something you just tried. Swipe a notice to remove it.</small>
+      <h4>On your phone</h4>
       <p class="mut">Permission: <b>${esc(perm)}</b></p>
       ${ns.ok && ns.permission !== "granted" ? `<button class="btn" data-askperm>Allow notifications</button>` : ""}
       ${tog("fills", "Limit order fills, stop loss and take profit")}
@@ -2725,9 +2805,10 @@ function settingsHTML() {
       ${tog("summary", "Summary at the Wall Street close")}
       ${tog("streak", "Streaks (“4 green days in a row”)")}
       <small class="mut">They arrive while the app is open or recently minimized. With the app fully closed it would need a notification server, which this version doesn't have. On iPhone, add the app to the Home Screen (iOS 16.4 or later).</small>
-      ${CFG.alerts.length ? `<h4>Active price alerts</h4>${CFG.alerts.map(a => `<div class="alert-row">${esc(a.inst.sym)}: ${a.dir === "above" ? "if it rises to" : "if it falls to"} ${$px(a.inst, a.price)} <button class="lnk" data-delalert="${a.id}">remove</button></div>`).join("")}` : ""}
+      <div id="alertsBox">${alertsHTML()}</div>
     </section>
     <section class="card" id="capBox"><h3>Money cap</h3>
+      <p class="mut" id="setBal"></p>
       <p class="mut">Every portfolio (yours in Live, yours in Sim, or a bot's) stops at the cap of its level. Reaching it unlocks the next one; at the last one you can Prestige. On the same cap, the first to get there ranks higher.</p>
       ${RICH.LEVELS.map((l, i) => `<p class="mut">${l.icon} <b>${l.name}</b>: up to <b>${$usd(l.cap)}</b>, ${l.what}.<br><small>Figure: ${levelSource(i)}.</small></p>`).join("")}
       <small class="mut">Snapshots: the app doesn't update them. The country list has no Taiwan (the World Bank doesn't publish it) and leaves out countries without a ${RICH.GDP_YEAR} figure yet.</small>
@@ -2744,8 +2825,9 @@ function settingsHTML() {
       <label class="tog"><input type="checkbox" id="simSoundTog" ${CFG.simSound ? "checked" : ""}><span>Sim sounds: buys, sales, pumps, rugs, events and jackpots</span></label></section>
     <section class="card" id="botsBox">${botsSettingsHTML()}</section>
     <section class="card" id="cheatsBox"><h3>Cheats</h3>
-      <p class="mut">Money printer, Zero fees, Leverage, Undo, Time machine and ${C.CHEATS.length - 5} more. Using any cheat marks your portfolio with a ★ on the leaderboard and in your history, and achievements earned with cheats are kept apart. Bots cheat too (Settings → Rival bots). Resetting the portfolio removes the star.</p>
-      ${E.isCheated(S) ? `<p class="mut"><span class="star">★</span> This portfolio has used cheats.</p>` : ""}
+      <p class="mut">Money printer, Zero fees, Leverage, Undo, Time machine and ${C.CHEATS.length - 5} more. Bots cheat too (Settings → Rival bots).</p>
+      <p class="mut" id="setCheats"></p>
+      <label class="tog"><input type="checkbox" id="marksTog" ${CFG.showMarks ? "checked" : ""}><span>Show cheat marks (★ on portfolios, trades and achievements)</span></label>
       <button class="btn" data-cheats>Open cheats</button>
     </section>
     <section class="card"><h3>Backup</h3>
@@ -2790,10 +2872,11 @@ async function saveKey(id) {
     st.textContent = e.kind === "limit" ? "Key saved. The source is at its limit right now; it will be tested again in a minute." : "Key saved. It couldn't be tested right now (connection?); it will be tested again on its own.";
   }
   await saveCfg();
+  inp.dataset.masked = "1";
   if (id === "fhKey") { fh.reset(); stockListAt = 0; statusAt = 0; lists.stock = []; kick("stock"); }
   src[id === "fhKey" ? "finnhub" : "twelvedata"] = { ok: Date.now(), err: null };
   renderBanners(); renderView();
-  setTimeout(() => { if (ui.sheet?.kind === "settings") renderSheet(); }, 1500);
+  setTimeout(() => { if (ui.sheet?.kind === "settings") { if (inp.isConnected) inp.value = inp.defaultValue; renderSheet(true); } }, 1500);
 }
 
 /** MM-DD-YYYY for file names (US order, no slashes). */
@@ -2805,7 +2888,7 @@ function fileDay(ms) {
 function exportBackup() {
   const text = buildBackup({ portfolio: S, achievements: A, settings: CFG, bots: BOTS });
   download(`ghost-desk-backup-${fileDay(Date.now())}.json`, text, "application/json");
-  toast("Backup exported", "up");
+  toast("Backup exported", "up", "info");
 }
 async function importBackup(file) {
   try {
@@ -2819,7 +2902,7 @@ async function importBackup(file) {
     CFG = { ...DEFAULT_CFG, ...d.settings, ...keep, notif: { ...DEFAULT_CFG.notif, ...(d.settings.notif || {}) } };
     DUE.add("portfolio"); DUE.add("bots"); DUE.add("achievements");
     if (!(await saveCfg())) throw new Error("The backup was read but could not be saved.");
-    toast(`Backup imported: ${plural(Object.keys(S.pos).length, "position", "positions")}, ${plural(S.trades.length, "trade", "trades")}${BOTS.length ? ", " + plural(BOTS.length, "bot", "bots") : ""}`, "up");
+    toast(`Backup imported: ${plural(Object.keys(S.pos).length, "position", "positions")}, ${plural(S.trades.length, "trade", "trades")}${BOTS.length ? ", " + plural(BOTS.length, "bot", "bots") : ""}`, "up", "info");
     closeSheet();
     renderAll();
     for (const m of MARKETS) kick(m === "stock" ? "stock" : m);
@@ -2912,7 +2995,7 @@ function onClick(e) {
   if (d.doit) { doIt(d.doit); return; }
   if (d.jumpbuy) { jumpBuy(d.jumpbuy); return; }
   if (d.jumpsell) { jumpSell(d.jumpsell); return; }
-  if (d.disarm) { dropSignal(d.disarm); oracleVer++; toast("Signal canceled"); drawChartSoon(true); return; }
+  if (d.disarm) { dropSignal(d.disarm); oracleVer++; toast("Signal canceled", "", "cheats"); drawChartSoon(true); return; }
   if (d.oascope) { CFG.oracleAuto.scope = d.oascope; saveCfg(); cheatChanged(); return; }
   if (d.frpct) { CFG.frontPct = +d.frpct; saveCfg(); refreshStandings(); renderSheet(); return; }
   if (d.front) { frontRun(d.front, false, d.key); return; }
@@ -2921,12 +3004,17 @@ function onClick(e) {
   if (d.bot) { openBot(d.bot); return; }
   if (d.cheats !== undefined) { openPanel({ kind: "cheats" }); return; }
   if (d.donno !== undefined) { $("#confirm").hidden = true; return; }
-  if (d.always) { C.setAlways(S, d.always, !C.isAlways(S, d.always), appNow()); toast(C.isAlways(S, d.always) ? `♾️ ${C.CHEAT[d.always].name}: always on` : `${C.CHEAT[d.always].name}: always on is off`, "gold"); cheatChanged(); return; }
+  if (d.always) { C.setAlways(S, d.always, !C.isAlways(S, d.always), appNow()); toast(C.isAlways(S, d.always) ? `♾️ ${C.CHEAT[d.always].name}: always on` : `${C.CHEAT[d.always].name}: always on is off`, "gold", "cheats"); cheatChanged(); return; }
   if (d.arm || d.lev || d.print || d.undo !== undefined || d.don !== undefined || d.donflip !== undefined || d.moon || d.airdrop !== undefined || d.copycat || d.closem) { cheatClick(t, d); return; }
   if (d.tm !== undefined) { startReplay($("#tmInst")?.value, +$("#tmDay")?.value); return; }
   if (d.rp) { replayAction(d.rp); return; }
   if (d.rpbuy) { replayAction(d.rpbuy); return; }
   if (d.rpspeed) { const rp = ui.replay; if (rp) { rp.speed = +d.rpspeed; rp.playing = !RP.atEnd(rp); rp.peek = false; rpLast = Date.now(); renderSheet(); } return; }
+  if (d.botdiff) {
+    CFG.botDiff = d.botdiff; saveCfg();
+    for (const b of BOTS) botCheatTick(b, appNow(), { ...botCtx(b), allowed: CFG.botCheats, quoteFor });
+    saveBots(); renderBotsBox(); refreshStandings(); return;
+  }
   if (d.addbot) { addBot(d.addbot); renderBotsBox(); return; }
   if (d.delbot) {
     if (!t.dataset.sure) {
@@ -2936,13 +3024,13 @@ function onClick(e) {
     }
     const b = BOTS.find(x => x.id === d.delbot);
     BOTS = BOTS.filter(x => x.id !== d.delbot); saveBots();
-    if (b) toast(`${b.name} removed`);
+    if (b) toast(`${b.name} removed`, "", "bots");
     renderBotsBox(); renderView(); return;
   }
   if (d.tab) { setTab(d.tab); return; }
   if (d.market) { ui.market = d.market; if (ui.tab !== "markets") setTab("markets"); else renderView(); ensureMarketLoaded(); return; }
   if (d.memeview) { ui.memeView = d.memeview; renderView(); kick("meme"); return; }
-  if (d.clear !== undefined) { lists.search[ui.market] = null; ui.query[ui.market] = ""; renderView(); return; }
+  if (d.clear !== undefined) { const i = $("#q-" + ui.market); if (i) i.value = i.defaultValue = ""; lists.search[ui.market] = null; ui.query[ui.market] = ""; renderView(); return; }
   if (d.hist) { ui.hist = d.hist; ui.histN = 100; renderView(); return; }
   if (d.sb) { ui.sb = d.sb; renderView(); return; }
   if (d.more !== undefined) { ui.histN += 200; renderView(); return; }
@@ -2951,7 +3039,7 @@ function onClick(e) {
     download(`ghost-desk-history-${ui.hist}-${fileDay(Date.now())}.csv`, toCSV(list), "text/csv;charset=utf-8");
     return;
   }
-  if (d.cancel) { if (E.cancelOrder(S, +d.cancel)) { toast("Order canceled"); saveSoon(0); renderView(); renderSheet(); } return; }
+  if (d.cancel) { if (E.cancelOrder(S, +d.cancel)) { toast("Order canceled", "", "trades"); saveSoon(0); renderView(); renderSheet(); } return; }
   if (d.settings !== undefined) { openSettings(); return; }
   if (d.close !== undefined) { closeSheet(); return; }
   if (d.ivl) { ui.sheet.ivl = d.ivl; CFG.ivl = d.ivl; saveCfg(); $$("[data-ivl]").forEach(b => b.setAttribute("aria-pressed", b.dataset.ivl === d.ivl)); if (ui.sheet.key.startsWith("crypto:")) crypto.watchChart(null); loadChart(); return; }
@@ -2984,16 +3072,16 @@ function onClick(e) {
     if (q && sl && sl >= q.px) { toast("The stop loss has to be below the current price.", "down"); return; }
     if (q && tp && tp <= q.px) { toast("The take profit has to be above the current price.", "down"); return; }
     E.setStops(S, key, { sl, tp }); saveSoon(0);
-    toast(sl || tp ? "Stop loss and take profit saved" : "Stop loss and take profit removed", "up");
+    toast(sl || tp ? "Stop loss and take profit saved" : "Stop loss and take profit removed", "up", "trades");
     renderSheet(); renderView(); return;
   }
   if (d.delalert) { CFG.alerts = CFG.alerts.filter(a => a.id !== +d.delalert); saveCfg(); renderSheet(); return; }
   if (d.savekey) { saveKey(d.savekey); return; }
   if (d.delkey) {
     if (d.delkey === "fhKey") { CFG.finnhubKey = ""; fh.reset(); } else CFG.twelveKey = "";
-    saveCfg(); src[d.delkey === "fhKey" ? "finnhub" : "twelvedata"] = {}; renderSheet(); renderBanners(); renderView(); return;
+    saveCfg(); src[d.delkey === "fhKey" ? "finnhub" : "twelvedata"] = {}; { const i = $("#" + d.delkey); if (i) i.value = i.defaultValue; } renderSheet(true); renderBanners(); renderView(); return;
   }
-  if (d.askperm !== undefined) { askPermission().then(() => renderSheet()); return; }
+  if (d.askperm !== undefined) { askPermission().then(() => renderSheet(true)); return; }
   if (d.savenow !== undefined) { flushSave(); return; }
   if (d.reload !== undefined) { location.reload(); return; }
   if (d.issuesok !== undefined) { loadIssues = []; renderBanners(); return; }
@@ -3016,7 +3104,7 @@ function onClick(e) {
     resetBots(S.start, appNow());
     if (SIM) clearPoints().then(() => addPoint()).catch(e => console.warn(e?.message));
     CFG.lastBuy = defaultBuy(S.start); saveCfg();
-    toast(`Portfolio reset: ${$usd0(S.start)}. Your achievements and badges stay.`, "up");
+    toast(`Portfolio reset: ${$usd0(S.start)}. Your achievements and badges stay.`, "up", "info");
     closeSheet(); renderAll(); return;
   }
 }
@@ -3024,10 +3112,10 @@ function onClick(e) {
 function cheatClick(t, d) {
   const now = appNow();
   try {
-    if (d.arm) { C.arm(S, d.arm, !C.isArmed(S, d.arm), now); if (C.isArmed(S, d.arm)) toast(`${C.CHEAT[d.arm].icon} ${C.CHEAT[d.arm].name} armed`, "gold"); }
-    else if (d.lev) { C.setLeverage(S, +d.lev, now); toast(+d.lev > 1 ? `⚙️ Leverage ${d.lev}x: your buys open leveraged positions` : "Leverage off"); }
-    else if (d.print) { const cut = C.printMoney(S, +d.print, now); if (cut) { capSeen = S.capCut; capNotice(cut); } else toast(`🖨️ ${$usd0(+d.print)} printed into your cash`, "gold"); confetti($("#confetti")); }
-    else if (d.undo !== undefined) { const gone = C.undo(S, now); toast(`↩️ Undone: ${gone.map(x => `${sideLabel(x)} ${esc(x.sym)}`).join(", ") || "last trade"}`, "gold"); }
+    if (d.arm) { C.arm(S, d.arm, !C.isArmed(S, d.arm), now); if (C.isArmed(S, d.arm)) toast(`${C.CHEAT[d.arm].icon} ${C.CHEAT[d.arm].name} armed`, "gold", "cheats"); }
+    else if (d.lev) { C.setLeverage(S, +d.lev, now); toast(+d.lev > 1 ? `⚙️ Leverage ${d.lev}x: your buys open leveraged positions` : "Leverage off", "", "cheats"); }
+    else if (d.print) { const cut = C.printMoney(S, +d.print, now); if (cut) { capSeen = S.capCut; capNotice(cut); } else toast(`🖨️ ${$usd0(+d.print)} printed into your cash`, "gold", "cheats"); confetti($("#confetti")); }
+    else if (d.undo !== undefined) { const gone = C.undo(S, now); toast(`↩️ Undone: ${gone.map(x => `${sideLabel(x)} ${esc(x.sym)}`).join(", ") || "last trade"}`, "gold", "cheats"); }
     else if (d.don !== undefined) { askDon(); return; }
     else if (d.donflip !== undefined) {
       $("#confirm").hidden = true;
@@ -3035,12 +3123,12 @@ function cheatClick(t, d) {
       bigResult($("#result"), { text: r.won ? usd(r.gain * 2, { sign: true }) : usd(C.DON_FLOOR), sub: r.won ? `🪙 Heads: the profit doubled · ${r.trade.sym}` : `🪙 Tails: your whole portfolio dropped to ${usd(C.DON_FLOOR)}`, win: r.won });
       if (r.won) { confetti($("#confetti")); sfx("win"); } else { shake($("#app")); sfx("loss"); }
     }
-    else if (d.moon) { C.startBoost(S, d.moon, quoteFor(d.moon)?.px, now); toast(`🌙 Moon boost: gains on ${esc(S.pos[d.moon].inst.sym)} count 3x for 10 minutes`, "gold"); }
+    else if (d.moon) { C.startBoost(S, d.moon, quoteFor(d.moon)?.px, now); toast(`🌙 Moon boost: gains on ${esc(S.pos[d.moon].inst.sym)} count 3x for 10 minutes`, "gold", "cheats"); }
     else if (d.airdrop !== undefined) { doAirdrop(); }
     else if (d.copycat) {
       if (!t.dataset.sure) { t.dataset.sure = "1"; const old = t.textContent; t.textContent = "Tap again: your positions are replaced"; setTimeout(() => { if (t.isConnected) { delete t.dataset.sure; t.textContent = old; } }, 5000); return; }
       const bot = BOTS.find(b => b.id === d.copycat);
-      C.copycat(S, bot, now); toast(`🐒 Copycat: your portfolio is now a copy of ${esc(bot.name)}'s`, "gold");
+      C.copycat(S, bot, now); toast(`🐒 Copycat: your portfolio is now a copy of ${esc(bot.name)}'s`, "gold", "cheats");
     }
     else if (d.closem) {
       const m = S.margin?.[d.closem]; if (!m) return;
@@ -3064,7 +3152,8 @@ function onSubmit(e) {
     CFG.alerts.push({ id: Date.now(), key, inst: E.slimInst(inst), dir: v >= q.px ? "above" : "below", price: v, createdAt: Date.now() });
     saveCfg();
     const ns = notifySupport();
-    toast(`Alert set: ${inst.sym} at ${$px(inst, v)}` + (ns.ok && ns.permission !== "granted" ? ". Allow notifications in Settings to get it on your phone." : ""), "up");
+    f.reset();
+    toast(`Alert set: ${inst.sym} at ${$px(inst, v)}` + (ns.ok && ns.permission !== "granted" ? ". Allow notifications in Settings to get it on your phone." : ""), "up", "price");
     renderSheet();
   }
 }
@@ -3087,19 +3176,26 @@ function onInput(e) {
 function onChange(e) {
   const t = e.target;
   if (t.dataset.notif) { CFG.notif[t.dataset.notif] = t.checked; saveCfg(); return; }
+  if (t.dataset.notice) {
+    CFG.notice[t.dataset.notice] = t.checked; saveCfg();
+    if (t.dataset.notice === "quiet") { $("#noticeTypes").classList.toggle("dim", t.checked); $$("#noticeTypes input").forEach(i => { i.disabled = t.checked; }); }
+    if (!noticeOn("saved")) $("#saved").hidden = true;
+    renderBanners(); return;
+  }
+  if (t.id === "marksTog") { CFG.showMarks = t.checked; saveCfg(); renderAll(); refreshStandings(); return; }
   if (t.id === "moveTh") { CFG.moveTh = +t.value; saveCfg(); return; }
-  if (t.id === "botCheatsTog") { CFG.botCheats = t.checked; saveCfg(); for (const b of BOTS) botCheatTick(b, appNow(), { allowed: CFG.botCheats, quoteFor }); saveBots(); refreshStandings(); return; }
+  if (t.id === "botCheatsTog") { CFG.botCheats = t.checked; saveCfg(); for (const b of BOTS) botCheatTick(b, appNow(), { ...botCtx(b), allowed: CFG.botCheats, quoteFor }); saveBots(); refreshStandings(); return; }
   if (t.id === "lcPct") { const v = +t.value; if (v >= 1 && v <= 90) { CFG.lc.pct = v; saveCfg(); $$("[data-lcpct]").forEach(b => b.setAttribute("aria-pressed", +b.dataset.lcpct === v)); } else toast("Choose between 1% and 90%.", "down"); return; }
   if (t.id === "lcWarn") { CFG.lc.warn = t.checked; saveCfg(); return; }
-  if (t.id === "lcTrail") { CFG.lc.trail = t.checked; saveCfg(); toast(t.checked ? `Trailing stop on: it sells at −${CFG.lc.pct}% from the high since you bought.` : "Trailing stop off."); for (const k of trackedKeys()) runChecks(k); return; }
+  if (t.id === "lcTrail") { CFG.lc.trail = t.checked; saveCfg(); toast(t.checked ? `Trailing stop on: it sells at −${CFG.lc.pct}% from the high since you bought.` : "Trailing stop off.", "", "info"); for (const k of trackedKeys()) runChecks(k); return; }
   if (t.dataset.cheat === "oracle" && !SIM) { t.checked = false; toast("Oracle works only in Sim mode.", "down"); return; }
-  if (t.dataset.cheat) { C.setToggle(S, t.dataset.cheat, t.checked, appNow()); if (t.checked) toast(`${C.CHEAT[t.dataset.cheat].icon} ${C.CHEAT[t.dataset.cheat].name} on`, "gold"); cheatChanged(); return; }
+  if (t.dataset.cheat) { C.setToggle(S, t.dataset.cheat, t.checked, appNow()); if (t.checked) toast(`${C.CHEAT[t.dataset.cheat].icon} ${C.CHEAT[t.dataset.cheat].name} on`, "gold", "cheats"); cheatChanged(); return; }
   if (t.id === "oaTog") {
     CFG.oracleAuto.on = t.checked; saveCfg();
     if (t.checked && !C.isOn(S, "oracle")) C.setToggle(S, "oracle", true, appNow());
     if (t.checked) C.mark(S, "oracle", "Oracle Auto on", appNow());
     else for (const [k, g] of Object.entries(signals())) if (g.src === "auto") delete S.cheats.auto[k];
-    toast(t.checked ? "🔮 Oracle Auto on" : "Oracle Auto off: what it bought stays yours.", t.checked ? "gold" : "");
+    toast(t.checked ? "🔮 Oracle Auto on" : "Oracle Auto off: what it bought stays yours.", t.checked ? "gold" : "", "cheats");
     cheatChanged(); return;
   }
   if (t.id === "oaPct") { const v = +t.value; if (v >= 1 && v <= 100) { CFG.oracleAuto.pct = v; saveCfg(); } else { t.value = CFG.oracleAuto.pct; toast("Choose between 1% and 100%.", "down"); } return; }
@@ -3123,13 +3219,41 @@ function ensureMarketLoaded() {
   }
 }
 
-let toastTimer = null;
-function toast(text, kind = "") {
-  const el = $("#toast");
-  el.innerHTML = text; el.className = "toast " + kind; el.hidden = false;
-  clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => { el.hidden = true; }, 3200);
+// Notices inside the app. "important" (liquidation, levels) and "ui" (errors and answers to a tap) always show;
+// the other types have a switch in Settings, and Quiet hides them all.
+const NOTICES = [["trades", "My trades, achievements and streaks"], ["cheats", "Cheats"], ["bots", "Bots and Rival moves"], ["sim", "Sim events"], ["price", "Prices"], ["saved", "Saved (the green dot)"]];
+const noticeOn = cat => cat === "important" || cat === "ui" || (!CFG.notice.quiet && CFG.notice[cat] !== false);
+const TOAST_MS = 2000, TOAST_MAX = 2;
+function toast(text, kind = "", cat = "ui") {
+  if (!noticeOn(cat)) return;
+  const box = $("#toasts"), same = [...box.children].find(x => x._text === text);
+  if (same) dropToast(same);
+  while (box.children.length >= TOAST_MAX) dropToast(box.firstElementChild);
+  const el = document.createElement("div");
+  el.className = "toast " + kind; el._text = text;
+  el.innerHTML = `<span>${text}</span>`;
+  box.append(el);
+  toastLife(el);
+  // swipe it away, in any direction
+  let x = 0, y = 0, on = false;
+  el.addEventListener("pointerdown", e => { on = true; x = e.clientX; y = e.clientY; clearTimeout(el._timer); try { el.setPointerCapture(e.pointerId); } catch {} });
+  el.addEventListener("pointermove", e => {
+    if (!on) return;
+    const dx = e.clientX - x, dy = e.clientY - y;
+    el.style.transform = `translate(${dx}px, ${dy}px)`; el.style.opacity = Math.max(0, 1 - Math.hypot(dx, dy) / 160);
+  });
+  const end = e => {
+    if (!on) return;
+    on = false;
+    if (e.type === "pointerup" && Math.hypot(e.clientX - x, e.clientY - y) >= 40) { dropToast(el); return; }
+    el.style.transform = el.style.opacity = "";
+    toastLife(el);
+  };
+  el.addEventListener("pointerup", end);
+  el.addEventListener("pointercancel", end);
 }
+function toastLife(el) { clearTimeout(el._timer); el._timer = setTimeout(() => dropToast(el), TOAST_MS); }
+function dropToast(el) { clearTimeout(el._timer); el.remove(); }
 
 let rafPending = false;
 function frame() {
@@ -3203,7 +3327,7 @@ function setupTestHooks() {
     showJackpot: (sym, mult, gain) => showJackpot(sym, mult, gain, appNow()),
     openCheats: () => openPanel({ kind: "cheats" }), startReplay, replay: () => ui.replay, rpTick, runChecks, ticks,
     chooseSide: side => $(`[data-side="${side}"]`)?.click(),
-    lists, live, prestige, levelCheck, participants, badges: () => A.prestige || [], kv, saveSoon, saveOnExit, rewind, points: () => PTS, signals, doIt, jumpBuy, jumpSell, frontRun, nextMoves, forecast, SAVE: flushSave, refreshStandings,
+    lists, live, prestige, levelCheck, participants, badges: () => A.prestige || [], kv, saveSoon, saveOnExit, rewind, points: () => PTS, signals, doIt, jumpBuy, jumpSell, frontRun, nextMoves, forecast, SAVE: flushSave, refreshStandings, renderSheet, toast, simEvents,
   };
   document.documentElement.dataset.ready = "1";
 }

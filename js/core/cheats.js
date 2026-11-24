@@ -1,9 +1,8 @@
 // Cheats: the owner's menu of unfair advantages. Pure state changes on a portfolio's s.cheats. The bots arm
 // their own (a shorter list, see bots.js) through the same state and the same engine rules.
 //
-// Any cheat that is turned on, armed or used marks the portfolio (s.cheats.since): the leaderboard and the
-// history show a star, and achievements unlocked while it is marked are kept apart. Resetting the portfolio
-// creates a clean one, so the mark goes away.
+// Any cheat that is turned on, armed or used marks the portfolio (s.cheats.since). The mark is only shown
+// (as a star) with "Show cheat marks" on. Resetting the portfolio creates a clean one, so the mark goes away.
 
 import * as E from "./engine.js";
 import { localDay } from "./stats.js";

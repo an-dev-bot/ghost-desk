@@ -32,8 +32,8 @@ export function newAchievements() {
 /**
  * Update lifetime counters with new trades and return the achievements unlocked now.
  * ctx = {trades (current portfolio), total, start (starting balance), now, stockOpenSince (ms or null), cheated}
- * cheated: the portfolio has used cheats. Those unlocks are marked apart in ach.cheated; earning the same
- * achievement later with a clean portfolio removes the mark.
+ * cheated: the portfolio has used cheats. Those unlocks count like any other; ach.cheated only remembers it for
+ * "Show cheat marks", and earning the same achievement later with a clean portfolio removes the mark.
  */
 export function evaluate(ach, newTrades, ctx) {
   const got = [];
@@ -42,7 +42,7 @@ export function evaluate(ach, newTrades, ctx) {
       ach.unlocked[id] = ctx.now; got.push(id);
       if (ctx.cheated) (ach.cheated ||= {})[id] = ctx.now;
     } else if (ach.cheated?.[id] && !ctx.cheated) {
-      delete ach.cheated[id]; ach.unlocked[id] = ctx.now; got.push(id);
+      delete ach.cheated[id];
     }
   };
   for (const t of newTrades) {

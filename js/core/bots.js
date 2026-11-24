@@ -14,7 +14,7 @@ import { reachedAt } from "./rich.js";
 
 // Bot cheats: each bot arms one whenever it suits its next trade, with no daily limit (same engine rules as yours).
 // Only Money printer is limited: once a day per bot.
-// Bots never use Undo, Ghost trade, Oracle, X-ray, Time machine, Skip ahead or Always on.
+// On Easy, Normal and Hard bots never use Undo, Ghost trade, Oracle, X-ray, Time machine or Skip ahead.
 export const BOT_CHEATS = [
   { id: "zeroFees", name: "Zero fees for 1 hour" },
   { id: "insurance", name: "Insurance 50%" },
@@ -26,7 +26,24 @@ export const BOT_CHEATS = [
   { id: "printer", name: "Money printer 10%" },
 ];
 export const BOT_TIMED = 3600e3;
-const BOT_LEV = [10, 20];
+const BOT_LEV = [10, 20]; // Easy
+
+/**
+ * Bot difficulty. share: part of its cash in each bet (null: the style's own sizes); lev: the most leverage;
+ * always: the cheats it uses stay on Always on; all: every cheat of the owner's except NEVER.
+ */
+export const DIFFS = {
+  easy: { name: "Easy", desc: "Small bets, the usual bots.", share: null, lev: 20 },
+  normal: { name: "Normal", desc: "Bets 10–25% of its cash each time, leverage up to 10x.", share: [0.1, 0.25], lev: 10 },
+  hard: { name: "Hard", desc: "Bets 25–50% of its cash each time, leverage up to 50x. Its cheats can be on Always on.", share: [0.25, 0.5], lev: 50, always: true },
+  insane: { name: "Insane", desc: "Bets 50–90% of its cash each time, leverage up to 100x, with almost all your cheats on Always on.", share: [0.5, 0.9], lev: 100, always: true, all: true },
+};
+export const DIFF_IDS = Object.keys(DIFFS);
+export const NEVER = ["undo", "oracle", "timeMachine", "timeSkip"];
+const ALL_TOGGLES = C.CHEATS.filter(c => c.kind === "toggle" && !NEVER.includes(c.id)).map(c => c.id);
+const ALL_ARMS = C.CHEATS.filter(c => c.kind === "arm" && !NEVER.includes(c.id)).map(c => c.id);
+const POOL_SHARE = 0.05; // a bigger bet never takes more than 5% of a memecoin's liquidity (10% price impact)
+const diffOf = id => DIFFS[id] || DIFFS.normal;
 
 export const STYLES = {
   momentum: { name: "Momentum", desc: "Buys what is rising fastest in all 4 markets, cuts losers early." },
@@ -94,7 +111,8 @@ export function freshQuotes(entries, now, status, bootAt) {
 const quoteOf = L => ({ px: L.px, t: L.t, liq: L.liq, quoteUsd: L.quoteUsd });
 
 /** What the bot wants to do now: [{type:'sell', key, why} | {type:'buy', key, usd, why}]. */
-export function decide(bot, fresh, now) {
+export function decide(bot, fresh, now, { diff = "easy", cheats = false, peers = [] } = {}) {
+  const D = diffOf(diff), hard = !!D.share;
   const R = RULES[bot.style], pf = bot.pf, rand = bot.style === "random" ? rng(bot) : null;
   const acts = [];
   const equity = E.totals(pf, k => (fresh.get(k) ? quoteOf(fresh.get(k)) : null)).total;
@@ -119,11 +137,12 @@ export function decide(bot, fresh, now) {
   }
 
   // one buy at most per cooldown
-  const open = Object.keys(pf.pos).length - acts.length;
+  const margin = hard ? E.marginPositions(pf) : [];
+  const open = Object.keys(pf.pos).length - acts.length + margin.length;
   if (now - (bot.lastBuy || 0) < R.cooldown || open >= R.maxPos) return acts;
   const cash = E.available(pf);
-  const pool = [...fresh.values()].filter(L => !pf.pos[L.inst.key]);
-  let pick = null, usd = 0, why = "";
+  const pool = [...fresh.values()].filter(L => !pf.pos[L.inst.key] && !margin.some(m => m.key === L.inst.key));
+  let pick = null, usd = 0, why = "", dir = 1;
 
   if (bot.style === "momentum" || bot.style === "contrarian") {
     const sign = bot.style === "momentum" ? 1 : -1;
@@ -162,22 +181,59 @@ export function decide(bot, fresh, now) {
       why = "random pick";
     }
   }
+  // Insane: X-ray (buy before the leading rival does), then Short anything on the opposite signal
+  if (!pick && D.all && cheats) {
+    const v = peekLeader(bot, peers, fresh, now, diff);
+    if (v && pool.some(L => L.inst.key === v.key)) { pick = fresh.get(v.key); why = `X-ray: before ${v.name}`; }
+    else if (bot.style === "momentum" || bot.style === "contrarian") {
+      const sign = bot.style === "momentum" ? 1 : -1;
+      let best = 0;
+      for (const L of pool) {
+        const m = L.inst.m;
+        if (L.ch24 == null || !isFinite(L.ch24) || (m === "meme" && !(L.liq >= R.minLiq))) continue;
+        const x = -sign * L.ch24; // the mirror image of its entry
+        if (x < Math.abs(R.enter[m])) continue;
+        if (x / SCALE[m] > best) { best = x / SCALE[m]; pick = L; dir = -1; }
+      }
+      if (pick) why = `${pick.ch24 < 0 ? "falling" : "rose"} ${pick.ch24.toFixed(2)}% in 24h`;
+    }
+  }
+  if (pick && hard) {
+    const r = (rand || rng(bot))();
+    usd = cash * (D.share[0] + r * (D.share[1] - D.share[0]));
+    const on = pf.cheats?.on || {};
+    if (pick.inst.m === "meme" && !on.zeroFees && !on.marketMaker) usd = Math.min(usd, (pick.liq || 0) * POOL_SHARE);
+  }
   usd = Math.floor(Math.min(usd, cash) * 100) / 100;
-  if (pick && usd >= MIN_TICKET) acts.push({ type: "buy", key: pick.inst.key, usd, why });
+  if (pick && usd >= MIN_TICKET) acts.push({ type: "buy", key: pick.inst.key, usd, why, ...(dir < 0 ? { dir } : {}) });
   return acts;
+}
+
+/** X-ray for an Insane bot: what the rival with the most money would buy now, without touching it. */
+function peekLeader(bot, peers, fresh, now, diff) {
+  const qf = k => (fresh.get(k) ? quoteOf(fresh.get(k)) : null);
+  let lead = null, top = -Infinity;
+  for (const b of peers) { const t = E.totals(b.pf, qf).total; if (t > top) { top = t; lead = b; } }
+  if (!lead) return null;
+  const a = decide({ ...lead }, fresh, now, { diff }).find(x => x.type === "buy"); // no cheats: it doesn't peek back
+  return a ? { key: a.key, name: lead.name } : null;
 }
 
 /**
  * One bot turn: decide with fresh live prices and execute through the same engine as the owner's trades.
  * cheats: the bot may arm its own cheats for these trades. Returns the trades made (each with .why).
  */
-export function step(bot, { entries, now, status, bootAt, extreme = null, cheats = false }) {
+export function step(bot, { entries, now, status, bootAt, extreme = null, cheats = false, diff = "easy", peers = [] }) {
+  const D = diffOf(diff);
   const fresh = freshQuotes(entries, now, status, bootAt);
   for (const key in bot.pf.pos) {
     const L = fresh.get(key), p = bot.pf.pos[key];
     if (L) { p.lastPx = L.px; p.lastT = L.t; if (L.quoteUsd) p.lastQu = L.quoteUsd; }
+    const bo = bot.pf.cheats?.boost;
+    if (L && bo?.key === key && now <= bo.until && L.t >= bo.from) bo.lastPx = E.gameQuote(bot.pf, key, quoteOf(L)).px;
   }
   const trades = [];
+  if (D.all && cheats) trades.push(...extras(bot, fresh, now));
   // Leveraged positions (Leverage cheat): real liquidation with the engine's rules, then the bot's own exits.
   for (const m of E.marginPositions(bot.pf)) {
     const L = fresh.get(m.key);
@@ -186,13 +242,14 @@ export function step(bot, { entries, now, status, bootAt, extreme = null, cheats
     if (!bot.pf.margin?.[m.id]) continue;
     const v = E.positionValue(bot.pf, m, quoteOf(L)), r = v / m.cost - 1;
     const why = r >= 0.5 ? `take profit (+${(r * 100).toFixed(0)}% on its margin)` : r <= -0.5 ? `stop loss (${(r * 100).toFixed(0)}% on its margin)` : now - m.openedAt > 3600e3 ? "held too long" : null;
-    if (why && cheats) consider(bot, "lucky", r > 0, now);
+    if (why && cheats) consider(bot, "lucky", r > 0, now, undefined, D);
     if (why) try { const t = E.closeMargin(bot.pf, m.id, 1, quoteOf(L), now, "bot"); t.why = why; trades.push(t); } catch { /* skip */ }
+    if (cheats && D.always) C.rearm(bot.pf);
   }
-  for (const a of decide(bot, fresh, now)) {
+  for (const a of decide(bot, fresh, now, { diff, cheats, peers })) {
     const L = fresh.get(a.key), q = quoteOf(L);
     try {
-      if (cheats) (a.type === "sell" ? cheatsForSell : cheatsForBuy)(bot, a, L, now, extreme);
+      if (cheats) (a.type === "sell" ? cheatsForSell : cheatsForBuy)(bot, a, L, now, extreme, D);
       const opts = {}, c = bot.pf.cheats;
       let t;
       if (a.type === "sell") {
@@ -202,14 +259,20 @@ export function step(bot, { entries, now, status, bootAt, extreme = null, cheats
         t = E.executeSell(bot.pf, a.key, 1, q, now, "bot", opts);
       } else {
         // Golden entry: the lowest price of the last 15 minutes
-        const lo = c?.armed?.golden && extreme ? extreme(a.key, now - 15 * 60e3, "low") : null;
+        // Sniper (Insane): a memecoin's first candle, or the lowest price there is
+        const first = c?.armed?.sniper && L.inst.m === "meme" && a.dir !== -1 && extreme ? extreme(a.key, 0, "first") ?? extreme(a.key, 0, "low") : null;
+        const lo = !(first > 0) && c?.armed?.golden && a.dir !== -1 && extreme ? extreme(a.key, now - 15 * 60e3, "low") : null;
+        if (first > 0) { opts.price = Math.min(first, q.px); opts.tags = ["Sniper"]; c.armed.sniper = false; }
         if (lo > 0) { opts.price = Math.min(lo, q.px); opts.tags = ["Golden entry"]; c.armed.golden = false; }
-        if (c?.lev > 1 && L.inst.m !== "meme") { t = E.openMargin(bot.pf, L.inst, a.usd, c.lev, 1, q, now, "bot", opts); c.lev = 1; }
+        if (a.dir === -1) { const lev = L.inst.m === "meme" ? 1 : C.leverage(bot.pf); t = E.openMargin(bot.pf, L.inst, a.usd, lev, -1, q, now, "bot", opts); if (c) c.lev = 1; }
+        else if (c?.lev > 1 && L.inst.m !== "meme") { t = E.openMargin(bot.pf, L.inst, a.usd, c.lev, 1, q, now, "bot", opts); c.lev = 1; }
         else t = E.executeBuy(bot.pf, L.inst, a.usd, q, now, "bot", false, opts);
         bot.lastBuy = now;
       }
       t.why = a.why;
       trades.push(t);
+      if (cheats && D.always) C.rearm(bot.pf);
+      if (cheats && D.all) desperateFlip(bot, t, now);
     } catch { /* not enough cash or no price: skip this action */ }
   }
   if (bot.pf.trades.length > 2000) bot.pf.trades.splice(0, bot.pf.trades.length - 2000);
@@ -220,11 +283,11 @@ export function step(bot, { entries, now, status, bootAt, extreme = null, cheats
  * X-ray: what the bot would buy (and sell) on its next turn with these live prices, without touching the bot.
  * Returns {buy: {key, sym, usd, why} | null, sells: [{key, sym, why}], wait: ms until its cooldown ends}.
  */
-export function preview(bot, { entries, now, status, bootAt }) {
+export function preview(bot, { entries, now, status, bootAt, diff = "easy", cheats = false, peers = [] }) {
   const fresh = freshQuotes(entries, now, status, bootAt);
   const copy = structuredClone(bot);
   copy.lastBuy = 0;
-  const acts = decide(copy, fresh, now);
+  const acts = decide(copy, fresh, now, { diff, cheats, peers });
   const sym = k => fresh.get(k)?.inst.sym || bot.pf.pos[k]?.inst.sym || "?";
   const b = acts.find(a => a.type === "buy");
   return {
@@ -254,8 +317,8 @@ export function byRank(a, b) {
 }
 
 export function validBots(list) {
-  // Bots arm their own cheats; Undo and Always on are never theirs.
-  if (Array.isArray(list)) for (const b of list) if (b?.pf) { delete b.pf.undo; delete b.pf.undoable; delete b.pf.cheats?.always; b.pf.margin ||= {}; }
+  // Bots arm their own cheats; Undo is never theirs.
+  if (Array.isArray(list)) for (const b of list) if (b?.pf) { delete b.pf.undo; delete b.pf.undoable; b.pf.margin ||= {}; }
   return Array.isArray(list) && list.every(b => b && STYLES[b.style] && typeof b.id === "string" && b.pf && typeof b.pf.cash === "number" && b.pf.start > 0 && Array.isArray(b.pf.trades) && typeof b.pf.pos === "object");
 }
 
@@ -277,8 +340,10 @@ const CHEAT_WHEN = {
 };
 
 /** Start one cheat now, and mark it on the bot's portfolio. */
-function useCheat(bot, id, now, arg) {
+function useCheat(bot, id, now, arg, D) {
   const st = C.state(bot.pf);
+  if (D?.always && C.ALWAYS.includes(id)) { C.setAlways(bot.pf, id, true, now); return; }
+  if (D?.always && (id === "zeroFees" || id === "rugShield")) { st.on[id] = true; C.mark(bot.pf, id, `${C.CHEAT[id].name}: always on`, now); return; }
   let text = BOT_CHEATS.find(x => x.id === id).name;
   if (id === "zeroFees" || id === "rugShield") { st.on[id] = true; (st.until ||= {})[id] = now + BOT_TIMED; }
   else if (id === "leverage") { st.lev = arg; text = `Leverage ${arg}x on its next buy`; }
@@ -286,32 +351,80 @@ function useCheat(bot, id, now, arg) {
   C.mark(bot.pf, id, text, now);
 }
 /** The bot could use this cheat here: does it? (never when it's already running) */
-function consider(bot, id, worth, now, arg) {
+function consider(bot, id, worth, now, arg, D) {
   if (!worth || C.isArmed(bot.pf, id) || C.isOn(bot.pf, id) || (id === "leverage" && C.leverage(bot.pf) > 1)) return;
   const whim = CHEAT_WHEN[bot.style].whim;
   if (whim && rng(bot)() >= whim) return;
-  useCheat(bot, id, now, arg);
+  useCheat(bot, id, now, arg, D);
 }
-function cheatsForBuy(bot, a, L, now, extreme) {
+/** How much leverage this buy deserves: up to the difficulty's limit on a strong signal, less on an ordinary one. */
+function levFor(D, m, strong) {
+  return strong ? D.lev : Math.max(2, Math.round(D.lev * { fx: 0.5, stock: 0.3, crypto: 0.2 }[m]));
+}
+function cheatsForBuy(bot, a, L, now, extreme, D) {
   const w = CHEAT_WHEN[bot.style], m = L.inst.m, enter = RULES[bot.style].enter?.[m];
   const equity = E.totals(bot.pf, () => null).total;
   const strong = w.lev != null && m !== "meme" && (enter == null || Math.abs(L.ch24) >= w.lev * Math.abs(enter));
-  consider(bot, "leverage", strong, now, m === "fx" ? BOT_LEV[1] : BOT_LEV[0]);
+  if (D.share) consider(bot, "leverage", m !== "meme", now, levFor(D, m, strong), D);
+  else consider(bot, "leverage", strong, now, m === "fx" ? BOT_LEV[1] : BOT_LEV[0], D);
   const big = a.usd >= w.share * equity, levered = C.leverage(bot.pf) > 1 && m !== "meme";
-  consider(bot, "insurance", m === "meme" || levered || big, now);
-  consider(bot, "rugShield", m === "meme" && big, now);
-  consider(bot, "zeroFees", m === "meme" || levered || big, now);
+  consider(bot, "insurance", m === "meme" || levered || big, now, undefined, D);
+  consider(bot, "rugShield", m === "meme" && big, now, undefined, D);
+  consider(bot, "zeroFees", m === "meme" || levered || big, now, undefined, D);
   const lo = extreme?.(a.key, now - 15 * 60e3, "low");
-  consider(bot, "golden", lo > 0 && lo < L.px * (1 - w.edge * SCALE[m]), now);
+  consider(bot, "golden", lo > 0 && lo < L.px * (1 - w.edge * SCALE[m]), now, undefined, D);
 }
-function cheatsForSell(bot, a, L, now, extreme) {
+function cheatsForSell(bot, a, L, now, extreme, D) {
   const w = CHEAT_WHEN[bot.style], p = bot.pf.pos[a.key], m = L.inst.m;
   const r = E.positionView(p, quoteOf(L)).plPct ?? 0;
   const hi = r > 0 ? extreme?.(a.key, startOfDay(now), "high") : null;
-  consider(bot, "perfect", hi > 0 && hi > L.px * (1 + w.edge * SCALE[m]), now);
-  consider(bot, "lucky", r > 0 && r >= w.win * SCALE[m], now);
-  consider(bot, "rugShield", r < E.SHIELD - 1, now);
-  consider(bot, "insurance", r < 0, now);
+  consider(bot, "perfect", hi > 0 && hi > L.px * (1 + w.edge * SCALE[m]), now, undefined, D);
+  consider(bot, "lucky", r > 0 && r >= w.win * SCALE[m], now, undefined, D);
+  consider(bot, "rugShield", r < E.SHIELD - 1, now, undefined, D);
+  consider(bot, "insurance", r < 0, now, undefined, D);
+}
+
+// ---------------------------------------------------------------- Insane: the owner's cheats
+/** Everything that can stay on, on. */
+function allOn(bot, now) {
+  const c = C.state(bot.pf);
+  for (const id of ALL_TOGGLES) if (!c.on[id]) { c.on[id] = true; C.mark(bot.pf, id, `${C.CHEAT[id].name}: always on`, now); }
+  for (const id of ALL_ARMS) if (!C.isAlways(bot.pf, id)) C.setAlways(bot.pf, id, true, now);
+  C.rearm(bot.pf);
+  c.until = {};
+}
+/** The daily airdrop, and Moon boost on the biggest memecoin it holds. Returns the trades made. */
+function extras(bot, fresh, now) {
+  const out = [];
+  try {
+    const memes = [...fresh.values()].filter(L => L.inst.m === "meme");
+    if (memes.length && C.airdropReady(bot.pf, now)) {
+      const L = memes[Math.floor(rng(bot)() * memes.length)];
+      const t = C.airdrop(bot.pf, L.inst, quoteOf(L), now);
+      t.why = "airdrop"; out.push(t);
+    }
+    if (!bot.pf.cheats?.boost) {
+      const p = Object.values(bot.pf.pos).filter(x => x.inst.m === "meme" && fresh.has(x.key)).sort((a, b) => b.qty * b.lastPx - a.qty * a.lastPx)[0];
+      if (p) C.startBoost(bot.pf, p.key, fresh.get(p.key).px, now);
+    }
+  } catch { /* no price: next turn */ }
+  return out;
+}
+/** Double or nothing: a loss drops everything to $100, so only when there is almost nothing left to lose. */
+function desperateFlip(bot, t, now) {
+  if (C.lastWin(bot.pf) !== t || E.totals(bot.pf, () => null).total >= bot.pf.start * 0.05) return;
+  C.doubleOrNothing(bot.pf, rng(bot)(), now);
+}
+/** Copycat: once a day, when the leading rival has more than twice its money. */
+function copyLeader(bot, peers, now, quoteFor) {
+  const day = localDay(now);
+  if (bot.copyDay === day) return null;
+  let lead = null, top = E.totals(bot.pf, quoteFor).total * 2;
+  for (const b of peers) { const t = E.totals(b.pf, quoteFor).total; if (t > top) { top = t; lead = b; } }
+  if (!lead) return null;
+  bot.copyDay = day;
+  C.copycat(bot.pf, lead, now);
+  return { id: "copycat", text: `Copycat: copied ${lead.name}'s portfolio` };
 }
 
 /**
@@ -319,26 +432,39 @@ function cheatsForSell(bot, a, L, now, extreme) {
  * The other cheats are decided in step(), trade by trade.
  * ctx: {allowed (Settings: Bots can cheat), quoteFor(key) for Money printer}. Returns [{id, text}] used now.
  */
-export function cheatTick(bot, now, { allowed = true, quoteFor = () => null } = {}) {
-  const c = bot.pf.cheats;
+export function cheatTick(bot, now, { allowed = true, quoteFor = () => null, diff = "easy", peers = [], memeMax = null } = {}) {
+  const D = diffOf(diff), used = [];
+  let c = bot.pf.cheats;
+  // another difficulty: it starts over with that difficulty's cheats
+  if ((bot.diff || "easy") !== diff && c) { c.on = {}; c.armed = {}; c.always = {}; c.lev = 1; c.until = {}; }
+  bot.diff = diff;
   const day = localDay(now);
   // bots saved when cheats were limited per day: today's Money printer still counts
   if (bot.cheatDay === day && bot.cheatsToday?.includes("printer")) bot.printerDay = day;
   delete bot.cheatPlan; delete bot.cheatsToday; delete bot.cheatDay;
   if (!allowed) {
-    if (c) { c.on = {}; c.armed = {}; c.lev = 1; c.until = {}; }
+    if (c) { c.on = {}; c.armed = {}; c.always = {}; c.lev = 1; c.until = {}; }
     return [];
+  }
+  C.settleBoost(bot.pf, now);
+  if (D.all) {
+    bot.pf.memeMax = memeMax;
+    allOn(bot, now);
+    const cp = copyLeader(bot, peers, now, quoteFor);
+    if (cp) used.push(cp);
+    c = bot.pf.cheats;
   }
   const until = c?.until || {};
   for (const id in until) if (now >= until[id]) { c.on[id] = false; delete until[id]; }
-  if (bot.printerDay === day) return [];
+  if (bot.printerDay === day) return used;
   const R = RULES[bot.style], { total, pl } = E.totals(bot.pf, quoteFor);
-  if (!(pl < 0 || E.available(bot.pf) < total * (R.size ?? R.maxSize))) return [];
+  if (!(pl < 0 || E.available(bot.pf) < total * (D.share?.[0] ?? R.size ?? R.maxSize))) return used;
   bot.printerDay = day;
   const add = Math.round(total * 0.1 * 100) / 100, cut = E.addCash(bot.pf, add);
   const text = `Money printer: +$${(add - cut).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })} (10% of its balance)`;
   C.mark(bot.pf, "printer", text, now);
-  return [{ id: "printer", text }];
+  used.push({ id: "printer", text });
+  return used;
 }
 
 /** Recent cheats of all bots, newest first: [{bot, t, id, text}]. */

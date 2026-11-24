@@ -102,9 +102,9 @@ picks up the new version. If you change app files, also bump the `VERSION` strin
   Perfect exit, Sniper, 2x Lucky trade, Ghost trade, Insurance, Double or nothing, Undo, Rug shield, Diamond hands,
   Second chance, Moon boost, Airdrop, Time machine and Time skip (replay a past day on real 1-minute candles in a
   separate replay portfolio), Copycat and X-ray. Golden entry, Perfect exit, Sniper and the Time machine use real
-  candles (Binance/Coinbase, GeckoTerminal, Twelve Data). Using any cheat marks your portfolio
-  with a ★ on the leaderboard and in the history, and achievements earned with cheats are kept apart (earning one
-  again without cheats moves it back). Resetting the portfolio removes the star. Cheats work the same in Live and
+  candles (Binance/Coinbase, GeckoTerminal, Twelve Data). Achievements earned with
+  cheats count like any other. The ★ marks (portfolios, trades, history, achievements) are hidden unless you turn on
+  Settings → Cheats → "Show cheat marks"; resetting the portfolio removes them. Cheats work the same in Live and
   Sim, except Oracle, Rewind and Skip ahead, which exist only in Sim (in Live they show off, marked "Sim only").
 - **Missing data never stops a trade**: Golden entry, Perfect exit and Sniper use the best price available (the trade
   says so, "Perfect exit: highest price available"); with no data at all the trade is a normal one and they stay armed.
@@ -117,7 +117,15 @@ picks up the new version. If you change app files, also bump the `VERSION` strin
 - **Bots cheat too** (Settings → Rival bots → "Bots can cheat", on by default): each bot arms cheats
   whenever they suit its next trade, with no daily limit (Money printer: once a day per bot): Zero fees for 1 hour, Insurance 50%, 2x Lucky trade, Rug shield 20% for 1 hour, Golden entry (15-minute
   low), Perfect exit, Leverage 10x or 20x, Money printer 10% of its balance. Never Undo, Ghost trade, Oracle, X-ray,
-  Time machine, Skip ahead or Always on. Their cheats show in Rival moves and give their row a ★.
+  Time machine or Skip ahead (except on Insane, below). Their cheats show in Rival moves.
+- **Bot difficulty** (Settings → Rival bots, Normal by default). Easy: small bets. Normal: 10–25% of its cash in each
+  bet, leverage up to 10x. Hard: 25–50%, up to 50x, and the cheats it uses stay on Always on. Insane: 50–90%, up to
+  100x, and all your cheats except Undo, Oracle and Time machine, on Always on. On a memecoin a bet never takes more
+  than 5% of its liquidity (unless the bot has no price impact). Leverage needs "Bots can cheat". Magic limit does
+  nothing for a bot, because bots don't place limit orders.
+- **Notices inside the app** (Settings → Notifications): a switch per type (my trades, cheats, bots / Rival moves, Sim
+  events, prices, Saved) and **Quiet**, which leaves only liquidations, Last chance, Double or nothing and levels (and
+  the errors of something you just tried). They last 2 seconds, stack 2 at most and can be swiped away.
 - **Money cap by levels** (Live, Sim and bots; figures and dates in `js/core/rich.js` and Settings): Billionaires, up to
   $7.27T (Forbes, Nov 23, 2026); Countries, up to the United States' GDP, $30.77T (World Bank, 2025); World, up to
   $517.69T (UBS Global Wealth Report 2026, end of 2025, 56 markets). A gain past the cap is cut; reaching it unlocks
@@ -139,7 +147,7 @@ picks up the new version. If you change app files, also bump the `VERSION` strin
 - **Skip ahead** (Sim only, +1m / +5m / +15m / +1h / +1d / +1w under the chart): plays the whole Sim world forward: candles, events,
   new coins, rugs and the bots' trades; your limit orders, stop loss, take profit and trailing stop fill on the way.
 - **Rewind** (cheat, Sim only, -1m / -5m / -15m / -1h / -1d / -1w next to Skip ahead): the Sim world, your Sim portfolio and the bots go
-  back to a save point (every 15 Sim minutes and before every jump, up to 1 week; every 20 seconds in the last 20 minutes). Your cheat switches and the star stay.
+  back to a save point (every 15 Sim minutes and before every jump, up to 1 week; every 20 seconds in the last 20 minutes). Your cheat switches stay.
 - **Oracle Auto** (in the Oracle card): buys at BUY and sells at SELL by itself, with a % of your cash, on the coin
   you're viewing or on all of them; marks that costs would turn into a loss are left alone. **Do it** arms one signal;
   **Jump to it** plays the Sim to BUY, and **Jump to sell** to SELL.

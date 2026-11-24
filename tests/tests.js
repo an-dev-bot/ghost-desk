@@ -22,7 +22,7 @@ import * as RICH from "../js/core/rich.js";
 import * as F from "../js/ui/format.js";
 import * as RW from "../js/sim/rewind.js";
 import * as CLEAN from "../js/core/sanitize.js";
-import { cheatTick, BOT_CHEATS, validBots } from "../js/core/bots.js";
+import { cheatTick, BOT_CHEATS, NEVER, validBots } from "../js/core/bots.js";
 
 const results = [];
 async function test(name, fn) {
@@ -734,7 +734,7 @@ await test("Cheats · X-ray shows the bot's next buy before it makes it", () => 
   eq(seen?.sym, made.sym, "X-ray saw the symbol"); near(seen.usd, made.usd, "and the amount");
 });
 
-await test("Cheats · achievements earned with cheats are kept apart", () => {
+await test("Cheats · achievements earned with cheats count the same", () => {
   const a = newAchievements();
   const s = cheated();
   C.printMoney(s, 1000000, T0);
@@ -746,6 +746,7 @@ await test("Cheats · achievements earned with cheats are kept apart", () => {
   ok(a.unlocked.first_trade && !a.cheated.first_trade, "a clean one is not");
   evaluate(a, [], { trades: [], total: 160000, start: 100000, now: T0 + 2, cheated: false });
   ok(!a.cheated.value_150, "earned again without cheats: the mark goes away");
+  eq(a.unlocked.value_150, T0, "and its date stays: it already counted");
   const csv = toCSV([...s.trades, { t: T0, m: "crypto", sym: "BTC", name: "Bitcoin", side: "buy", dir: -1, lev: 50, qty: 1, px: 1, usd: 1, cheat: ["Leverage 50x"], reason: "manual" }]);
   ok(/,short,/.test(csv) && /,50x,Leverage 50x/.test(csv), "CSV says short, 50x and the cheat");
 });
@@ -1256,9 +1257,74 @@ await test("Bot cheats · any time, as it suits them, Money printer once a day; 
   cheatTick(k, T0 + 1, { allowed: false });
   ok(!C.isArmed(k.pf, "lucky") && !C.isOn(k.pf, "zeroFees"), "Bots can cheat off: nothing armed");
   ok(E.isCheated(k.pf), "the ★ stays: it cheated before");
-  // an imported bot keeps its cheats (but never Undo or Always on)
+  // an imported bot keeps its cheats (but never Undo)
   const list = [JSON.parse(JSON.stringify(k))]; list[0].pf.cheats.always = { golden: true }; list[0].pf.undo = {};
-  ok(validBots(list), "valid"); ok(list[0].pf.cheats && !list[0].pf.cheats.always && !list[0].pf.undo, "cheats kept, Always on and Undo dropped");
+  ok(validBots(list), "valid"); ok(list[0].pf.cheats?.always?.golden && !list[0].pf.undo, "cheats and Always on kept, Undo dropped");
+});
+
+await test("Bot difficulty · bets, leverage and Always on of each level", () => {
+  const turn = (b, diff, t, e = {}, o = {}) => botStep(b, { entries: [L(o.inst || BTC, o.px || 60000, t, { ch24: 5, ...e })], now: t, status: statusAt(t), bootAt: 0, cheats: o.cheats ?? true, diff, extreme: o.extreme, peers: o.peers });
+  for (const [diff, lo, hi, maxLev] of [["normal", 0.1, 0.25, 10], ["hard", 0.25, 0.5, 50], ["insane", 0.5, 0.9, 100]]) {
+    const sizes = [], levs = [];
+    for (let seed = 1; seed <= 60; seed++) for (const style of ["momentum", "contrarian", "random"]) {
+      const b = newBot(style, { id: "d" + seed, start: 100000, now: T0, seed }), ch24 = (style === "contrarian" ? -1 : 1) * (seed % 2 ? 5 : 20);
+      cheatTick(b, T0, { diff });
+      const t = turn(b, diff, T0, { ch24 }).find(x => x.side === "buy" && x.reason === "bot");
+      if (t) { sizes.push(t.usd / 100000); levs.push(t.lev || 1); }
+    }
+    ok(sizes.length > 100, diff + ": they bet " + sizes.length);
+    ok(Math.min(...sizes) >= lo - 1e-4 && Math.max(...sizes) <= hi + 1e-4, `${diff}: ${Math.min(...sizes)}–${Math.max(...sizes)} of its cash`);
+    eq(Math.max(...levs), maxLev, diff + ": leverage up to");
+  }
+  // Easy: exactly the same as without a difficulty
+  const run = o => { const b = newBot("momentum", { id: "x", start: 100000, now: T0, seed: 1 }); cheatTick(b, T0, o); return botStep(b, { entries: [L(BTC, 60000, T0, { ch24: 9 })], now: T0, status: statusAt(T0), bootAt: 0, cheats: true, ...o }); };
+  deepEq(run({ diff: "easy" }), run({}), "Easy as before"); near(run({ diff: "easy" })[0].usd, 6000, "6% of its balance");
+  // cheats off: the bet grows, no leverage
+  const off = newBot("momentum", { id: "o", start: 100000, now: T0, seed: 4 });
+  cheatTick(off, T0, { diff: "insane", allowed: false });
+  const [ot] = turn(off, "insane", T0, { ch24: 9 }, { cheats: false });
+  ok(ot.usd >= 50000 && !ot.lev && !off.pf.cheats, "cheats off: a plain, big buy");
+  // one leveraged position per coin
+  const one = newBot("momentum", { id: "1", start: 100000, now: T0, seed: 4 });
+  turn(one, "normal", T0); turn(one, "normal", T0 + 200e3); eq(E.marginPositions(one.pf).length, 1, "it doesn't pile on the same coin");
+  // a thin memecoin: no more than 5% of its pool
+  const dg = newBot("degen", { id: "dg", start: 100000, now: T0, seed: 2 });
+  const [mt] = turn(dg, "hard", T0, { ch1h: 40, liq: 100000 }, { inst: MEME, px: 0.001, cheats: false });
+  near(mt.usd, 5000, "5% of a $100K pool");
+  // Hard: what it uses stays on Always on; Normal's is used up
+  for (const [diff, always] of [["normal", false], ["hard", true]]) {
+    const h = newBot("momentum", { id: "h", start: 100000, now: T0, seed: 2 });
+    cheatTick(h, T0, { diff });
+    turn(h, diff, T0, { ch24: 9 }, { extreme: (k, f, kind) => (kind === "low" ? 57000 : null) });
+    eq(C.isAlways(h.pf, "golden"), always, diff + ": Golden entry always on"); eq(C.isArmed(h.pf, "golden"), always, diff + ": armed again");
+    cheatTick(h, T0 + 2 * 3600e3, { diff }); eq(C.isOn(h.pf, "zeroFees"), always, diff + ": Zero fees after its hour");
+    if (always) { cheatTick(h, T0 + 3 * 3600e3, { diff: "normal" }); ok(!C.isAlways(h.pf, "golden") && !C.isArmed(h.pf, "golden") && !C.isOn(h.pf, "zeroFees"), "back to Normal: nothing left on"); }
+  }
+  // Insane: your cheats except Undo, Oracle and Time machine, always on
+  const z = newBot("momentum", { id: "z", start: 100000, now: T0, seed: 3 });
+  cheatTick(z, T0, { diff: "insane" });
+  for (const c of C.CHEATS) if (c.kind === "toggle") eq(C.isOn(z.pf, c.id), !NEVER.includes(c.id), c.id);
+  for (const c of C.CHEATS) if (c.kind === "arm") ok(C.isAlways(z.pf, c.id) && C.isArmed(z.pf, c.id), c.id + " always on");
+  for (const id of ["undo", "oracle", "timeMachine", "timeSkip"]) ok(!z.pf.cheats.used[id], "never " + id);
+  const round = JSON.parse(JSON.stringify(z)); ok(validBots([round]) && C.isAlways(round.pf, "golden"), "kept when saved");
+  // short on the opposite signal; airdrop and Moon boost
+  const sh = turn(z, "insane", T0, { ch24: -9 });
+  ok(sh.some(t => t.dir === -1 && t.lev > 1), "shorts a falling coin: " + JSON.stringify(sh.map(t => [t.dir, t.lev])));
+  const ad = newBot("degen", { id: "ad", start: 100000, now: T0, seed: 3 });
+  cheatTick(ad, T0, { diff: "insane" });
+  const got = turn(ad, "insane", T0, { ch1h: 40, liq: 1e6 }, { inst: MEME, px: 0.001 });
+  ok(got.some(t => t.reason === "airdrop") && ad.pf.cheats.boost, "airdrop and Moon boost");
+  const c0 = ad.pf.cash; turn(ad, "insane", T0 + 30e3, { ch1h: 40, liq: 1e6 }, { inst: MEME, px: 0.0012 });
+  cheatTick(ad, T0 + C.BOOST_MS + 1000, { diff: "insane" }); ok(ad.pf.cash > c0, "the boost pays at the end");
+  // X-ray: buys before the leading rival
+  const lead = newBot("contrarian", { id: "l", start: 200000, now: T0, seed: 3 }), spy = newBot("degen", { id: "s", start: 150000, now: T0, seed: 3 });
+  cheatTick(spy, T0, { diff: "insane" });
+  const seed0 = lead.seed, sp = turn(spy, "insane", T0, { ch24: -9 }, { peers: [lead] });
+  ok(sp.some(t => /X-ray/.test(t.why)), "X-ray: " + JSON.stringify(sp.map(t => t.why))); eq(lead.seed, seed0, "the rival isn't touched"); eq(lead.pf.trades.length, 0);
+  // Copycat: far behind the leader, once a day
+  const cp = newBot("momentum", { id: "cp", start: 100000, now: T0, seed: 3 }), rich = newBot("momentum", { id: "r", start: 100000, now: T0, seed: 3 });
+  rich.pf.cash = 900000;
+  ok(cheatTick(cp, T0, { diff: "insane", peers: [rich] }).some(x => x.id === "copycat"), "copies the leader"); near(cp.pf.cash, 900000);
 });
 
 await test("Saving · good data is never touched; bad numbers are repaired and the rest is kept", () => {

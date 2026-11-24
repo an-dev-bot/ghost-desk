@@ -354,6 +354,7 @@ async def layout_tests(p):
     await asyncio.sleep(0.5)
     await check("settings")
     fails += await reset_tests(p, check)
+    fails += await notice_tests(p, check)
     fails += await rival_tests(p, check)
     fails += await cheat_ui_tests(p, check)
     fails += await sim_ui_tests(p, check)
@@ -415,6 +416,43 @@ async def reset_tests(p, check):
     return fails
 
 
+async def notice_tests(p, check):
+    """Notices inside the app: short, two at most, swiped away, a switch per type and Quiet."""
+    fails = []
+    def res(good, text, key):
+        print(("PASS " if good else "FAIL ") + " " + text)
+        if not good:
+            fails.append(key)
+    N = "document.querySelectorAll('#toasts .toast').length"
+    await p.js("ghostDesk.closeSheet(true), document.querySelectorAll('#toasts .toast').forEach(t => t.remove()), true")
+    await p.js("['One','Two','Three'].forEach(t => ghostDesk.toast(t, 'up', 'trades')), true")
+    two = await p.js("[...document.querySelectorAll('#toasts .toast')].map(t => t.textContent)")
+    await check("notices two")
+    r = await p.js("(() => { const r = document.querySelector('#toasts .toast').getBoundingClientRect(); return { x: r.x + r.width / 2, y: r.y + r.height / 2, h: r.height }; })()")
+    await p.send("Input.dispatchMouseEvent", type="mousePressed", x=r["x"], y=r["y"], button="left", clickCount=1)
+    for k in (20, 50, 90):
+        await p.send("Input.dispatchMouseEvent", type="mouseMoved", x=r["x"] + k, y=r["y"], button="left", buttons=1)
+    await p.send("Input.dispatchMouseEvent", type="mouseReleased", x=r["x"] + 90, y=r["y"], button="left", clickCount=1)
+    left = await p.js("[...document.querySelectorAll('#toasts .toast')].map(t => t.textContent)")
+    await asyncio.sleep(2.3)
+    gone = await p.js(N)
+    res(two == ["Two", "Three"] and left == ["Three"] and gone == 0 and r["h"] <= 34, f"Notices: at most 2 {two}, {r['h']:.0f} px tall, swiped one away {left}, gone after 2 s", "notices")
+    await p.js("ghostDesk.openSettings(), true")
+    sw = await p.js("[...document.querySelectorAll('[data-notice]')].map(i => i.dataset.notice + ':' + i.checked)")
+    show = f"(() => {{ const out = []; for (const c of ['trades','cheats','bots','sim','price','info','important','ui']) {{ document.querySelectorAll('#toasts .toast').forEach(t => t.remove()); ghostDesk.toast('x', '', c); if ({N}) out.push(c); }} document.querySelectorAll('#toasts .toast').forEach(t => t.remove()); return out; }})()"
+    await p.js("document.querySelector('[data-notice=cheats]').click(), true")
+    no_cheats = await p.js(show)
+    await p.js("document.querySelector('[data-notice=cheats]').click(), document.querySelector('[data-notice=quiet]').click(), true")
+    quiet = await p.js(show)
+    saved = await p.js("(async () => { document.getElementById('saved').hidden = true; await ghostDesk.saveOnExit(); ghostDesk.saveSoon(0); await new Promise(r => setTimeout(r, 300)); return !document.getElementById('saved').hidden; })()")
+    await check("settings notices quiet")
+    await p.js("document.querySelector('[data-notice=quiet]').click(), true")
+    res(sw == ["quiet:false", "trades:true", "cheats:true", "bots:true", "sim:true", "price:true", "saved:true"] and "cheats" not in no_cheats and len(no_cheats) == 7 and quiet == ["important", "ui"] and not saved,
+        f"Notice switches {sw}; Cheats off shows {no_cheats}; Quiet shows {quiet}, no Saved dot", "notice switches")
+    await p.js("ghostDesk.closeSheet(true), true")
+    return fails
+
+
 async def rival_tests(p, check):
     """Settings → add bots through the real buttons; bots trade on the live prices; leaderboard and bot history."""
     fails = []
@@ -425,6 +463,16 @@ async def rival_tests(p, check):
         await asyncio.sleep(0.2)
     await p.js("document.querySelector('[data-addbot=momentum]').click(), true")
     await asyncio.sleep(0.3)
+    d0 = await p.js("document.querySelector('[data-botdiff][aria-pressed=true]').dataset.botdiff")
+    seen = []
+    for d in ["hard", "insane", "normal", "easy"]:
+        await p.js(f"document.querySelector('[data-botdiff={d}]').click(), true")
+        seen.append(await p.js("ghostDesk.cfg().botDiff + ':' + document.querySelector('[data-botdiff][aria-pressed=true]').dataset.botdiff + ':' + Object.keys(ghostDesk.bots()[0].pf.cheats?.always || {}).length"))
+    await check("settings bot difficulty")
+    ok0 = d0 == "normal" and seen == ["hard:hard:0", "insane:insane:6", "normal:normal:0", "easy:easy:0"]
+    print(("PASS " if ok0 else "FAIL ") + f" Bot difficulty: {d0} by default; {seen}")
+    if not ok0:
+        fails.append("bot difficulty")
     names = await p.js("ghostDesk.bots().map(b => b.name + ':' + b.pf.start)")
     await check("settings bots")
     ok1 = names == ["Momentum:25000", "Degen:25000", "Random:25000", "Contrarian:25000", "Momentum 2:25000"]
@@ -492,7 +540,12 @@ async def cheat_ui_tests(p, check):
     await p.js("document.querySelector('[data-cheats]').scrollIntoView(), document.querySelector('[data-cheats]').click(), true")
     await asyncio.sleep(0.4)
     n = await p.js("document.querySelectorAll('.sheet .cheat').length")
+    nonote = await p.js("!document.querySelector('.sheet .cheat-note')")
+    # cheat marks: off by default; the rest of these tests turn them on
+    marks = await p.js("ghostDesk.cfg().showMarks")
+    await p.js("ghostDesk.cfg().showMarks = true, ghostDesk.renderSheet(), true")
     clean = await p.js("document.querySelector('.sheet .cheat-note b').textContent")
+    res(nonote and marks is False, "Cheat marks are off by default", "marks off")
     await check("cheats sheet")
     cash0 = await p.js("ghostDesk.state().cash")
     await p.js("document.querySelector('[data-print=\"10000\"]').click(), true")
@@ -532,6 +585,19 @@ async def cheat_ui_tests(p, check):
     me = await p.js("[...document.querySelectorAll('#lbSlotFull .row.lb')].find(r => r.textContent.includes('You'))?.querySelector('.nm b').textContent")
     res(lev_rows == 1 and hist["note"] and "Leverage 10x" in (hist["tag"] or "") and hist["side"] == "short" and "★" in (me or ""),
         f"Star on the portfolio: leaderboard “{me}”, history note + trade “{hist['side']}” {hist['tag']}; leveraged row in Portfolio", "star")
+    # the switch hides every mark, and shows them again
+    MARKS = "document.querySelectorAll('.star, .cheat-note, .cheat-tag, .tr.cheat').length"
+    marks = {}
+    await asyncio.sleep(2.3)  # notices from before
+    for on in (False, True):
+        await p.js("ghostDesk.closeSheet(true), ghostDesk.openSettings(), true")
+        await p.js(f"(() => {{ const t = document.getElementById('marksTog'); if (t.checked !== {str(on).lower()}) t.click(); ghostDesk.closeSheet(true); return true; }})()")
+        c = 0
+        for tab in ["home", "portfolio", "history", "achievements"]:
+            await p.js(f"ghostDesk.setTab('{tab}'), true")
+            c += await p.js(MARKS + " + (document.body.innerText.match(/★/g) || []).length")
+        marks[on] = c
+    res(marks[False] == 0 and marks[True] > 0, f"Show cheat marks: off {marks[False]} marks on any tab, on {marks[True]}", "marks switch")
     # X-ray on the leaderboard, then Undo the short
     await p.js("ghostDesk.openCheats(), true")
     await asyncio.sleep(0.3)
@@ -624,24 +690,24 @@ async def cheat_ui_tests(p, check):
     # Tap an abbreviated number: the full one
     await p.js("ghostDesk.setTab('portfolio'), true")
     await asyncio.sleep(0.3)
-    hd = await p.js("(() => { const s = ghostDesk.state(); s.cash = 1234567.89; ghostDesk.renderAll(); const el = document.getElementById('total'); el.click(); return { txt: el.textContent, full: el.dataset.full, toast: document.getElementById('toast').textContent }; })()")
+    hd = await p.js("(() => { const s = ghostDesk.state(); s.cash = 1234567.89; ghostDesk.renderAll(); const el = document.getElementById('total'); el.click(); return { txt: el.textContent, full: el.dataset.full, toast: [...document.querySelectorAll('#toasts .toast')].at(-1)?.textContent || '' }; })()")
     await check("tap full number")
     res(hd["txt"] == "$1.23M" and hd["full"] == "$1,234,567.89" and hd["toast"] == "$1,234,567.89",
         f"Big numbers: header {hd['txt']}, tap → “{hd['toast']}”", "abbr tap")
     # Cheats with missing data: the trade always goes on, no red notice
-    miss = await p.js("""(async () => { const g = ghostDesk, out = [], wait = ms => new Promise(r => setTimeout(r, ms)); const toastEl = document.getElementById('toast');
+    miss = await p.js("""(async () => { const g = ghostDesk, out = [], wait = ms => new Promise(r => setTimeout(r, ms)); const toastEls = () => [...document.querySelectorAll('#toasts .toast')];
       const enter = () => document.querySelector('.swipe-thumb').dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
       const keep = structuredClone(g.state().cheats), now = g.appNow(), bar = (t, l, h) => ({ t, o: l, h, l, c: l });
       const K = { meme: 'meme:MISSINGDATA1', crypto: 'crypto:MISSUSDT' };
       g.setLive({ key: K.meme, m: 'meme', id: 'MISSINGDATA1', sym: 'MISS', name: 'Miss', pair: 'P', born: now - 9e8 }, { px: 1, t: now, liq: 1e9 });
       g.setLive({ key: K.crypto, m: 'crypto', id: 'MISSUSDT', sym: 'MISSC', name: 'Missc' }, { px: 100, t: now });
       g.state().cash = 50000;
-      const go = async (id, key, side, candles) => { delete window.__firstCandle; window.__candles = candles; toastEl.hidden = true; toastEl.className = 'toast';
+      const go = async (id, key, side, candles) => { delete window.__firstCandle; window.__candles = candles; toastEls().forEach(t => t.remove());
         const c = g.state().cheats; c.on = {}; c.armed = {}; c.always = {}; c.lev = 1; c.armed[id] = true; const n = g.state().trades.length;
         g.closeSheet(true); g.openSheet(key); await wait(150); g.chooseSide(side); await wait(100);
         if (side === 'buy') { document.querySelector('[data-amt="max"]').click(); await wait(50); const a = document.getElementById('amtIn'); a.value = 100; a.oninput(); }
         await wait(80); enter(); await wait(400);
-        const t = g.state().trades.slice(n)[0]; out.push({ id, ok: !!t, mid: t?.mid, tag: (t?.cheat || []).join(), armed: !!g.state().cheats.armed[id], red: toastEl.classList.contains('down') && !toastEl.hidden, line: toastEl.textContent }); };
+        const t = g.state().trades.slice(n)[0]; out.push({ id, ok: !!t, mid: t?.mid, tag: (t?.cheat || []).join(), armed: !!g.state().cheats.armed[id], red: toastEls().some(t => t.classList.contains('down')), line: toastEls().at(-1)?.textContent || '' }); };
       await go('sniper', K.meme, 'buy', []); await go('golden', K.crypto, 'buy', []); await go('perfect', K.crypto, 'sell', []);
       await go('sniper', K.meme, 'buy', [bar(now - 6e8, 0.4, 2), bar(now - 5e8, 0.25, 2)]); await go('golden', K.crypto, 'buy', [bar(now - 120000, 80, 90)]); await go('perfect', K.crypto, 'sell', [bar(now - 120000, 80, 130)]);
       window.__candles = undefined; g.closeSheet(true); g.state().cheats = keep; for (const k of Object.values(K)) { delete g.state().pos[k]; g.live.delete(k); } return out; })()""")
@@ -657,7 +723,7 @@ async def cheat_ui_tests(p, check):
     await asyncio.sleep(0.3)
     await p.js("document.querySelector('[data-print=\"10000\"]').click(), true")
     await asyncio.sleep(1.2)
-    rc = await p.js("({ cash: ghostDesk.state().cash, tag: document.querySelector('#totalPl .rich-tag')?.textContent, total: document.getElementById('total').textContent, toast: document.getElementById('toast').textContent })")
+    rc = await p.js("({ cash: ghostDesk.state().cash, tag: document.querySelector('#totalPl .rich-tag')?.textContent, total: document.getElementById('total').textContent, toast: [...document.querySelectorAll('#toasts .toast')].at(-1)?.textContent || '' })")
     await p.js("ghostDesk.closeSheet(true), ghostDesk.setTab('achievements'), true")
     await asyncio.sleep(0.4)
     fx1 = await p.js("document.getElementById('levelFx').hidden ? '' : document.getElementById('levelFx').innerText.split(String.fromCharCode(10)).join(' ')")
@@ -786,7 +852,7 @@ async def cheats_live_check(p):
     await p.js("(() => { const i = document.getElementById('amtIn'); i.value = '100'; i.dispatchEvent(new Event('input', { bubbles: true })); return true; })()")
     await p.js("document.querySelector('.swipe-thumb').dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true })), true")
     await asyncio.sleep(8)
-    toast = await p.js("document.getElementById('toast').innerText")
+    toast = await p.js("[...document.querySelectorAll('#toasts .toast')].at(-1)?.textContent || ''")
     await p.shot("live-sniper")
     await asyncio.sleep(1)
     st = await p.js("""(async () => { const st = await import('./js/store.js'); const s = await st.kv.get('portfolio');
@@ -939,6 +1005,7 @@ async def sim_ui_tests(p, check):
     await asyncio.sleep(0.3)
     await p.js("document.querySelector('[data-print=\"10000\"]').click(), true")
     await asyncio.sleep(0.3)
+    await p.js("ghostDesk.cfg().showMarks = true, ghostDesk.renderAll(), true")
     c1 = await p.js("({ cash: ghostDesk.state().cash, star: !!document.querySelector('#totalPl .star') })")
     res(abs(c1["cash"] - c0 - 10000) < 1e-6 and c1["star"], f"Cheats in Sim: Money printer {c0:.2f} → {c1['cash']:.2f}, ★ on the Sim portfolio", "sim cheats")
     # Last chance: buy, the price falls 15% from its high → big warning with a Sell button
@@ -1115,7 +1182,7 @@ async def sim_ui_tests(p, check):
     au = await p.js("""(() => { const g = ghostDesk, n = g.state().trades.length; let ms = performance.now(); g.forecast(); ms = performance.now() - ms;
       const end = g.sim().t + 15 * 60e3; while (g.sim().t < end) g.simAdvance(g.sim().t + 5000);
       const ts = g.state().trades.slice(n), sells = ts.filter(t => t.side === 'sell' && t.reason === 'oracle');
-      return { buys: ts.filter(t => t.side === 'buy' && t.reason === 'oracle').length, sells: sells.length, wins: sells.filter(t => t.pl > 0).length, ms, toast: document.getElementById('toast').textContent }; })()""")
+      return { buys: ts.filter(t => t.side === 'buy' && t.reason === 'oracle').length, sells: sells.length, wins: sells.filter(t => t.pl > 0).length, ms, toast: [...document.querySelectorAll('#toasts .toast')].at(-1)?.textContent || '' }; })()""")
     await sleep_js("document.getElementById('oaTog').click(), true")
     left = await p.js("Object.values(ghostDesk.signals()).filter(x => x.src === 'auto').length")
     res(au["buys"] > 3 and au["sells"] > 1 and au["wins"] >= au["sells"] * 0.9 and left == 0, f"Oracle Auto on all coins, 15 min: {au['buys']} buys, {au['sells']} sells, {au['wins']} wins; forecast {au['ms']:.0f} ms; off: nothing left to sell; “{au['toast'][:70]}”", "oracle auto")
@@ -1131,6 +1198,32 @@ async def sim_ui_tests(p, check):
       g.refreshStandings(); const btn = [...document.querySelectorAll('[data-sellfirst]')].find(x => x.dataset.key === k); const txt = btn?.textContent; btn?.click(); return { txt, gone: !g.state().pos[k], had: !!me }; })()""" % fr["k"])
     res(fr["n"] == 1 and fr["key"] == fr["k"] and abs(fr["usd"] - cash * 0.1) < 0.02 and "Front-run" in fr["tag"] and sf["had"] and sf["gone"], f"{fr['txt']}: bought {fr['usd']:.2f} (10% of cash); {sf['txt']}: sold mine", "front run")
     await sleep_js("ghostDesk.closeSheet(true), true")
+    # Settings stays where you scrolled while the Sim world moves, on the phone and on a PC; the others keep it too
+    for name, w, h, mobile in [("phone", 375, 812, True), ("PC", 1280, 720, False)]:
+        await p.send("Emulation.setDeviceMetricsOverride", width=w, height=h, deviceScaleFactor=1, mobile=mobile)
+        sc = await p.js("""(async () => { const g = ghostDesk, wait = ms => new Promise(r => setTimeout(r, ms)), out = {};
+          if (!g.bots().length) g.addBot('momentum');
+          g.closeSheet(true); g.openSettings(); await wait(50);
+          const body = document.querySelector('.sh-body'), key = document.getElementById('fhKey'), lc = document.getElementById('lcPct');
+          lc.focus(); body.scrollTop = 900; const y0 = body.scrollTop; key.value = 'half typed';
+          for (let i = 0; i < 12; i++) {
+            if (i % 4 === 0) g.simForce('elonTweet');
+            g.simAdvance(g.appNow() + 5000); g.afterTrades([]); g.botTick(); g.renderSheet(); g.refreshStandings(); await wait(30);
+          }
+          const b2 = document.querySelector('.sh-body');
+          out.settings = b2 === body && b2.scrollTop === y0 && y0 > 300 && document.activeElement === lc && document.getElementById('fhKey').value === 'half typed';
+          out.y = [y0, b2.scrollTop];
+          const bal = document.getElementById('setBal').textContent; g.state().cash += 1234; g.renderSheet(); out.values = bal !== document.getElementById('setBal').textContent && b2.scrollTop === y0;
+          g.C.arm(g.state(), 'golden', true, g.appNow()); g.renderSheet(); out.armed = document.getElementById('setCheats').textContent.includes('Golden entry'); g.C.arm(g.state(), 'golden', false, g.appNow());
+          const keep = async open => { open(); await wait(80); const b = document.querySelector('.sh-body'); b.scrollTop = 160; const y = b.scrollTop; const inp = document.getElementById('alertIn'); if (inp) inp.value = '42'; g.afterTrades([]); g.renderSheet(); await wait(30); const n = document.querySelector('.sh-body'); return y > 0 && n.scrollTop === y && (!inp || document.getElementById('alertIn').value === '42'); };
+          out.coin = await keep(() => { g.closeSheet(true); g.openSheet(g.lists.crypto[0]); });
+          out.cheats = await keep(() => { g.closeSheet(true); g.openCheats(); });
+          out.bot = await keep(() => { g.closeSheet(true); g.openBot(g.bots()[0].id); });
+          g.closeSheet(true); g.setTab('achievements'); await wait(50); window.scrollTo(0, 300); const vy = scrollY; g.afterTrades([]); g.renderAll(); await wait(50); out.view = vy > 0 && scrollY === vy;
+          return out; })()""")
+        res(all(v for k, v in sc.items() if k != "y"), f"Scroll kept on {name}: {sc}", "scroll " + name)
+    await p.send("Emulation.setDeviceMetricsOverride", width=375, height=812, deviceScaleFactor=2, mobile=True)
+    await p.js("ghostDesk.closeSheet(true), ghostDesk.setTab('home'), true")
     # Back to Live with the real button: Live portfolio untouched, no star
     await p.js("ghostDesk.closeSheet(true), document.getElementById('liveDot').click(), true")
     await wait("!document.body.classList.contains('sim') && document.documentElement.dataset.ready === '1'", 15)

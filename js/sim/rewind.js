@@ -46,7 +46,7 @@ export function makePoint(w, s, bots, prev = null) {
     s: { head: head(s), trades: tradeDelta(s, prev?.s.tail, false), tail: tail(s) },
     bots: bots.map(b => {
       const p = prev?.bots.find(x => x.id === b.id), { pf, ...rest } = b;
-      return { id: b.id, bot: structuredClone(rest), head: head(pf), trades: tradeDelta(pf, p?.tail, true), tail: tail(pf) };
+      return { id: b.id, bot: structuredClone(rest), head: head(pf), trades: tradeDelta(pf, p?.tail, pf.trades.length >= BOT_TRADES), tail: tail(pf) };
     }),
   };
 }
