@@ -13,7 +13,7 @@ import { setFetch } from "../js/sources/http.js";
 import { createTwelve } from "../js/sources/twelve.js";
 import { createFinnhub } from "../js/sources/stocks.js";
 import { fxInst } from "../js/sources/fx.js";
-import { newBot, step as botStep, freshQuotes, standing, botName, STYLE_IDS, MAX_AGE, preview as botPreview } from "../js/core/bots.js";
+import { newBot, byRank, step as botStep, freshQuotes, standing, botName, STYLE_IDS, MAX_AGE, preview as botPreview } from "../js/core/bots.js";
 import * as C from "../js/core/cheats.js";
 import * as RP from "../js/core/replay.js";
 import * as SW from "../js/sim/world.js";
@@ -1350,6 +1350,29 @@ await test("Sim · market cap limits: $10T, memecoins $1T; Whale mode 25% per tr
   for (let k = 0; k < 60; k++) E.executeBuy(g, MEME, 1e6, { px: 1, liq: 1000, t: T0 }, T0);
   near(E.gameQuote(g, MEME.key, { px: 1 }).px, 1000, "many buys stop at the limit"); eq(E.gameQuote(g, MEME.key, { px: 900 }).px, 1000, "also when the Sim price rises");
   E.executeSell(g, MEME.key, 0.5, { px: 1, liq: 1000, t: T0 }, T0); near(E.gameQuote(g, MEME.key, { px: 1 }).px, 750, "a sale lowers it from there");
+});
+
+await test("Levels · Billionaires, Countries, World: each cap unlocks the next; ties by time; badges survive", () => {
+  eq(RICH.LEVELS.length, 3); ok(RICH.LEVELS.every((l, i, a) => !i || l.cap > a[i - 1].cap), "rising caps");
+  eq(RICH.COUNTRIES[0][1], "United States"); eq(RICH.LEVELS[1].cap, RICH.COUNTRIES[0][2], "up to the US"); near(RICH.WORLD_WEALTH, 517.69e12, "UBS");
+  ok(RICH.COUNTRIES.every((r, i, a) => !i || r[2] <= a[i - 1][2]), "sorted"); eq(RICH.ladder(5.1e12, RICH.COUNTRIES).place, 3, "country ladder");
+  const s = E.newPortfolio(T0, 100000), none = () => null;
+  eq(E.checkLevel(s, T0, none), -1, "nothing yet");
+  for (let l = 0; l < 3; l++) {
+    E.addCash(s, 1e15); near(s.cash, RICH.LEVELS[l].cap, "stops at level " + l, 1e-12);
+    eq(E.checkLevel(s, T0 + l, none), l, "reached " + l); eq(E.checkLevel(s, T0 + 100, none), -1, "only once"); eq(s.reached[l], T0 + l, "when");
+  }
+  eq(s.level, 2); E.addCash(s, 1e15); near(s.cash, RICH.WORLD_WEALTH, "the last one is final", 1e-12); eq(s.reached[2], T0 + 2, "the first time counts");
+  s.cash = 5; eq(RICH.levelOf(s), 2, "losing money keeps the level");
+  // same cap: the first one wins, whatever the order
+  const at = t => { const p = E.newPortfolio(T0, 100000); p.cash = 1e15; E.capCash(p); E.checkLevel(p, t, none); return standing(p, none); };
+  const a = { id: "a", ...at(T0 + 50) }, b = { id: "b", ...at(T0 + 10) }, low = { id: "low", ...standing(E.newPortfolio(T0, 100000), none) };
+  deepEq([a, low, b].sort(byRank).map(x => x.id), ["b", "a", "low"], "first to arrive"); deepEq([b, a, low].sort(byRank).map(x => x.id), ["b", "a", "low"], "any order");
+  // badges: kept by the repair and by an import
+  const A1 = { ...newAchievements(), prestige: [{ t: T0 }, { t: T0 + 1 }, { t: NaN }] }, is = [];
+  CLEAN.cleanAchievements(A1, T0, is); eq(A1.prestige.length, 2, "only the damaged one goes"); eq(is.length, 1);
+  eq(mergeAchievements(newAchievements(), A1).prestige.length, 2, "imported"); eq(mergeAchievements(A1, newAchievements()).prestige.length, 2, "never lost");
+  const bad = E.newPortfolio(T0, 100000); bad.level = 9; bad.reached = [NaN]; CLEAN.cleanPortfolio(bad, T0, []); ok(bad.level === 0 && !bad.reached.length, "bad level repaired");
 });
 
 const pass = results.filter(r => r[0]).length;

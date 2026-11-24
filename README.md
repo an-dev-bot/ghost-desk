@@ -106,6 +106,8 @@ picks up the new version. If you change app files, also bump the `VERSION` strin
   with a ★ on the leaderboard and in the history, and achievements earned with cheats are kept apart (earning one
   again without cheats moves it back). Resetting the portfolio removes the star. Cheats work the same in Live and
   Sim, except Oracle, Rewind and Skip ahead, which exist only in Sim (in Live they show off, marked "Sim only").
+- **Missing data never stops a trade**: Golden entry, Perfect exit and Sniper use the best price available (the trade
+  says so, "Perfect exit: highest price available"); with no data at all the trade is a normal one and they stay armed.
 - **Always on**: the one-shot cheats (Golden entry, Perfect exit, Sniper, 2x Lucky trade, Ghost trade, Insurance,
   Double or nothing) have an "Always on" switch that arms them again after every trade; those cards show an
   ALWAYS ON tag and the list sits at the top of the Cheats menu.
@@ -116,10 +118,11 @@ picks up the new version. If you change app files, also bump the `VERSION` strin
   whenever they suit its next trade, with no daily limit (Money printer: once a day per bot): Zero fees for 1 hour, Insurance 50%, 2x Lucky trade, Rug shield 20% for 1 hour, Golden entry (15-minute
   low), Perfect exit, Leverage 10x or 20x, Money printer 10% of its balance. Never Undo, Ghost trade, Oracle, X-ray,
   Time machine, Skip ahead or Always on. Their cheats show in Rival moves and give their row a ★.
-- **Money cap**: no portfolio (Live, Sim or a bot's) can be worth more than the combined fortune of the world's 100
-  richest people, $7.27T (Forbes Real-Time Billionaires, Nov 23, 2026, in `js/core/rich.js`; Settings shows the
-  date). A gain past it is cut, with a "World's richest" notice. Trophies has a **Billionaire ladder**: where your
-  total would rank among the 100 and how much you need to pass the next one.
+- **Money cap by levels** (Live, Sim and bots; figures and dates in `js/core/rich.js` and Settings): Billionaires, up to
+  $7.27T (Forbes, Nov 23, 2026); Countries, up to the United States' GDP, $30.77T (World Bank, 2025); World, up to
+  $517.69T (UBS Global Wealth Report 2026, end of 2025, 56 markets). A gain past the cap is cut; reaching it unlocks
+  the next level. At the last one, **Prestige** starts you and the bots again at $10K with a permanent badge. On the
+  same cap, the first to get there ranks higher. Trophies shows the ladder of your level.
 - **Big numbers** are abbreviated everywhere ($1.25K, $3.4M, $12.7B, $1.05T, +1.2M%), never in scientific notation;
   tap one to see it in full. The live price at the top of a coin's page and the trade inputs stay full.
 - **Sim mode** (the Live / Sim switch at the top): invented markets with invented names in all four types, prices

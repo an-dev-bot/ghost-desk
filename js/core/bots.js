@@ -10,6 +10,7 @@
 import * as E from "./engine.js";
 import * as C from "./cheats.js";
 import { localDay } from "./stats.js";
+import { reachedAt } from "./rich.js";
 
 // Bot cheats: each bot arms one whenever it suits its next trade, with no daily limit (same engine rules as yours).
 // Only Money printer is limited: once a day per bot.
@@ -243,7 +244,13 @@ export function standing(pf, quoteFor) {
     if (!best || x.pl > best.pl) best = x;
     if (!worst || x.pl < worst.pl) worst = x;
   }
-  return { total: t.total, pl: t.pl, plPct: t.plPct, best, worst, closed: n, winRate: n ? wins / n : null, open: Object.keys(pf.pos).length, trades: pf.trades.length };
+  return { reached: reachedAt(pf, t.total), total: t.total, pl: t.pl, plPct: t.plPct, best, worst, closed: n, winRate: n ? wins / n : null, open: Object.keys(pf.pos).length, trades: pf.trades.length };
+}
+
+/** Leaderboard order: the bigger gain; on the same money cap, the one that got there first. */
+export function byRank(a, b) {
+  if (a.reached != null && b.reached != null && Math.abs(a.total - b.total) < 0.01) return a.reached - b.reached;
+  return b.plPct - a.plPct;
 }
 
 export function validBots(list) {

@@ -3,6 +3,7 @@
 // number (NaN, Infinity, absurdly big) never costs the rest of the data.
 
 import * as E from "./engine.js";
+import { LAST } from "./rich.js";
 import { START_CASH } from "./money.js";
 import { validBots } from "./bots.js";
 import { newAchievements } from "./achievements.js";
@@ -27,12 +28,14 @@ export function scrub(x, to = null) {
 function cashFromTrades(p) {
   let c = p.start;
   for (const t of p.trades) c += t.side === "buy" ? -t.usd : t.usd;
-  return Math.min(E.WORLD_CAP, Math.max(0, num(c) ? c : 0));
+  return Math.min(E.capOf(p), Math.max(0, num(c) ? c : 0));
 }
 
 /** Returns the repaired portfolio, or null when there is nothing usable in it. */
 export function cleanPortfolio(p, now, issues) {
   if (!obj(p)) { issues.push("the portfolio couldn't be read"); return null; }
+  if (p.level !== undefined && !(Number.isInteger(p.level) && p.level >= 0 && p.level <= LAST)) { p.level = 0; issues.push("money cap level"); }
+  if (p.reached !== undefined && (!Array.isArray(p.reached) || p.reached.some(t => t != null && !num(t)))) { p.reached = []; issues.push("money cap times"); }
   if (!E.validStart(p.start)) { issues.push("starting balance"); p.start = START_CASH; }
   for (const k of ["pos", "margin", "days"]) if (!obj(p[k])) { if (p[k] != null) issues.push(k); p[k] = {}; }
   for (const k of ["orders", "trades"]) if (!Array.isArray(p[k])) { issues.push(k); p[k] = []; }
@@ -46,7 +49,7 @@ export function cleanPortfolio(p, now, issues) {
   }).length;
   if (fixedTrades) issues.push(`numbers in ${fixedTrades} trades of the history`);
 
-  if (p.cash === Infinity || (typeof p.cash === "number" && p.cash >= HUGE)) { issues.push("cash was over the money cap"); p.cash = E.WORLD_CAP; }
+  if (p.cash === Infinity || (typeof p.cash === "number" && p.cash >= HUGE)) { issues.push("cash was over the money cap"); p.cash = E.capOf(p); }
   else if (!num(p.cash)) { p.cash = cashFromTrades(p); issues.push("cash, worked out again from your history"); }
 
   for (const group of ["pos", "margin"]) {
@@ -137,6 +140,10 @@ export function cleanAchievements(a, now, issues) {
   if (!obj(a.lifetime)) { a.lifetime = { trades: 0, markets: {} }; issues.push("achievement counters"); }
   if (!num(a.lifetime.trades)) { a.lifetime.trades = 0; issues.push("achievement counters"); }
   if (!obj(a.lifetime.markets)) a.lifetime.markets = {};
+  if (a.prestige !== undefined) {
+    const log = Array.isArray(a.prestige) ? a.prestige.filter(x => obj(x) && num(x.t)) : [];
+    if (!Array.isArray(a.prestige) || log.length !== a.prestige.length) { a.prestige = log; issues.push("a prestige badge"); }
+  }
   return a;
 }
 

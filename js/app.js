@@ -7,7 +7,7 @@ import { scoreboard, greenStreak, localDay, toCSV, MARKET_LABEL, realizedByDay, 
 import { ACHIEVEMENTS, newAchievements, evaluate, achievementById } from "./core/achievements.js";
 import { applyTick, ticksToBars, INTERVALS } from "./core/candles.js";
 import { buildBackup, parseBackup, mergeAchievements } from "./core/backup.js";
-import { STYLES, STYLE_IDS, MAX_BOTS, newBot, botName, step as botStep, cheatTick as botCheatTick, cheatFeed as botCheatFeed, BOT_CHEATS, standing, preview as botPreview } from "./core/bots.js";
+import { STYLES, STYLE_IDS, MAX_BOTS, newBot, botName, step as botStep, cheatTick as botCheatTick, cheatFeed as botCheatFeed, BOT_CHEATS, standing, byRank, preview as botPreview } from "./core/bots.js";
 import * as C from "./core/cheats.js";
 import * as RP from "./core/replay.js";
 import * as SW from "./sim/world.js";
@@ -200,25 +200,94 @@ function askDon() {
   el.hidden = false;
 }
 
-// ---------------------------------------------------------------- money cap and Billionaire ladder
+// ---------------------------------------------------------------- money cap by levels, ladders and Prestige
 const richDate = () => new Date(RICH.AS_OF).toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" });
-function worldsRichest(cut) {
-  toast(`🌍 World's richest: your ${SIM ? "Sim " : ""}portfolio stops at ${$usd(RICH.WORLD_CAP)}, the combined fortune of the world's 100 richest people. ${$usd(cut)} stayed out.`, "gold");
+const levelSource = i => [`${RICH.SOURCE}, ${richDate()}`, `GDP of ${RICH.GDP_YEAR}, ${RICH.GDP_SOURCE}`, `${RICH.WEALTH_SOURCE}, end of ${RICH.WEALTH_YEAR} (56 markets, over 92% of the world's wealth)`][i];
+function capNotice(cut) {
+  const l = RICH.LEVELS[RICH.levelOf(S)];
+  toast(`${l.icon} Your ${SIM ? "Sim " : ""}portfolio stops at ${$usd(l.cap)}, ${l.what}. ${$usd(cut)} stayed out.`, "gold");
   vibrate([60, 40, 60]);
 }
+let fxQueue = [], fxBusy = false;
+/** Big full-screen animation; several in a row wait for each other. */
+function bigFx(icon, title, strong, small) {
+  fxQueue.push([icon, title, strong, small]);
+  if (!fxBusy) nextFx();
+}
+function nextFx() {
+  const f = fxQueue.shift(), el = $("#levelFx");
+  fxBusy = !!f;
+  if (!f) { el.hidden = true; return; }
+  el.innerHTML = `<div class="jp-box lv-box"><span class="jp-coins" aria-hidden="true">${f[0]}</span><b>${esc(f[1])}</b><strong>${esc(f[2])}</strong><small>${esc(f[3])}</small></div>`;
+  el.hidden = false;
+  confetti($("#confetti"), { big: true }); shake($("#app")); vibrate([100, 50, 100, 50, 100, 50, 400]); sfx("jackpot");
+  const t = setTimeout(nextFx, 4200);
+  el.onclick = () => { clearTimeout(t); nextFx(); };
+}
+/** You or a bot reached the cap of a level: write down when and unlock the next one. */
+function levelCheck(now = appNow(), qf = quoteFor) {
+  const l = E.checkLevel(S, now, qf);
+  if (l >= 0) {
+    const next = RICH.LEVELS[l + 1];
+    if (next) bigFx(next.icon, "LEVEL UNLOCKED", next.name, `You reached ${usd(RICH.LEVELS[l].cap)}. Next cap: ${usd(next.cap)}`);
+    else bigFx("👑", "THE WORLD", usd(RICH.LEVELS[l].cap), "You own it all. Prestige is ready in Trophies");
+    saveSoon(0);
+    if (!skipping) setTimeout(renderView, 0);
+  }
+  return l;
+}
+function botLevelCheck(b, now, qf) {
+  const l = E.checkLevel(b.pf, now, qf);
+  if (l >= 0) { toast(`${RICH.LEVELS[l].icon} ${esc(b.name)} reached ${$usd(RICH.LEVELS[l].cap)}`, "gold"); saveBots(false); }
+}
+const prestigeN = () => A.prestige?.length || 0;
+const prestigeReady = () => S.reached?.[RICH.LAST] != null;
+async function prestige() {
+  if (!prestigeReady() || skipping) return;
+  const now = appNow(), n = prestigeN() + 1;
+  (A.prestige ||= []).push({ t: now, reached: S.reached[RICH.LAST], started: S.createdAt, cheat: E.isCheated(S) });
+  S = E.newPortfolio(now, RICH.PRESTIGE_START); S.undoable = true; S.memeMax = SIM ? SW.MEME_MAX_PX : null;
+  BOTS = BOTS.map(b => ({ ...b, pf: E.newPortfolio(now, S.start), lastBuy: 0 }));
+  CFG.lastBuy = defaultBuy(S.start);
+  for (const k of ["portfolio", "bots", "achievements", "settings"]) DUE.add(k);
+  if (SIM) DUE.add("world");
+  saveLoud = true;
+  const saved = flushSave(); // all in one transaction
+  if (SIM) clearPoints().then(() => addPoint()).catch(e => console.warn(e?.message));
+  fc = null; oracle = null; oracleVer++; jpKeys.clear(); capSeen = -1; lastTotal = null;
+  hideLastChance();
+  closeSheet(true); renderAll(); refreshStandings();
+  bigFx("🎖️", "PRESTIGE", String(n), `Back to ${usd(S.start)}. The badge is yours forever`);
+  await saved;
+}
+function prestigeHTML() {
+  const list = A.prestige || [];
+  if (!list.length) return "";
+  return `<h2>Prestige</h2><div class="ach-grid">${list.map((p, i) => `<div class="ach got prest"><span class="ach-i" aria-hidden="true">🎖️</span><b>Prestige ${i + 1}${p.cheat ? ` <span class="star">★</span>` : ""}</b><small>${dateTime(p.t)}</small></div>`).join("")}</div>`;
+}
 function ladderHTML() {
-  const total = E.totals(S, quoteFor).total, L = RICH.ladder(total);
-  const row = (r, me) => me
-    ? `<div class="lad me"><span class="rk">#${L.place > 100 ? "101+" : L.place}</span><span class="nm"><b>You</b><small>${SIM ? "Sim portfolio" : "Live portfolio"}</small></span><b>${$usd(total)}</b></div>`
-    : `<div class="lad"><span class="rk">#${r[0]}</span><span class="nm"><b>${esc(r[1])}</b></span><b>${$usd(r[2])}</b></div>`;
-  const i = L.place - 1;
-  const above = RICH.RICHEST.slice(Math.max(0, i - 2), i), below = RICH.RICHEST.slice(i, i + 2);
-  const head = L.place > 100
-    ? `Not in the top 100 yet. #100 is ${esc(L.above[1])} with ${$usd(L.above[2])}: ${$usd(L.above[2] - total)} to go.`
-    : L.place === 1 ? `You'd be the richest person in the world.` : `You'd be <b>#${L.place}</b>. Next up: #${L.above[0]} ${esc(L.above[1])} with ${$usd(L.above[2])}, ${$usd(L.above[2] - total)} to go.`;
-  return `<h2>Billionaire ladder</h2><div class="card ladder"><p>${head}</p>
-    ${above.map(r => row(r)).join("")}${row(null, true)}${below.map(r => row(r)).join("")}
-    <small class="mut">${RICH.SOURCE}, ${richDate()}. Your portfolio can't pass the 100 together: ${$usd(RICH.WORLD_CAP)}.</small></div>`;
+  const total = E.totals(S, quoteFor).total, lv = RICH.levelOf(S);
+  const steps = `<div class="levels">${RICH.LEVELS.map((l, i) => `<div class="lv${i === lv ? " on" : ""}${S.reached?.[i] != null ? " done" : ""}"><span aria-hidden="true">${i > lv ? "🔒" : l.icon}</span><b>${l.name}</b><small>${$usd(l.cap)}</small><small>${S.reached?.[i] != null ? "✓ " + dateTime(S.reached[i]) : i === lv ? "now" : ""}</small></div>`).join("")}</div>`;
+  const ready = prestigeReady() ? `<p><b>You reached the last cap.</b> Prestige starts you again with ${$usd0(RICH.PRESTIGE_START)} and a permanent badge. Your bots start over with you; badges, achievements and records stay.</p><button class="btn" data-prestige>🎖️ Prestige ${prestigeN() + 1}</button>` : "";
+  let title, body;
+  if (lv === RICH.LAST) {
+    const from = RICH.LEVELS[lv - 1].cap, to = RICH.LEVELS[lv].cap, pct = Math.max(0, Math.min(1, total / to)) * 100;
+    title = "World ladder";
+    body = `<p>${prestigeReady() && total >= to - 0.01 ? "You own the wealth of the whole world." : `You'd own <b>${pct.toFixed(2)}%</b> of the world's wealth: ${$usd(to - total)} to go.`}</p><div class="lv-bar"><i style="width:${pct.toFixed(2)}%"></i></div><small class="mut">From ${$usd(from)} (the United States) to ${$usd(to)}.</small>`;
+  } else {
+    const list = lv ? RICH.COUNTRIES : RICH.RICHEST, L = RICH.ladder(total, list), last = list.length;
+    const row = (r, me) => me
+      ? `<div class="lad me"><span class="rk">#${L.place > last ? last + 1 + "+" : L.place}</span><span class="nm"><b>You</b><small>${SIM ? "Sim portfolio" : "Live portfolio"}</small></span><b>${$usd(total)}</b></div>`
+      : `<div class="lad"><span class="rk">#${r[0]}</span><span class="nm"><b>${esc(r[1])}</b></span><b>${$usd(r[2])}</b></div>`;
+    const i = L.place - 1;
+    const head = L.place > last
+      ? `Not in the top ${last} yet. #${last} is ${esc(L.above[1])} with ${$usd(L.above[2])}: ${$usd(L.above[2] - total)} to go.`
+      : L.place === 1 ? (lv ? `You'd be bigger than any country.` : `You'd be the richest person in the world.`) : `You'd be <b>#${L.place}</b>. Next up: #${L.above[0]} ${esc(L.above[1])} with ${$usd(L.above[2])}, ${$usd(L.above[2] - total)} to go.`;
+    title = lv ? "Country ladder" : "Billionaire ladder";
+    body = `<p>${head}</p>${list.slice(Math.max(0, i - 2), i).map(r => row(r)).join("")}${row(null, true)}${list.slice(i, i + 2).map(r => row(r)).join("")}`;
+  }
+  return `<h2>${title}</h2><div class="card ladder">${steps}${body}${ready}
+    <small class="mut">${levelSource(lv)}. Cap of this level: ${$usd(RICH.LEVELS[lv].cap)}, ${RICH.LEVELS[lv].what}.</small></div>${prestigeHTML()}`;
 }
 
 // ---------------------------------------------------------------- Last chance
@@ -847,7 +916,7 @@ const autoOn = () => SIM && CFG.oracleAuto.on && C.isOn(S, "oracle");
 let fc = null;                // forecast of every coin: {t0, paths, insts, lev, plans}
 let sigStale = false;         // the future changed (Skip ahead): signals need new times
 const levSig = () => JSON.stringify(SW.leverageByKey([S]));
-const simQ = key => { const i = W.insts[key]; return i ? { px: i.px, t: W.t, liq: i.liq, quoteUsd: i.m === "fx" ? W.cur[i.quote].usd : undefined } : null; };
+const simQ = key => { const i = W?.insts[key]; return i ? { px: i.px, t: W.t, liq: i.liq, quoteUsd: i.m === "fx" ? W.cur[i.quote].usd : undefined } : null; };
 
 function forecast(need) {
   const lev = levSig();
@@ -1174,6 +1243,7 @@ async function playAhead(plan, title, exact, label = "") {
         if (exact && W.t < endT) for (const trade of autoTrades()) mine.push({ type: "oracle", trade });
         addPoint();
         if (ptQueue.length >= 8) await flushPoints();
+        levelCheck(now, simQ);
         sinceBots += seg.dt;
         if (BOTS.length && sinceBots >= 60) {
           sinceBots = 0;
@@ -1181,6 +1251,7 @@ async function playAhead(plan, title, exact, label = "") {
           for (const b of BOTS) {
             botCheatTick(b, now, { allowed: CFG.botCheats, quoteFor: k => { const i = W.insts[k]; return i ? { px: i.px, t: now, liq: i.liq, quoteUsd: i.m === "fx" ? W.cur[i.quote].usd : undefined } : null; } });
             for (const t of botStep(b, { entries, now, status: () => OPEN, bootAt, extreme: botExtreme, cheats: CFG.botCheats })) botMade.push([b, t]);
+            botLevelCheck(b, now, simQ);
           }
         }
         done++;
@@ -1283,6 +1354,7 @@ function botTick(now = appNow()) {
     cheated += botCheatTick(b, now, { allowed: CFG.botCheats, quoteFor }).length;
     const trades = botStep(b, { entries, now, status: m => mstatus(m, now), bootAt: TEST ? 0 : bootAt, extreme: botExtreme, cheats: CFG.botCheats });
     for (const t of trades) made.push([b, t]);
+    botLevelCheck(b, now, quoteFor);
   }
   if (made.length || cheated) saveBots(false);
   refreshStandings();
@@ -1309,7 +1381,7 @@ function refreshStandings() {
 
 function participants() {
   const me = { id: "me", name: "You", cheat: E.isCheated(S), ...standing(S, quoteFor) };
-  return [me, ...BOTS.map(b => ({ id: b.id, name: b.name, style: b.style, cheat: E.isCheated(b.pf), ...standing(b.pf, quoteFor) }))].sort((a, b) => b.plPct - a.plPct);
+  return [me, ...BOTS.map(b => ({ id: b.id, name: b.name, style: b.style, cheat: E.isCheated(b.pf), ...standing(b.pf, quoteFor) }))].sort(byRank);
 }
 
 function leaderboardHTML() {
@@ -1318,7 +1390,7 @@ function leaderboardHTML() {
   return `<div class="list">${participants().map((x, i) => `
     <button class="row lb ${x.id === "me" ? "me" : ""}" ${x.id === "me" ? `data-tab="history"` : `data-bot="${esc(x.id)}"`}>
       <span class="ico ico-rank" aria-label="Rank ${i + 1}">${medal[i] || i + 1}</span>
-      <span class="nm"><b>${esc(x.name)}${x.cheat ? ` <span class="star" title="Cheats used">★</span>` : ""}${x.style && !x.name.startsWith(STYLES[x.style].name) ? ` <i class="mk-tag">${STYLES[x.style].name}</i>` : ""}</b><small>${tr("Best", x.best)}</small><small>${tr("Worst", x.worst)}</small>${x.id !== "me" && C.isOn(S, "xray") ? `<small class="xray">${xrayText(x.id)}</small>` : ""}</span>
+      <span class="nm"><b>${esc(x.name)}${x.cheat ? ` <span class="star" title="Cheats used">★</span>` : ""}${x.style && !x.name.startsWith(STYLES[x.style].name) ? ` <i class="mk-tag">${STYLES[x.style].name}</i>` : ""}</b>${x.reached != null ? `<small class="gold">👑 ${$usd(x.total)} reached ${dateTime(x.reached)}</small>` : ""}<small>${tr("Best", x.best)}</small><small>${tr("Worst", x.worst)}</small>${x.id !== "me" && C.isOn(S, "xray") ? `<small class="xray">${xrayText(x.id)}</small>` : ""}</span>
       <span class="px"><b>${$usd(x.total)}</b><small class="${dirCls(x.pl)}">${$pct(x.plPct * 100)}</small></span>
     </button>${x.id !== "me" && C.isOn(S, "xray") ? frontBtns(x.id) : ""}`).join("")}</div>${BOTS.length && C.isOn(S, "xray") ? frontPctHTML() : ""}`;
 }
@@ -1557,7 +1629,8 @@ function updateHeader() {
   if (SIM && lastTotal != null && Math.abs(t.total - lastTotal) > 0.004) rollNumber(el, lastTotal, t.total, n => usd(n));
   else if (!el._roll || !el.classList.contains("rolling")) el.textContent = usd(t.total);
   el.dataset.full = usd(t.total, { full: true }); el.classList.add("ab");
-  if ((S.capCut || 0) > capSeen) { if (capSeen >= 0) worldsRichest(S.capCut - capSeen); capSeen = S.capCut; }
+  if ((S.capCut || 0) > capSeen) { if (capSeen >= 0) capNotice(S.capCut - capSeen); capSeen = S.capCut; }
+  if (t.capped && !skipping && levelCheck(now) >= 0) t.capped = E.totals(S, quoteFor).capped;
   if (lastTotal != null && Math.abs(t.total - lastTotal) > 0.004) flash(el, t.total > lastTotal ? 1 : -1);
   lastTotal = t.total;
   const day = S.days[localDay(now)];
@@ -1566,7 +1639,8 @@ function updateHeader() {
   tp.innerHTML = `<span class="${dirCls(t.pl)}">${$usd(t.pl, { sign: true })} (${$pct(t.plPct * 100)})</span> from ${$usd0(S.start)}` +
     (dd != null && Math.abs(dd) >= 0.01 ? ` · <span class="${dirCls(dd)}">${$usd(dd, { sign: true })} today</span>` : "") +
     (E.isCheated(S) ? ` <span class="star" title="Cheats used in this portfolio">★</span>` : "") +
-    (t.capped ? ` <span class="rich-tag">🌍 World's richest</span>` : "");
+    (RICH.levelOf(S) || t.capped ? ` <span class="rich-tag">${t.capped && RICH.levelOf(S) === RICH.LAST ? "👑 Owns the world" : RICH.levelOf(S) === 1 ? "💎 World's richest" : "🏛️ Beyond countries"}</span>` : "") +
+    (prestigeN() ? ` <span class="rich-tag prest" title="Prestige ${prestigeN()}">🎖️ ${prestigeN()}</span>` : "");
   const ok = Object.values(src).some(s => s.ok && now - s.ok < 90e3);
   const dot = $("#liveDot"), simb = $("#simBtn");
   if (SIM) {
@@ -2182,11 +2256,11 @@ function tradePreview() {
 function armedNotes(side, inst, waiting) {
   const n = [];
   if (side !== "sell") {
-    if (!waiting && inst.m === "meme" && C.isArmed(S, "sniper")) n.push("🔭 Sniper: fills at the price of this coin's first candle.");
-    else if (!waiting && C.isArmed(S, "golden")) n.push("🥇 Golden entry: fills at the lowest price of the last 15 minutes.");
+    if (!waiting && inst.m === "meme" && C.isArmed(S, "sniper")) n.push("🔭 Sniper: fills at the price of this coin's first candle, or the lowest price available.");
+    else if (!waiting && C.isArmed(S, "golden")) n.push("🥇 Golden entry: fills at the lowest price of the last 15 minutes, or the lowest price available.");
     if (C.isArmed(S, "ghost")) n.push("👻 Ghost trade: if this position closes at a loss, it's erased.");
   } else {
-    if (!waiting && C.isArmed(S, "perfect")) n.push("🎯 Perfect exit: fills at today's highest price.");
+    if (!waiting && C.isArmed(S, "perfect")) n.push("🎯 Perfect exit: fills at today's highest price, or the highest price available.");
     if (C.isArmed(S, "lucky")) n.push("🍀 2x Lucky trade: a profit on this sale pays double.");
     if (C.isArmed(S, "insurance")) n.push("☂️ Insurance: half of a loss on this sale comes back.");
   }
@@ -2247,54 +2321,79 @@ async function submitTrade() {
   }
 }
 
-/** Golden entry, Perfect exit and Sniper: the fill price comes from real candles. null when none is armed. */
+/**
+ * Golden entry, Perfect exit and Sniper: the fill price comes from the candles and prices there are. Missing data
+ * never stops a trade: with part of it, the best price available (the trade says so); with none, null: the trade
+ * goes on as usual and the cheat stays armed.
+ */
 async function cheatPrice(side, inst) {
   const now = appNow();
-  if (SIM && side !== "sell" && inst.m === "meme" && C.isArmed(S, "sniper")) {
-    const wi = W.insts[inst.key], b = wi?.b1[0];
-    if (!wi || !b || b[0] > wi.born + 10 * 60e3) throw new E.TradeError("Sniper: this coin is too old, its first candle is gone. Sniper stays armed.");
-    return { id: "sniper", name: "Sniper", px: b[1] };
-  }
-  if (side !== "sell" && inst.m === "meme" && C.isArmed(S, "sniper")) {
-    toast("🔭 Looking up its first candle on GeckoTerminal…");
-    if (TEST && window.__firstCandle) return { id: "sniper", name: "Sniper", px: window.__firstCandle.o };
-    try { const b = await dex.firstCandle(inst.pair, inst.born); return { id: "sniper", name: "Sniper", px: b.o }; }
-    catch (e) {
-      noteError(e);
-      throw new E.TradeError(e.kind === "old" ? "Sniper: this coin is too old, GeckoTerminal no longer has its first candle. Sniper stays armed." : "Sniper: GeckoTerminal didn't send its first candle. Sniper stays armed.");
+  const fill = (id, name, r, kind) => r && { id, name: r.whole ? name : `${name}: ${kind} price available`, px: r.px };
+  try {
+    if (side !== "sell" && inst.m === "meme" && C.isArmed(S, "sniper")) {
+      const r = fill("sniper", "Sniper", await sniperPrice(inst), "lowest");
+      if (r) return r;
     }
-  }
-  if (side !== "sell" && C.isArmed(S, "golden")) return { id: "golden", name: "Golden entry", px: await extremePrice(inst, now - 15 * 60e3, "low") };
-  if (side === "sell" && C.isArmed(S, "perfect")) {
-    const st = mstatus(inst.m, now);
-    return { id: "perfect", name: "Perfect exit", px: await extremePrice(inst, Math.max(RP.startOfDay(now), inst.m === "stock" ? st.since || 0 : 0), "high") };
-  }
+    if (side !== "sell" && C.isArmed(S, "golden")) return fill("golden", "Golden entry", await extremePrice(inst, now - 15 * 60e3, "low"), "lowest");
+    if (side === "sell" && C.isArmed(S, "perfect")) {
+      const st = mstatus(inst.m, now);
+      return fill("perfect", "Perfect exit", await extremePrice(inst, Math.max(RP.startOfDay(now), inst.m === "stock" ? st.since || 0 : 0), "high"), "highest");
+    }
+  } catch (e) { noteError(e); }
   return null;
 }
 
-/** Lowest (or highest) real price since `from`: source candles plus the live prices seen. It must cover the whole window. */
+/** Live prices this app has seen before the current one. */
+function ticksBefore(key, from = 0) {
+  const q = quoteFor(key), tk = ticks.get(key) || [];
+  return tk.filter(x => x.t >= from && x.px > 0 && (!q || x.t < q.t || x.px !== q.px));
+}
+
+/** Sniper: the price of the coin's first candle; without it, the lowest price of the history there is. */
+async function sniperPrice(inst) {
+  const lows = [];
+  if (SIM) {
+    const wi = W.insts[inst.key], first = wi?.b1[0];
+    if (!wi) return null;
+    if (first && wi.born && first[0] <= wi.born + 10 * 60e3) return { px: first[1], whole: true };
+    for (const f of ["b1", "bh", "bd"]) for (const x of wi[f]) lows.push(x[3]);
+  } else if (TEST) {
+    if (window.__firstCandle) return { px: window.__firstCandle.o, whole: true };
+    for (const x of window.__candles || []) lows.push(x.l);
+  } else {
+    try { return { px: (await dex.firstCandle(inst.pair, inst.born)).o, whole: true }; } catch (e) { noteError(e); }
+    for (const r of await Promise.allSettled(["1d", "1h", "1m"].map(i => dex.candles(inst.pair, i)))) if (r.status === "fulfilled") for (const x of r.value) lows.push(x.l);
+  }
+  lows.push(...ticksBefore(inst.key).map(x => x.px));
+  const good = lows.filter(x => x > 0 && isFinite(x));
+  if (!good.length) return null;
+  const q = quoteFor(inst.key);
+  return { px: good.reduce((m, x) => Math.min(m, x), q?.px > 0 ? q.px : Infinity), whole: false };
+}
+
+/**
+ * Lowest (or highest) price since `from`: source candles plus the live prices seen. {px, whole: it covers the whole
+ * window}, or null when there is nothing but the current price.
+ */
 async function extremePrice(inst, from, kind) {
   const ivl = kind === "low" ? "1m" : "5m", ms = INTERVALS[ivl], now = appNow();
   let bars = [], whole = false;
   if (SIM) { const wi = W.insts[inst.key]; bars = wi ? SW.bars(wi, ivl) : []; whole = !!wi?.born && wi.born >= from - 60e3; }
-  else if (!TEST) {
+  else if (TEST) bars = window.__candles || [];
+  else {
     try {
       if (inst.m === "crypto") bars = await crypto.candles(inst.id, ivl);
       else if (inst.m === "meme") { bars = await dex.candles(inst.pair, ivl); whole = bars.length > 0 && bars.length < 300; }
       else if (CFG.twelveKey) bars = (await td.series(tdSymbol(inst), ivl, { now, lastActive: H.lastActivity(inst.m, now) })).bars;
     } catch (e) { noteError(e); bars = []; }
   }
-  const pts = bars.filter(b => b.t + ms > from).map(b => (kind === "low" ? b.l : b.h));
-  let covered = bars.length > 0 && (bars[0].t <= from || whole || (inst.born && inst.born >= from));
   const tk = ticks.get(inst.key) || [];
-  if (tk.length && tk[0].t <= from + 60e3) covered = true;
-  pts.push(...tk.filter(x => x.t >= from).map(x => x.px));
+  const pts = [...bars.filter(b => b.t + ms > from).map(b => (kind === "low" ? b.l : b.h)), ...ticksBefore(inst.key, from).map(x => x.px)].filter(x => x > 0 && isFinite(x));
+  if (!pts.length) return null;
+  const covered = (bars.length > 0 && (bars[0].t <= from || whole || (inst.born && inst.born >= from))) || (tk.length > 0 && tk[0].t <= from + 60e3);
   const q = quoteFor(inst.key);
   if (q) pts.push(q.px);
-  if (!covered || !pts.length) {
-    throw new E.TradeError(kind === "low" ? "Golden entry: there are no real prices for the whole last 15 minutes yet. It stays armed." : "Perfect exit: there are no real prices for the whole day yet. It stays armed.");
-  }
-  return kind === "low" ? Math.min(...pts) : Math.max(...pts);
+  return { px: pts.reduce((m, x) => (kind === "low" ? Math.min(m, x) : Math.max(m, x))), whole: covered };
 }
 
 // ---------------------------------------------------------------- cheats sheet
@@ -2368,8 +2467,9 @@ function cheatChanged() {
 
 function doAirdrop() {
   const now = appNow();
-  const pool = [...live.values()].filter(L => L.inst?.m === "meme" && L.px > 0 && L.t && now - L.t < 10 * 60e3);
-  if (!pool.length) { toast("Waiting for live memecoin prices for the airdrop…", "down"); kick("meme"); return; }
+  const all = [...live.values()].filter(L => L.inst?.m === "meme" && L.px > 0), recent = all.filter(L => L.t && now - L.t < 10 * 60e3);
+  const pool = recent.length ? recent : all; // no recent prices: the last ones known
+  if (!pool.length) { toast("Waiting for live memecoin prices for the airdrop…"); kick("meme"); return; }
   const L = pool[Math.floor(rand() * pool.length)];
   try {
     const t = C.airdrop(S, L.inst, quoteFor(L.inst.key), now);
@@ -2628,8 +2728,9 @@ function settingsHTML() {
       ${CFG.alerts.length ? `<h4>Active price alerts</h4>${CFG.alerts.map(a => `<div class="alert-row">${esc(a.inst.sym)}: ${a.dir === "above" ? "if it rises to" : "if it falls to"} ${$px(a.inst, a.price)} <button class="lnk" data-delalert="${a.id}">remove</button></div>`).join("")}` : ""}
     </section>
     <section class="card" id="capBox"><h3>Money cap</h3>
-      <p class="mut">No portfolio (yours in Live, yours in Sim, or a bot's) can be worth more than the combined fortune of the world's 100 richest people: <b>${$usd(RICH.WORLD_CAP)}</b>. If a gain would pass it, the portfolio stays at the cap with a “World's richest” notice.</p>
-      <small class="mut">Figure: ${RICH.SOURCE}, ${richDate()} (a snapshot; Trophies shows where you'd rank).</small>
+      <p class="mut">Every portfolio (yours in Live, yours in Sim, or a bot's) stops at the cap of its level. Reaching it unlocks the next one; at the last one you can Prestige. On the same cap, the first to get there ranks higher.</p>
+      ${RICH.LEVELS.map((l, i) => `<p class="mut">${l.icon} <b>${l.name}</b>: up to <b>${$usd(l.cap)}</b>, ${l.what}.<br><small>Figure: ${levelSource(i)}.</small></p>`).join("")}
+      <small class="mut">Snapshots: the app doesn't update them. The country list has no Taiwan (the World Bank doesn't publish it) and leaves out countries without a ${RICH.GDP_YEAR} figure yet.</small>
     </section>
     <section class="card" id="lcBox"><h3>Last chance</h3>
       <p class="mut">After you buy, the app follows the highest price since your buy (the lowest, for a short). If it falls this much from there:</p>
@@ -2789,6 +2890,14 @@ function onClick(e) {
   if (d.lcsell !== undefined) { lastChanceSell(); return; }
   if (d.lckeep !== undefined) { hideLastChance(); return; }
   if (d.skip) { skipAhead(d.skip); return; }
+  if (d.prestige !== undefined) {
+    if (!t.dataset.sure) {
+      t.dataset.sure = "1"; t.textContent = `Tap again: back to ${usd0(RICH.PRESTIGE_START)}`;
+      setTimeout(() => { if (t.isConnected) { delete t.dataset.sure; t.textContent = `🎖️ Prestige ${prestigeN() + 1}`; } }, 5000);
+      return;
+    }
+    prestige(); return;
+  }
   if (d.rewind) {
     if (!t.dataset.sure) {
       if (!findPoint((W?.t || 0) - RW.REWINDS[d.rewind])) { rewind(d.rewind); return; }
@@ -2907,7 +3016,7 @@ function onClick(e) {
     resetBots(S.start, appNow());
     if (SIM) clearPoints().then(() => addPoint()).catch(e => console.warn(e?.message));
     CFG.lastBuy = defaultBuy(S.start); saveCfg();
-    toast(`Portfolio reset: ${$usd0(S.start)}. Your achievements stay.`, "up");
+    toast(`Portfolio reset: ${$usd0(S.start)}. Your achievements and badges stay.`, "up");
     closeSheet(); renderAll(); return;
   }
 }
@@ -2917,7 +3026,7 @@ function cheatClick(t, d) {
   try {
     if (d.arm) { C.arm(S, d.arm, !C.isArmed(S, d.arm), now); if (C.isArmed(S, d.arm)) toast(`${C.CHEAT[d.arm].icon} ${C.CHEAT[d.arm].name} armed`, "gold"); }
     else if (d.lev) { C.setLeverage(S, +d.lev, now); toast(+d.lev > 1 ? `⚙️ Leverage ${d.lev}x: your buys open leveraged positions` : "Leverage off"); }
-    else if (d.print) { const cut = C.printMoney(S, +d.print, now); if (cut) { capSeen = S.capCut; worldsRichest(cut); } else toast(`🖨️ ${$usd0(+d.print)} printed into your cash`, "gold"); confetti($("#confetti")); }
+    else if (d.print) { const cut = C.printMoney(S, +d.print, now); if (cut) { capSeen = S.capCut; capNotice(cut); } else toast(`🖨️ ${$usd0(+d.print)} printed into your cash`, "gold"); confetti($("#confetti")); }
     else if (d.undo !== undefined) { const gone = C.undo(S, now); toast(`↩️ Undone: ${gone.map(x => `${sideLabel(x)} ${esc(x.sym)}`).join(", ") || "last trade"}`, "gold"); }
     else if (d.don !== undefined) { askDon(); return; }
     else if (d.donflip !== undefined) {
@@ -3094,7 +3203,7 @@ function setupTestHooks() {
     showJackpot: (sym, mult, gain) => showJackpot(sym, mult, gain, appNow()),
     openCheats: () => openPanel({ kind: "cheats" }), startReplay, replay: () => ui.replay, rpTick, runChecks, ticks,
     chooseSide: side => $(`[data-side="${side}"]`)?.click(),
-    lists, live, kv, saveSoon, saveOnExit, rewind, points: () => PTS, signals, doIt, jumpBuy, jumpSell, frontRun, nextMoves, forecast, SAVE: flushSave, refreshStandings,
+    lists, live, prestige, levelCheck, participants, badges: () => A.prestige || [], kv, saveSoon, saveOnExit, rewind, points: () => PTS, signals, doIt, jumpBuy, jumpSell, frontRun, nextMoves, forecast, SAVE: flushSave, refreshStandings,
   };
   document.documentElement.dataset.ready = "1";
 }

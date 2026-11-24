@@ -2,7 +2,7 @@
 // It only caches the app's own files and the fonts. Price requests are never intercepted or stored,
 // so a URL that carries an API key (Finnhub) never ends up in any cache.
 
-const VERSION = "g1-2026-11-23l";
+const VERSION = "g1-2026-11-23n";
 const SHELL = [
   "./", "index.html", "manifest.webmanifest", "css/app.css",
   "js/app.js", "js/store.js",

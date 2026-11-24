@@ -149,6 +149,7 @@ export function doubleOrNothing(s, coin, now) {
 export function startBoost(s, key, px, now) {
   const p = s.pos[key];
   if (!p || p.inst.m !== "meme") throw new E.TradeError("Moon boost works on a memecoin you hold.");
+  if (!(px > 0)) px = p.lastPx; // no live price: the last one known
   if (!(px > 0)) throw new E.TradeError("Wait for a live price.");
   const c = state(s);
   if (c.boost && now <= c.boost.until) throw new E.TradeError(`Moon boost is already running on ${s.pos[c.boost.key]?.inst.sym || "a coin"}.`);
@@ -192,6 +193,7 @@ export function copycat(s, bot, now) {
   s.orders = [];
   s.undo = null;
   if (s.cheats?.boost) s.cheats.boost = null;
+  E.capCash(s);
   mark(s, "copycat", `Copycat: copied ${bot.name}'s portfolio`, now);
 }
 

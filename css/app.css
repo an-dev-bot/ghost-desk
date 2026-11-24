@@ -402,6 +402,14 @@ body.sim .total-box small{color:#ff8fe1}
 .skip.off { opacity: .55; }
 .rich-tag { display: inline-block; font-size: 12px; font-weight: 700; padding: 1px 7px; border-radius: 6px; background: var(--gold); color: #1a1300; }
 .ladder p { margin: 0 0 8px; }
+.level-fx { z-index: 80; background: radial-gradient(circle, rgba(106, 92, 255, .55), rgba(0, 0, 0, .88)); }
+.lv-box b { font-size: clamp(28px, 9vw, 60px); } .lv-box .jp-coins { font-size: 84px; } .lv-box strong, .lv-box small { overflow-wrap: anywhere; }
+.levels { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; margin-bottom: 12px; }
+.lv { display: grid; gap: 2px; padding: 8px 6px; border-radius: 12px; border: 1px solid var(--line); text-align: center; min-width: 0; opacity: .55; }
+.lv b { font-size: 12px; overflow-wrap: anywhere; } .lv small { font-size: 10px; color: var(--muted); overflow-wrap: anywhere; }
+.lv.on, .lv.done { opacity: 1; } .lv.on { border-color: var(--gold); } .lv.done small:last-child { color: var(--up); }
+.lv-bar { height: 12px; border-radius: 99px; background: var(--panel3); overflow: hidden; margin-bottom: 8px; } .lv-bar i { display: block; height: 100%; background: var(--gold); }
+.rich-tag.prest { background: #b9a7ff; } .ladder .btn { width: 100%; min-height: 48px; margin: 8px 0; }
 .lad { display: flex; align-items: center; gap: 10px; padding: 6px 0; border-top: 1px solid var(--line); }
 .lad .rk { width: 44px; color: var(--muted); font-variant-numeric: tabular-nums; }
 .lad .nm { flex: 1; min-width: 0; display: flex; flex-direction: column; }

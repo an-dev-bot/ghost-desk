@@ -628,6 +628,28 @@ async def cheat_ui_tests(p, check):
     await check("tap full number")
     res(hd["txt"] == "$1.23M" and hd["full"] == "$1,234,567.89" and hd["toast"] == "$1,234,567.89",
         f"Big numbers: header {hd['txt']}, tap → “{hd['toast']}”", "abbr tap")
+    # Cheats with missing data: the trade always goes on, no red notice
+    miss = await p.js("""(async () => { const g = ghostDesk, out = [], wait = ms => new Promise(r => setTimeout(r, ms)); const toastEl = document.getElementById('toast');
+      const enter = () => document.querySelector('.swipe-thumb').dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+      const keep = structuredClone(g.state().cheats), now = g.appNow(), bar = (t, l, h) => ({ t, o: l, h, l, c: l });
+      const K = { meme: 'meme:MISSINGDATA1', crypto: 'crypto:MISSUSDT' };
+      g.setLive({ key: K.meme, m: 'meme', id: 'MISSINGDATA1', sym: 'MISS', name: 'Miss', pair: 'P', born: now - 9e8 }, { px: 1, t: now, liq: 1e9 });
+      g.setLive({ key: K.crypto, m: 'crypto', id: 'MISSUSDT', sym: 'MISSC', name: 'Missc' }, { px: 100, t: now });
+      g.state().cash = 50000;
+      const go = async (id, key, side, candles) => { delete window.__firstCandle; window.__candles = candles; toastEl.hidden = true; toastEl.className = 'toast';
+        const c = g.state().cheats; c.on = {}; c.armed = {}; c.always = {}; c.lev = 1; c.armed[id] = true; const n = g.state().trades.length;
+        g.closeSheet(true); g.openSheet(key); await wait(150); g.chooseSide(side); await wait(100);
+        if (side === 'buy') { document.querySelector('[data-amt="max"]').click(); await wait(50); const a = document.getElementById('amtIn'); a.value = 100; a.oninput(); }
+        await wait(80); enter(); await wait(400);
+        const t = g.state().trades.slice(n)[0]; out.push({ id, ok: !!t, mid: t?.mid, tag: (t?.cheat || []).join(), armed: !!g.state().cheats.armed[id], red: toastEl.classList.contains('down') && !toastEl.hidden, line: toastEl.textContent }); };
+      await go('sniper', K.meme, 'buy', []); await go('golden', K.crypto, 'buy', []); await go('perfect', K.crypto, 'sell', []);
+      await go('sniper', K.meme, 'buy', [bar(now - 6e8, 0.4, 2), bar(now - 5e8, 0.25, 2)]); await go('golden', K.crypto, 'buy', [bar(now - 120000, 80, 90)]); await go('perfect', K.crypto, 'sell', [bar(now - 120000, 80, 130)]);
+      window.__candles = undefined; g.closeSheet(true); g.state().cheats = keep; for (const k of Object.values(K)) { delete g.state().pos[k]; g.live.delete(k); } return out; })()""")
+    await asyncio.sleep(2)
+    none, part = miss[:3], miss[3:]
+    res(all(x["ok"] and x["armed"] and not x["tag"] and not x["red"] for x in none) and all(x["ok"] and not x["armed"] and not x["red"] and "price available" in x["tag"] for x in part)
+        and [x["mid"] for x in part] == [0.25, 80, 130],
+        f"Cheats with missing data: none → normal trade, still armed; some → {[(x['tag'], x['mid']) for x in part]}; line “{part[0]['line']}”", "missing data")
     # Money cap: World's richest notice, ladder in Trophies, source and date in Settings
     cap = await p.js("ghostDesk.RICH.WORLD_CAP")
     await p.js(f"(() => {{ const s = ghostDesk.state(); s.cash = {cap} - 5000; ghostDesk.renderAll(); return true; }})()")
@@ -638,15 +660,35 @@ async def cheat_ui_tests(p, check):
     rc = await p.js("({ cash: ghostDesk.state().cash, tag: document.querySelector('#totalPl .rich-tag')?.textContent, total: document.getElementById('total').textContent, toast: document.getElementById('toast').textContent })")
     await p.js("ghostDesk.closeSheet(true), ghostDesk.setTab('achievements'), true")
     await asyncio.sleep(0.4)
+    fx1 = await p.js("document.getElementById('levelFx').hidden ? '' : document.getElementById('levelFx').innerText.split(String.fromCharCode(10)).join(' ')")
+    await check("level unlocked")
+    await p.js("document.getElementById('levelFx').click(), true")
     lad = await p.js("(() => { const l = document.querySelector('.ladder'); return { h: l?.previousElementSibling?.textContent, p: l?.querySelector('p')?.textContent, me: l?.querySelector('.lad.me .rk')?.textContent, rows: l?.querySelectorAll('.lad').length, src: l?.querySelector(':scope > small')?.textContent }; })()")
     await check("billionaire ladder")
     await p.js("ghostDesk.openSettings(), true")
     await asyncio.sleep(0.3)
     capbox = await p.js("document.getElementById('capBox')?.textContent || ''")
-    res(abs(rc["cash"] - cap) < 0.01 and "World's richest" in (rc["tag"] or "") and "World's richest" in rc["toast"] and rc["total"] == "$7.27T"
-        and lad["h"] == "Billionaire ladder" and lad["me"] == "#1" and "richest person in the world" in (lad["p"] or "") and "Forbes" in (lad["src"] or "")
+    res(abs(rc["cash"] - cap) < 0.01 and "World's richest" in (rc["tag"] or "") and "100 richest" in rc["toast"] and rc["total"] == "$7.27T"
+        and lad["h"] == "Country ladder" and lad["me"] == "#3" and "China" in (lad["p"] or "") and "World Bank" in (lad["src"] or "") and "UNLOCKED" in fx1 and "Countries" in fx1 and "UBS" in capbox and "2025" in capbox
         and "Forbes Real-Time Billionaires" in capbox and "2026" in capbox,
         f"Money cap: printing at the top keeps it at {rc['total']} (cash {rc['cash'] - cap:+.2f} vs the cap) with “{rc['tag']}”, toast “{rc['toast'][:60]}”; ladder {lad['me']} “{lad['p']}” (heading {lad['h']!r}, source {lad['src'][:40]!r}); Settings: {capbox[capbox.find('Figure'):][:70]}", "money cap")
+    # World, the last cap and Prestige
+    lv = await p.js("""(async () => { const g = ghostDesk, s = g.state(), fx = document.getElementById('levelFx'), seen = [], wait = ms => new Promise(r => setTimeout(r, ms));
+      for (let k = 0; k < 2; k++) { g.E.addCash(s, 1e15); g.renderAll(); await wait(300); seen.push(fx.hidden ? '' : fx.innerText.replace(/\\n/g, ' ')); fx.click(); await wait(100); }
+      g.closeSheet(true); g.setTab('achievements'); await wait(300);
+      return { seen, level: s.level, reached: s.reached.length, btn: document.querySelector('[data-prestige]')?.textContent, h: document.querySelector('.ladder').previousElementSibling.textContent }; })()""")
+    await check("prestige ready")
+    pr = await p.js("""(async () => { const g = ghostDesk, wait = ms => new Promise(r => setTimeout(r, ms)); const b = document.querySelector('[data-prestige]'); b.click(); const sure = b.textContent; const before = g.state().start; b.click(); await wait(700);
+      const fx = document.getElementById('levelFx').innerText; return { sure, fx, cash: g.state().cash, start: g.state().start, level: g.state().level || 0, bots: g.bots().map(x => x.pf.cash), badges: g.badges().length, tag: document.querySelector('#totalPl .prest')?.textContent,
+      disk: (await g.kv.get('achievements')).prestige?.length, diskCash: (await g.kv.get('portfolio')).cash }; })()""")
+    await check("prestige done")
+    await p.js("document.getElementById('levelFx').click(), ghostDesk.setTab('achievements'), true")
+    await asyncio.sleep(0.4)
+    await check("prestige badge")
+    res("World" in lv["seen"][0] and "THE WORLD" in lv["seen"][1] and lv["level"] == 2 and lv["reached"] == 3 and "Prestige 1" in (lv["btn"] or "") and "Tap again" in pr["sure"] and "PRESTIGE" in pr["fx"]
+        and pr["cash"] == 10000 and pr["start"] == 10000 and pr["level"] == 0 and all(x == 10000 for x in pr["bots"]) and pr["badges"] == 1 and pr["disk"] == 1 and pr["diskCash"] == 10000 and pr["tag"],
+        f"Levels: {lv['seen']}; “{lv['btn']}” asks first, then $10K for me and {len(pr['bots'])} bots, badge {pr['tag']} kept and saved", "prestige")
+    await p.js("ghostDesk.state().cheats || ghostDesk.C.mark(ghostDesk.state(), 'printer', 'test', ghostDesk.appNow()), true")
     await p.js("(() => { const s = ghostDesk.state(); s.cash = 1000; ghostDesk.renderAll(); return true; })()")
     await p.js("ghostDesk.closeSheet(true), ghostDesk.setTab('achievements'), true")
     await asyncio.sleep(0.4)

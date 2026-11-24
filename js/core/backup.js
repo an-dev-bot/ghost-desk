@@ -64,5 +64,7 @@ export function mergeAchievements(a, b) {
     if (ca && cb) cheated[id] = (a.cheated?.[id] || b.cheated?.[id]);
   }
   out.cheated = cheated;
+  // Prestige badges: the copy with more of them.
+  if ((b.prestige?.length || 0) > (a.prestige?.length || 0)) out.prestige = structuredClone(b.prestige);
   return out;
 }

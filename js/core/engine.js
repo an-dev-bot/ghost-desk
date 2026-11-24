@@ -10,16 +10,15 @@
 // bots.js). A portfolio without s.cheats trades with the plain rules. The owner's portfolio sets s.undoable so
 // Undo can step back.
 //
-// Money cap: no portfolio can be worth more than the combined fortune of the world's 100 richest people
-// (WORLD_CAP, rich.js). Cash that would push it past that is cut (trade.capped says how much).
+// Money cap: by levels (rich.js LEVELS). s.level is the level in play, s.reached[i] when level i's cap was reached. Cash that would push it past that is cut (trade.capped says how much).
 
 import {
   START_CASH, START_MIN, START_MAX, quoteBuy, quoteSell, markValue, memeImpact,
   quoteOpenMargin, quoteCloseMargin, marginEquity, quoteToUsd,
 } from "./money.js";
 import { localDay } from "./stats.js";
-import { WORLD_CAP } from "./rich.js";
-export { WORLD_CAP };
+import { WORLD_CAP, LAST, levelOf, capOf } from "./rich.js";
+export { WORLD_CAP, capOf };
 
 export class TradeError extends Error {}
 
@@ -117,11 +116,20 @@ export function addCash(s, usd) {
   return cut;
 }
 
-/** The money cap: if the portfolio is worth more than WORLD_CAP, cash above it is cut. Returns the dollars cut. */
+/** Did the portfolio reach its level's cap? Writes down when, and unlocks the next level. Returns the level reached or -1. */
+export function checkLevel(s, now, quoteFor) {
+  const l = levelOf(s);
+  if (s.reached?.[l] != null || !totals(s, quoteFor).capped) return -1;
+  (s.reached ||= [])[l] = now;
+  if (l < LAST) s.level = l + 1;
+  return l;
+}
+
+/** The money cap: if the portfolio is worth more than its level's cap, cash above it is cut. Returns the dollars cut. */
 export function capCash(s) {
   let held = 0;
   for (const p of [...Object.values(s.pos), ...marginPositions(s)]) { const v = positionValue(s, p, null); held += v == null ? p.cost : v; }
-  const over = s.cash + held - WORLD_CAP;
+  const over = s.cash + held - capOf(s);
   if (!(over > 0.005)) return 0;
   const cut = Math.min(over, Math.max(0, s.cash));
   s.cash -= cut;
@@ -520,8 +528,8 @@ export function totals(s, quoteFor) {
     const v = positionValue(s, p, q);
     held += v == null ? p.cost : v;
   }
-  const raw = s.cash + held, total = Math.min(raw, WORLD_CAP); // positions can be worth more on paper; the portfolio stops at the cap
-  return { cash: s.cash, held, total, pl: total - s.start, plPct: (total - s.start) / s.start, reserved: reserved(s), stale, capped: raw >= WORLD_CAP - 0.005 };
+  const raw = s.cash + held, cap = capOf(s), total = Math.min(raw, cap); // positions can be worth more on paper; the portfolio stops at the cap
+  return { cash: s.cash, held, total, pl: total - s.start, plPct: (total - s.start) / s.start, reserved: reserved(s), stale, capped: raw >= cap - 0.005 };
 }
 
 /** Value of a position plus unrealized P&L. Pass the portfolio to include its cheats. */
