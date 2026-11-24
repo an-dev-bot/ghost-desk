@@ -15,7 +15,7 @@ const B1_MAX = 360, BH_MAX = 240, BD_MAX = 120;   // 6 hours of 1m, 10 days of 1
 export const MAX_MEMES = 45;
 export const MAX_GAP = 30e3;                        // a longer gap (app closed or hidden) is not simulated
 export const VERSION = 2;
-export const SKIPS = { "1h": 3600e3, "1d": 86400e3, "1w": 7 * 86400e3 };
+export const SKIPS = { "1m": 60e3, "5m": 5 * 60e3, "15m": 15 * 60e3, "1h": 3600e3, "1d": 86400e3, "1w": 7 * 86400e3 };
 
 // Volatility per second, by market: crypto high, stocks with crashes and rallies, forex calm except news.
 export const SIG = { crypto: 0.0003, stock: 0.00012, fx: 0.00002, meme: 0.004 };
@@ -397,6 +397,18 @@ export function future(w, key, secs, opts = {}) {
     path.push([c.t, i.px]);
   }
   return { path, inst: c.insts[key] || null };
+}
+
+/** The same for every instrument alive now, in one run: {t0, paths: {key: Float64Array of prices, one per second}, insts}. */
+export function futureAll(w, secs, opts = {}) {
+  const c = structuredClone(w), paths = {}, t0 = w.t;
+  for (const k in c.insts) paths[k] = new Float64Array(secs);
+  for (let n = 0; n < secs; n++) {
+    c.t += 1000;
+    tick(c, c.t, [], opts, 1);
+    for (const k in paths) if (c.insts[k]) paths[k][n] = c.insts[k].px; // 0: the coin is gone by then
+  }
+  return { t0, paths, insts: c.insts };
 }
 
 /** The best single trade on a path: buy at the lowest point before the biggest gain, sell at that peak. null if no gain. */

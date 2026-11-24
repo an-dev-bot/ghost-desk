@@ -11,7 +11,8 @@ import * as E from "./engine.js";
 import * as C from "./cheats.js";
 import { localDay } from "./stats.js";
 
-// Bot cheats: each bot arms up to 3 a day, at random times, from this list (same engine rules as yours).
+// Bot cheats: each bot arms one whenever it suits its next trade, with no daily limit (same engine rules as yours).
+// Only Money printer is limited: once a day per bot.
 // Bots never use Undo, Ghost trade, Oracle, X-ray, Time machine, Skip ahead or Always on.
 export const BOT_CHEATS = [
   { id: "zeroFees", name: "Zero fees for 1 hour" },
@@ -23,7 +24,6 @@ export const BOT_CHEATS = [
   { id: "leverage", name: "Leverage" },
   { id: "printer", name: "Money printer 10%" },
 ];
-export const BOT_CHEATS_PER_DAY = 3;
 export const BOT_TIMED = 3600e3;
 const BOT_LEV = [10, 20];
 
@@ -168,16 +168,15 @@ export function decide(bot, fresh, now) {
 
 /**
  * One bot turn: decide with fresh live prices and execute through the same engine as the owner's trades.
- * Returns the trades made (each with .why).
+ * cheats: the bot may arm its own cheats for these trades. Returns the trades made (each with .why).
  */
-export function step(bot, { entries, now, status, bootAt, extreme = null }) {
+export function step(bot, { entries, now, status, bootAt, extreme = null, cheats = false }) {
   const fresh = freshQuotes(entries, now, status, bootAt);
   for (const key in bot.pf.pos) {
     const L = fresh.get(key), p = bot.pf.pos[key];
     if (L) { p.lastPx = L.px; p.lastT = L.t; if (L.quoteUsd) p.lastQu = L.quoteUsd; }
   }
   const trades = [];
-  const c = bot.pf.cheats;
   // Leveraged positions (Leverage cheat): real liquidation with the engine's rules, then the bot's own exits.
   for (const m of E.marginPositions(bot.pf)) {
     const L = fresh.get(m.key);
@@ -186,12 +185,14 @@ export function step(bot, { entries, now, status, bootAt, extreme = null }) {
     if (!bot.pf.margin?.[m.id]) continue;
     const v = E.positionValue(bot.pf, m, quoteOf(L)), r = v / m.cost - 1;
     const why = r >= 0.5 ? `take profit (+${(r * 100).toFixed(0)}% on its margin)` : r <= -0.5 ? `stop loss (${(r * 100).toFixed(0)}% on its margin)` : now - m.openedAt > 3600e3 ? "held too long" : null;
+    if (why && cheats) consider(bot, "lucky", r > 0, now);
     if (why) try { const t = E.closeMargin(bot.pf, m.id, 1, quoteOf(L), now, "bot"); t.why = why; trades.push(t); } catch { /* skip */ }
   }
   for (const a of decide(bot, fresh, now)) {
     const L = fresh.get(a.key), q = quoteOf(L);
     try {
-      const opts = {};
+      if (cheats) (a.type === "sell" ? cheatsForSell : cheatsForBuy)(bot, a, L, now, extreme);
+      const opts = {}, c = bot.pf.cheats;
       let t;
       if (a.type === "sell") {
         // Perfect exit: the highest price of the day
@@ -252,49 +253,85 @@ export function validBots(list) {
 }
 
 // ---------------------------------------------------------------- bot cheats
-const endOfDay = now => { const d = new Date(now); d.setHours(24, 0, 0, 0); return d.getTime(); };
 const startOfDay = now => { const d = new Date(now); d.setHours(0, 0, 0, 0); return d.getTime(); };
 
 /**
- * The bot's cheats for this moment: timed ones expire, and on a new day it plans up to 3 at random times.
+ * When each style finds a cheat worth it. There is no daily limit: step() asks before every trade.
+ * edge: how far (relative to the market's SCALE) the 15-minute low / day high must be from the price for Golden
+ * entry / Perfect exit; win: profit (same scale) that deserves 2x Lucky trade; share: part of its balance that
+ * makes a buy big (Insurance, Zero fees); lev: times its entry threshold that deserves Leverage (null: never).
+ * Random uses a cheat it could use only half the time, on a whim.
+ */
+const CHEAT_WHEN = {
+  momentum: { edge: 0.005, win: 0.04, share: 0.1, lev: 2 },
+  contrarian: { edge: 0.01, win: 0.03, share: 0.1, lev: 2.5 },
+  degen: { edge: 0.003, win: 0.02, share: 0.05, lev: null },
+  random: { edge: 0, win: 0, share: 0.05, lev: 0, whim: 0.5 },
+};
+
+/** Start one cheat now, and mark it on the bot's portfolio. */
+function useCheat(bot, id, now, arg) {
+  const st = C.state(bot.pf);
+  let text = BOT_CHEATS.find(x => x.id === id).name;
+  if (id === "zeroFees" || id === "rugShield") { st.on[id] = true; (st.until ||= {})[id] = now + BOT_TIMED; }
+  else if (id === "leverage") { st.lev = arg; text = `Leverage ${arg}x on its next buy`; }
+  else st.armed[id] = true;
+  C.mark(bot.pf, id, text, now);
+}
+/** The bot could use this cheat here: does it? (never when it's already running) */
+function consider(bot, id, worth, now, arg) {
+  if (!worth || C.isArmed(bot.pf, id) || C.isOn(bot.pf, id) || (id === "leverage" && C.leverage(bot.pf) > 1)) return;
+  const whim = CHEAT_WHEN[bot.style].whim;
+  if (whim && rng(bot)() >= whim) return;
+  useCheat(bot, id, now, arg);
+}
+function cheatsForBuy(bot, a, L, now, extreme) {
+  const w = CHEAT_WHEN[bot.style], m = L.inst.m, enter = RULES[bot.style].enter?.[m];
+  const equity = E.totals(bot.pf, () => null).total;
+  const strong = w.lev != null && m !== "meme" && (enter == null || Math.abs(L.ch24) >= w.lev * Math.abs(enter));
+  consider(bot, "leverage", strong, now, m === "fx" ? BOT_LEV[1] : BOT_LEV[0]);
+  const big = a.usd >= w.share * equity, levered = C.leverage(bot.pf) > 1 && m !== "meme";
+  consider(bot, "insurance", m === "meme" || levered || big, now);
+  consider(bot, "rugShield", m === "meme" && big, now);
+  consider(bot, "zeroFees", m === "meme" || levered || big, now);
+  const lo = extreme?.(a.key, now - 15 * 60e3, "low");
+  consider(bot, "golden", lo > 0 && lo < L.px * (1 - w.edge * SCALE[m]), now);
+}
+function cheatsForSell(bot, a, L, now, extreme) {
+  const w = CHEAT_WHEN[bot.style], p = bot.pf.pos[a.key], m = L.inst.m;
+  const r = E.positionView(p, quoteOf(L)).plPct ?? 0;
+  const hi = r > 0 ? extreme?.(a.key, startOfDay(now), "high") : null;
+  consider(bot, "perfect", hi > 0 && hi > L.px * (1 + w.edge * SCALE[m]), now);
+  consider(bot, "lucky", r > 0 && r >= w.win * SCALE[m], now);
+  consider(bot, "rugShield", r < E.SHIELD - 1, now);
+  consider(bot, "insurance", r < 0, now);
+}
+
+/**
+ * Timed cheats expire, and the bot prints money (once a day) when it's losing or short of cash for its next buy.
+ * The other cheats are decided in step(), trade by trade.
  * ctx: {allowed (Settings: Bots can cheat), quoteFor(key) for Money printer}. Returns [{id, text}] used now.
  */
 export function cheatTick(bot, now, { allowed = true, quoteFor = () => null } = {}) {
   const c = bot.pf.cheats;
+  const day = localDay(now);
+  // bots saved when cheats were limited per day: today's Money printer still counts
+  if (bot.cheatDay === day && bot.cheatsToday?.includes("printer")) bot.printerDay = day;
+  delete bot.cheatPlan; delete bot.cheatsToday; delete bot.cheatDay;
   if (!allowed) {
     if (c) { c.on = {}; c.armed = {}; c.lev = 1; c.until = {}; }
-    bot.cheatPlan = [];
     return [];
   }
-  const st = C.state(bot.pf);
-  st.until ||= {};
-  for (const id in st.until) if (now >= st.until[id]) { st.on[id] = false; delete st.until[id]; }
-  const r = rng(bot);
-  const day = localDay(now);
-  if (bot.cheatDay !== day) {
-    bot.cheatDay = day; bot.cheatsToday = [];
-    const n = 1 + Math.floor(r() * BOT_CHEATS_PER_DAY), end = endOfDay(now);
-    bot.cheatPlan = Array.from({ length: n }, () => now + r() * (end - now)).sort((a, b) => a - b);
-  }
-  const used = [];
-  while (bot.cheatPlan?.length && bot.cheatPlan[0] <= now) {
-    bot.cheatPlan.shift();
-    const left = BOT_CHEATS.filter(x => !bot.cheatsToday.includes(x.id));
-    if (!left.length) break;
-    const pick = left[Math.floor(r() * left.length)];
-    bot.cheatsToday.push(pick.id);
-    let text = pick.name;
-    if (pick.id === "zeroFees" || pick.id === "rugShield") { st.on[pick.id] = true; st.until[pick.id] = now + BOT_TIMED; }
-    else if (pick.id === "leverage") { st.lev = BOT_LEV[Math.floor(r() * BOT_LEV.length)]; text = `Leverage ${st.lev}x on its next buy`; }
-    else if (pick.id === "printer") {
-      const total = E.totals(bot.pf, quoteFor).total, add = Math.round(total * 0.1 * 100) / 100;
-      const cut = E.addCash(bot.pf, add);
-      text = `Money printer: +$${(add - cut).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })} (10% of its balance)`;
-    } else st.armed[pick.id] = true;
-    C.mark(bot.pf, pick.id, text, now);
-    used.push({ id: pick.id, text });
-  }
-  return used;
+  const until = c?.until || {};
+  for (const id in until) if (now >= until[id]) { c.on[id] = false; delete until[id]; }
+  if (bot.printerDay === day) return [];
+  const R = RULES[bot.style], { total, pl } = E.totals(bot.pf, quoteFor);
+  if (!(pl < 0 || E.available(bot.pf) < total * (R.size ?? R.maxSize))) return [];
+  bot.printerDay = day;
+  const add = Math.round(total * 0.1 * 100) / 100, cut = E.addCash(bot.pf, add);
+  const text = `Money printer: +$${(add - cut).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })} (10% of its balance)`;
+  C.mark(bot.pf, "printer", text, now);
+  return [{ id: "printer", text }];
 }
 
 /** Recent cheats of all bots, newest first: [{bot, t, id, text}]. */

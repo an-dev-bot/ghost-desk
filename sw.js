@@ -2,12 +2,12 @@
 // It only caches the app's own files and the fonts. Price requests are never intercepted or stored,
 // so a URL that carries an API key (Finnhub) never ends up in any cache.
 
-const VERSION = "g1-2026-11-23g";
+const VERSION = "g1-2026-11-23k";
 const SHELL = [
   "./", "index.html", "manifest.webmanifest", "css/app.css",
   "js/app.js", "js/store.js",
   "js/core/money.js", "js/core/engine.js", "js/core/hours.js", "js/core/stats.js", "js/core/achievements.js",
-  "js/core/candles.js", "js/core/backup.js", "js/core/bots.js", "js/core/cheats.js", "js/core/rich.js", "js/core/replay.js", "js/sim/world.js", "js/sim/fun.js",
+  "js/core/candles.js", "js/core/backup.js", "js/core/sanitize.js", "js/core/bots.js", "js/core/cheats.js", "js/core/rich.js", "js/core/replay.js", "js/sim/world.js", "js/sim/fun.js", "js/sim/rewind.js",
   "js/sources/http.js", "js/sources/dex.js", "js/sources/crypto.js", "js/sources/stocks.js", "js/sources/twelve.js", "js/sources/fx.js",
   "js/ui/format.js", "js/ui/chart.js", "js/ui/effects.js", "js/ui/swipe.js", "js/ui/notify.js",
   "icons/icon.svg", "icons/icon-192.png", "icons/icon-512.png", "icons/icon-maskable-512.png", "icons/apple-touch-icon.png", "icons/badge-96.png",

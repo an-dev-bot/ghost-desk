@@ -35,7 +35,8 @@ h4{font-size:13px;margin:14px 0 6px;color:var(--muted)}
 .live.on{color:var(--up)} .live.on::before{background:var(--up);box-shadow:0 0 0 0 rgba(32,224,138,.6);animation:pulse 1.6s infinite}
 .live.off{color:var(--down)} .live.off::before{background:var(--down)}
 .gear{width:44px;height:44px;display:grid;place-items:center;border-radius:12px;color:var(--muted)}
-.total-box{max-width:720px;margin:0 auto;padding:2px 16px 8px}
+.total-box{position:relative;max-width:720px;margin:0 auto;padding:2px 16px 8px}
+.saved{position:absolute;right:16px;top:4px;font:600 10px var(--mono);color:var(--up);pointer-events:none}
 .total-box small{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.14em}
 .total{display:block;font:800 clamp(30px,9vw,44px)/1.1 var(--mono);font-variant-numeric:tabular-nums;letter-spacing:-.02em;border-radius:8px;width:fit-content;padding:0 4px;margin-left:-4px}
 .total-pl{font:600 12px var(--mono);color:var(--muted);min-height:18px}
@@ -365,8 +366,11 @@ body.sim .total-box small{color:#ff8fe1}
 .skip{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin:8px 0 4px}
 .skip span{font:600 12px var(--mono);color:#ffb3ee;margin-right:auto}
 .skip .btn{min-height:40px;min-width:56px}
+.skip-row{display:flex;gap:6px;width:100%;overflow-x:auto;scrollbar-width:none;-webkit-overflow-scrolling:touch}.skip-row::-webkit-scrollbar{display:none}.skip-row .btn{flex:0 0 auto}
 .oracle-note{margin:6px 0;padding:8px 10px;border-radius:12px;border:1px dashed var(--gold);font:600 12px/1.45 var(--mono);color:var(--fg);background:rgba(255,209,102,.08)}
 .oracle-note:empty{display:none}
+.on-b{display:flex;gap:8px;flex-wrap:wrap}.on-b:not(:empty){margin-top:8px}.on-b .btn{min-height:44px;flex:1}
+.front{display:flex;gap:8px;flex-wrap:wrap;padding:0 12px 10px}.front .btn{min-height:44px}.front-pct{align-items:center}.front-pct small{color:var(--muted)}
 .skipbox,.lastchance{position:fixed;inset:0;z-index:75;display:grid;place-items:center;background:rgba(0,0,0,.6);padding:16px}
 .skip-box,.lc-box{width:100%;max-width:420px;background:var(--panel);border:2px solid #ff5fd2;border-radius:22px;padding:20px;text-align:center}
 .skip-box>b{display:block;font:800 22px var(--display)}

@@ -12,6 +12,8 @@ import * as C from "./core/cheats.js";
 import * as RP from "./core/replay.js";
 import * as SW from "./sim/world.js";
 import * as FUN from "./sim/fun.js";
+import * as RW from "./sim/rewind.js";
+import * as CLEAN from "./core/sanitize.js";
 import { openStore, kv, candles as candleStore, usingMemory } from "./store.js";
 import { SourceError } from "./sources/http.js";
 import * as dex from "./sources/dex.js";
@@ -42,6 +44,7 @@ const DEFAULT_CFG = {
   finnhubKey: "", twelveKey: "", sound: false, simSound: false,
   lc: { pct: 10, warn: true, trail: false }, // Last chance: warn (or sell with the trailing stop) at −pct% from the high since you bought
   notif: { fills: true, moves: true, price: true, summary: true, streak: true }, moveTh: 5, botCheats: true,
+  oracleAuto: { on: false, pct: 10, scope: "view" }, frontPct: 10,
   alerts: [], lastBuy: defaultBuy(START_CASH), chartMode: "candles", ivl: "5m", lastSummary: "", lastStreakDay: "",
 };
 
@@ -428,19 +431,102 @@ function dailySummary(now) {
 }
 
 // ---------------------------------------------------------------- persistence
-let saveTimer = null;
+// Every change marks what it touched and is written at once (or within `ms`); a later, slower request never
+// postpones an earlier one. A save counts only when its IndexedDB transaction is complete.
+const DUE = new Set();
+let saveTimer = null, saveAt = 0, saveLoud = false, saveErr = null, pillTimer = null;
+let loadIssues = [];          // what had to be repaired in the saved data (told in a banner)
+const VALUES = {
+  portfolio: () => [K("portfolio"), S], achievements: () => [K("achievements"), A], settings: () => ["settings", CFG],
+  bots: () => [K("bots"), { v: 1, list: BOTS }], records: () => ["sim.records", REC], world: () => ["sim.world", W],
+};
 function saveSoon(ms = 400) {
+  DUE.add("portfolio");
+  if (ms < 1000) { saveLoud = true; if (SIM) DUE.add("world"); } // a position and its Sim coin are saved together
+  saveIn(ms);
+}
+function saveIn(ms) {
+  const at = Date.now() + ms;
+  if (saveTimer && saveAt <= at) return;
   clearTimeout(saveTimer);
+  saveAt = at;
   saveTimer = setTimeout(flushSave, ms);
 }
-async function flushSave() {
-  clearTimeout(saveTimer);
-  try { await kv.set(K("portfolio"), S); } catch (e) { console.warn("Could not save", e?.message); }
+/** Bad numbers never reach the disk: they are repaired in the live data, and the app says so. */
+function checkData(keys) {
+  const issues = [], now = appNow();
+  if (keys.includes("portfolio")) CLEAN.cleanPortfolio(S, now, issues);
+  if (keys.includes("bots")) BOTS = CLEAN.cleanBots(BOTS, now, issues);
+  if (keys.includes("achievements")) CLEAN.cleanAchievements(A, now, issues);
+  if (keys.includes("settings")) CFG = CLEAN.cleanSettings(CFG, DEFAULT_CFG, issues);
+  if (keys.includes("world")) W = CLEAN.cleanWorld(W, newWorld, issues) || newWorld();
+  if (issues.length) noteIssues(issues);
 }
-const saveAch = () => kv.set(K("achievements"), A).catch(() => {});
-const saveRec = () => kv.set("sim.records", REC).catch(() => {});
-const saveWorld = () => (W ? kv.set("sim.world", W).catch(() => {}) : Promise.resolve());
-const saveCfg = () => kv.set("settings", CFG).catch(() => {});
+function noteIssues(issues) {
+  for (const x of issues) if (!loadIssues.includes(x) && loadIssues.length < 30) loadIssues.push(x);
+  console.warn("Repaired data:", issues.join("; "));
+  if (S && CFG) renderBanners();
+}
+/** Write everything that changed, in one transaction. Resolves true when it is on disk. */
+async function flushSave() {
+  clearTimeout(saveTimer); saveTimer = null;
+  const keys = [...DUE].filter(k => (k !== "world" || W) && (k !== "records" || REC)), loud = saveLoud;
+  DUE.clear(); saveLoud = false;
+  if (!keys.length) return !saveErr;
+  try {
+    checkData(keys);
+    await kv.setMany(keys.map(k => VALUES[k]()));
+    const was = saveErr;
+    saveErr = null;
+    if (was) renderBanners();
+    if ((loud || was) && !usingMemory()) showSaved();
+    return true;
+  } catch (e) {
+    console.warn("Could not save", e?.message);
+    for (const k of keys) DUE.add(k);
+    const first = !saveErr;
+    saveErr = e || new Error("unknown error"); saveLoud = true;
+    renderBanners();
+    if (first) toast("⚠️ Your last changes are not saved", "down");
+    saveIn(5000); // keep trying
+    return false;
+  }
+}
+function saveNow(key, loud = true) { DUE.add(key); if (loud) saveLoud = true; return flushSave(); }
+const saveAch = () => saveNow("achievements");
+const saveRec = () => saveNow("records", false);
+const saveWorld = () => saveNow("world", false);
+const saveCfg = () => saveNow("settings");
+const saveBots = (loud = true) => saveNow("bots", loud);
+/** The app is being hidden or closed: write everything again. The requests are issued before this returns. */
+function saveOnExit() {
+  for (const k of ["portfolio", "bots", "achievements"]) DUE.add(k);
+  if (SIM) { DUE.add("world"); DUE.add("records"); }
+  return flushSave();
+}
+function showSaved() {
+  const el = $("#saved");
+  el.hidden = false;
+  clearTimeout(pillTimer);
+  pillTimer = setTimeout(() => { el.hidden = true; }, 1500);
+}
+function saveBanners() {
+  const b = [];
+  if (saveErr) b.push(["err", `Your last changes are not saved (${esc(saveErr.name === "QuotaExceededError" ? "the phone has no space left" : saveErr.message || saveErr.name)}). Trying again… <button class="lnk" data-savenow>Try now</button> <button class="lnk" data-export>Export backup</button>`]);
+  if (usingMemory()) b.push(["err", `The phone's storage didn't open, so nothing you do now will be saved (what you had saved is untouched). <button class="lnk" data-reload>Reload</button>`]);
+  if (loadIssues.length) b.push(["warn", `Some saved data was damaged and was repaired; everything else is intact: ${esc(loadIssues.slice(0, 4).join(", "))}${loadIssues.length > 4 ? ` and ${loadIssues.length - 4} more` : ""}. <button class="lnk" data-issuesok>OK</button>`]);
+  return b;
+}
+
+/** Read one saved value and repair it. If it needed repairs, the damaged original is kept apart. */
+async function loadClean(key, clean) {
+  const issues = [], value = clean(await kv.get(key), issues);
+  if (issues.length) {
+    noteIssues(issues);
+    try { await kv.set("damaged." + key, { at: Date.now(), value: await kv.get(key) }); } catch { /* only a copy */ }
+  }
+  return value;
+}
 
 // ---------------------------------------------------------------- loops
 const loops = {};
@@ -590,18 +676,21 @@ function startSources() {
 async function setMode(m) {
   if ((m === "sim") === SIM) return;
   toast(m === "sim" ? "🎰 Switching to Sim…" : "Switching to Live…");
-  if (SIM) await saveWorld();
-  await flushSave();
-  await kv.set("mode", m);
+  const saved = await saveOnExit();
+  if (!saved) return; // the banner says why
+  try { await kv.set("mode", m); } catch (e) { saveErr = e; renderBanners(); return; }
   location.reload();
 }
 
+const newWorld = () => SW.createWorld(TEST ? 12345 : Math.floor(Math.random() * 2147483647), Date.now());
 async function loadSim() {
-  REC = (await kv.get("sim.records")) || FUN.newRecords();
-  W = await kv.get("sim.world");
-  if (!W || W.v !== SW.VERSION) W = SW.createWorld(TEST ? 12345 : Math.floor(Math.random() * 2147483647), Date.now());
+  REC = await loadClean("sim.records", (v, is) => CLEAN.cleanRecords(v, FUN.newRecords(), is));
+  W = await loadClean("sim.world", (v, is) => (v && v.v === SW.VERSION ? CLEAN.cleanWorld(v, newWorld, is) : null));
+  if (!W) W = newWorld();
   W.off = W.t - Date.now(); // the Sim clock continues exactly where it stopped
   bootAt = appNow();
+  try { await loadPoints(); } catch (e) { console.warn("Rewind points", e?.message); PTS = []; FINE = []; lastPt = null; }
+  W.off = W.t - Date.now(); bootAt = appNow();
   document.querySelector(".total-box small").textContent = "Your Sim portfolio";
   publishSim(false);
 }
@@ -629,11 +718,26 @@ function simSecond() {
 function simKeep() {
   const keep = new Set(trackedKeys());
   for (const k of lists.meme.trending.slice(0, 10)) keep.add(k);
+  for (const k in signals()) keep.add(k);
   return keep;
 }
 
-/** Advance the Sim world to `now` and react: prices, banners, effects, jackpots, rugs. */
+/** Advance the Sim world to `now`, stopping at each second where an Oracle signal buys or sells. */
 function simAdvance(now) {
+  const out = [];
+  for (let n = 0; n < 500; n++) {
+    const t = autoNext();
+    if (!(t > W.t && t < now)) break;
+    out.push(...simStep(t));
+    if (W.t < t) break; // a long pause is not simulated
+    autoRun();
+  }
+  out.push(...simStep(now));
+  autoRun();
+  return out;
+}
+/** Advance the Sim world and react: prices, banners, effects, jackpots, rugs. */
+function simStep(now) {
   if (now > appNow()) W.off += now - appNow(); // tests drive the Sim clock directly
   const mine = [...Object.values(S.pos), ...E.marginPositions(S)];
   const before = new Map(), pxBefore = new Map();
@@ -653,7 +757,8 @@ function simAdvance(now) {
   }
   // jackpots: a position worth 10x its cost
   for (const j of FUN.newJackpots(mine, p => E.positionValue(S, p, quoteFor(p.key)))) { jpKeys.add(j.p.key); showJackpot(j.p.inst.sym, j.mult, j.usd, now); }
-  if (now - simSavedAt > 30e3) { simSavedAt = now; saveWorld(); }
+  addPoint();
+  if (now - simSavedAt > 10e3) { simSavedAt = now; saveWorld(); }
   if (changed && ui.tab === "markets" && ui.market === "meme" && !lists.search.meme && now - simListAt > 3000) { simListAt = now; renderView(); }
   return out;
 }
@@ -692,9 +797,15 @@ const ORACLE_SECS = 30 * 60;
 function oracleFor(key) {
   if (!SIM || !W || !C.isOn(S, "oracle") || !W.insts[key]) return null;
   if (oracle && oracle.key === key && oracle.ver === oracleVer && W.t >= oracle.at && W.t < oracle.at + 5 * 60e3) return oracle;
+  const g = signals()[key];
+  if (autoOn()) {
+    const a = forecast(key);
+    const best = g ? { buy: { t: g.buyT, px: g.buyPx }, sell: { t: g.sellT, px: g.sellPx }, gain: g.sellPx / g.buyPx - 1 } : planFor(a, key);
+    return (oracle = { key, at: W.t, ver: oracleVer - 1, inst: a.insts[key], best, until: a.t0 + ORACLE_SECS * 1000 });
+  }
   const f = SW.future(W, key, ORACLE_SECS, { keep: simKeep(), lev: SW.leverageByKey([S]) });
   const wi = W.insts[key];
-  oracle = { key, at: W.t, ver: oracleVer, inst: f.inst, best: SW.bestTrade(f.path, W.t, wi.px), until: W.t + ORACLE_SECS * 1000 };
+  oracle = { key, at: W.t, ver: oracleVer, inst: f.inst, best: g ? { buy: { t: g.buyT, px: g.buyPx }, sell: { t: g.sellT, px: g.sellPx }, gain: g.sellPx / g.buyPx - 1 } : SW.bestTrade(f.path, W.t, wi.px), until: W.t + ORACLE_SECS * 1000 };
   return oracle;
 }
 
@@ -705,9 +816,303 @@ function oracleNote(o, inst) {
   el.hidden = false;
   const now = W.t, b = o.best;
   const when = t => (t <= now ? "now" : t - now < 60e3 ? `in ${Math.ceil((t - now) / 1000)} s` : `in ${countdown(t - now)}`);
-  el.innerHTML = b
+  const g = signals()[inst.key];
+  // the buttons stay in place between redraws, so a tap never lands on a replaced one
+  if (!el.firstElementChild?.matches(".on-t")) el.innerHTML = `<div class="on-t"></div><div class="on-b"></div>`;
+  const btns = g?.state === "held" ? `<button class="btn sm" data-jumpsell="${esc(inst.key)}">Jump to sell</button>`
+    : g ? `<button class="btn sm ghost" data-disarm="${esc(inst.key)}">Cancel</button>`
+    : b && b.sell.t > now ? `<button class="btn sm" data-doit="${esc(inst.key)}">Do it</button><button class="btn sm ghost" data-jumpbuy="${esc(inst.key)}">Jump to it</button>` : "";
+  const bel = el.querySelector(".on-b");
+  if (bel._h !== btns) { bel._h = btns; bel.innerHTML = btns; }
+  const status = g?.state === "armed" ? ` · <b class="gold">Armed</b> ${$usd(g.usd)}, buys ${when(g.buyT)}` : g ? ` · <b class="gold">${g.src === "jump" ? "Bought" : "Armed"}</b>, ${g.src === "jump" ? "SELL is" : "sells"} ${g.sellT <= now ? "now" : when(g.sellT)}` : autoOn() ? ` · <b class="gold">Auto ${CFG.oracleAuto.pct}%</b>` : "";
+  el.querySelector(".on-t").innerHTML = (b
     ? `🔮 <b>Oracle</b> · BUY ${b.buy.t <= now ? "now" : when(b.buy.t)} at ${$px(inst, b.buy.px)} · SELL = max profit ${b.sell.t <= now ? "passed" : when(b.sell.t)} at ${$px(inst, b.sell.px)} · <b class="up">${$pct(b.gain * 100, 1)}</b>`
-    : `🔮 <b>Oracle</b> · no profitable trade in the next 30 minutes: it only goes down from here.`;
+    : `🔮 <b>Oracle</b> · no profitable trade in the next 30 minutes: it only goes down from here.`) + status;
+}
+
+// ---------------------------------------------------------------- Oracle Auto, "Do it" and "Jump to it"
+// S.cheats.auto = {key: signal}. A signal: {src: auto | do | jump, state: armed | held, sym, usd, buyT, buyPx, sellT,
+// sellPx, qty}. They live in the portfolio, so they survive closing the app and go back with a Rewind.
+const signals = () => S.cheats?.auto || {};
+const autoOn = () => SIM && CFG.oracleAuto.on && C.isOn(S, "oracle");
+let fc = null;                // forecast of every coin: {t0, paths, insts, lev, plans}
+let sigStale = false;         // the future changed (Skip ahead): signals need new times
+const levSig = () => JSON.stringify(SW.leverageByKey([S]));
+const simQ = key => { const i = W.insts[key]; return i ? { px: i.px, t: W.t, liq: i.liq, quoteUsd: i.m === "fx" ? W.cur[i.quote].usd : undefined } : null; };
+
+function forecast(need) {
+  const lev = levSig();
+  if (!fc || fc.lev !== lev || W.t < fc.t0 || W.t >= fc.t0 + 5 * 60e3 || (need && W.insts[need] && !fc.paths[need]))
+    fc = { ...SW.futureAll(W, ORACLE_SECS, { keep: simKeep(), lev: SW.leverageByKey([S]) }), lev, plans: {} };
+  return fc;
+}
+/** What is left of the forecast of one coin: [[t, px]]. */
+function pathLeft(f, key) {
+  const a = f.paths[key], out = [];
+  if (a) for (let n = Math.max(0, Math.round((W.t - f.t0) / 1000)); n < a.length && a[n] > 0; n++) out.push([f.t0 + (n + 1) * 1000, a[n]]);
+  return out;
+}
+/** The next mark of a coin: {buy, sell, gain} or null. A mark in the past is replaced by the next one. */
+function planFor(f, key) {
+  const p = f.plans[key];
+  if (p === null || (p && p.buy.t >= W.t)) return p;
+  return (f.plans[key] = W.insts[key] ? SW.bestTrade(pathLeft(f, key), W.t, W.insts[key].px) : null);
+}
+/** Would this mark still win after commissions, spread and price impact? */
+function paysOff(key, best, usd) {
+  try {
+    const i = W.insts[key], inst = SW.instOf(i), q = simQ(key), t = E.newPortfolio(W.t, 1e6);
+    t.cash = usd;
+    if (S.cheats) t.cheats = { on: { zeroFees: C.isOn(S, "zeroFees"), marketMaker: C.isOn(S, "marketMaker") }, armed: {}, log: [], lev: 1 };
+    E.executeBuy(t, inst, usd, { ...q, px: best.buy.px }, W.t);
+    return E.executeSell(t, key, 1, { ...q, px: best.sell.px }, W.t).pl > 0;
+  } catch { return false; }
+}
+const autoKeys = () => (CFG.oracleAuto.scope === "all" ? Object.keys(W.insts) : ui.sheet?.kind === "inst" && W.insts[ui.sheet.key] ? [ui.sheet.key] : []);
+/** The next moment a signal has something to do (Sim time), or Infinity. */
+function autoNext() {
+  let t = Infinity;
+  for (const g of Object.values(signals())) if (g.state === "armed") t = Math.min(t, g.buyT); else if (g.src !== "jump") t = Math.min(t, g.sellT);
+  if (autoOn()) { const keys = autoKeys(), f = keys.length ? forecast(CFG.oracleAuto.scope === "view" ? keys[0] : null) : null; for (const k of keys) { if (signals()[k]) continue; const p = planFor(f, k); if (p) t = Math.min(t, p.buy.t > W.t ? p.buy.t : Infinity); } }
+  return t;
+}
+function dropSignal(key, why) {
+  const g = signals()[key];
+  delete S.cheats.auto[key];
+  if (why && g) toast(`🔮 ${esc(g.sym)}: ${why}`, "down");
+  saveSoon(0);
+}
+function signalBuy(key, g, usd) {
+  usd = Math.floor(Math.min(usd, E.available(S)) * 100) / 100;
+  if (!(usd >= 1)) throw new E.TradeError("not enough cash for the signal.");
+  const t = E.executeBuy(S, SW.instOf(W.insts[key]), usd, simQ(key), W.t, "oracle", false, { tags: ["Oracle"] });
+  const st = C.state(S);
+  (st.auto ||= {})[key] = { ...g, state: "held", qty: t.qty };
+  C.mark(S, "oracle", `Oracle bought ${t.sym} for $${usd.toFixed(2)}`, W.t);
+  return t;
+}
+function signalSell(key, g) {
+  const p = S.pos[key];
+  delete S.cheats.auto[key];
+  if (fc) delete fc.plans[key];
+  if (!p) return null;
+  const t = E.executeSell(S, key, Math.min(1, g.qty / p.qty), simQ(key), W.t, "oracle", { tags: ["Oracle"] });
+  C.mark(S, "oracle", `Oracle sold ${t.sym}`, W.t);
+  return t;
+}
+/** After a Skip ahead or a leverage change the future is another one: give every signal its new times. */
+function refreshSignals() {
+  const lev = levSig(), keys = Object.keys(signals());
+  if (!keys.length) { sigStale = false; return; }
+  if (!sigStale && S.cheats.autoLev === lev) return;
+  sigStale = false; S.cheats.autoLev = lev;
+  const f = forecast();
+  for (const key of keys) {
+    const g = signals()[key], i = W.insts[key];
+    if (!i) { dropSignal(key, "the coin is gone, so the signal was canceled."); continue; }
+    if (g.state === "armed") {
+      const b = planFor(f, key);
+      if (!b) { dropSignal(key, "the future changed and there's no profitable trade now. Signal canceled."); continue; }
+      Object.assign(g, { buyT: b.buy.t, buyPx: b.buy.px, sellT: b.sell.t, sellPx: b.sell.px });
+    } else {
+      let top = [W.t, i.px];
+      for (const x of pathLeft(f, key)) if (x[1] > top[1]) top = x;
+      g.sellT = top[0]; g.sellPx = top[1];
+    }
+  }
+}
+/** Buy and sell whatever is due at this second. Returns the trades. */
+function autoTrades() {
+  if (!SIM || !W) return [];
+  const out = [], on = autoOn();
+  if (!on && !Object.keys(signals()).length) return out;
+  refreshSignals();
+  for (const [key, g] of Object.entries(signals())) {
+    try {
+      if (!W.insts[key]) dropSignal(key, "the coin is gone, so the signal was canceled.");
+      else if (g.state === "held") {
+        if (!S.pos[key]) dropSignal(key);                       // you already sold it
+        else if (g.src !== "jump" && W.t >= g.sellT) { const t = signalSell(key, g); if (t) out.push(t); }
+      } else if (W.t >= g.sellT) dropSignal(key, "the signal is over.");
+      else if (W.t >= g.buyT) out.push(signalBuy(key, g, g.usd));
+    } catch (e) { dropSignal(key, esc(e.message)); }
+  }
+  if (on) {
+    const keys = autoKeys(), f = keys.length ? forecast(CFG.oracleAuto.scope === "view" ? keys[0] : null) : null;
+    for (const key of keys) {
+      if (signals()[key]) continue;
+      const best = planFor(f, key);
+      if (!best || best.buy.t > W.t) continue;
+      const usd = E.available(S) * CFG.oracleAuto.pct / 100;
+      if (usd < 1) break;
+      if (!paysOff(key, best, usd)) { f.plans[key] = null; continue; } // costs would eat the gain
+      try {
+        out.push(signalBuy(key, { src: "auto", sym: W.insts[key].sym, buyT: best.buy.t, buyPx: best.buy.px, sellT: best.sell.t, sellPx: best.sell.px }, usd));
+        S.cheats.autoLev = levSig();
+      } catch { f.plans[key] = null; }
+    }
+  }
+  return out;
+}
+function autoNotice(trades) {
+  if (!trades.length) return;
+  const one = t => (t.side === "buy" ? `bought ${$usd(t.usd)} of ${esc(t.sym)}` : `sold ${esc(t.sym)}: ${$usd(t.pl, { sign: true })}`);
+  toast("🔮 Oracle " + trades.slice(0, 3).map(one).join(" · ") + (trades.length > 3 ? ` · and ${trades.length - 3} more` : ""), trades.some(t => t.side === "sell" && t.pl < 0) ? "down" : "up");
+  if (!skipping) afterTrades(trades);
+  drawChartSoon();
+}
+function autoRun() { const t = autoTrades(); autoNotice(t); return t; }
+
+/** The amount for a signal: what you chose in the buy box, or 10% of your cash. */
+function signalUsd(key) {
+  const sh = ui.sheet;
+  const usd = sh?.kind === "inst" && sh.key === key && sh.amtSet && sh.amount > 0 ? sh.amount : E.available(S) * 0.1;
+  return Math.floor(Math.min(usd, E.available(S)) * 100) / 100;
+}
+function newSignal(key, src) {
+  const o = oracleFor(key), b = o?.best;
+  if (!b || signals()[key] || W.t >= b.sell.t) return null;
+  const usd = signalUsd(key);
+  if (!(usd >= 1)) { toast("Not enough cash for this signal.", "down"); return null; }
+  const st = C.state(S);
+  st.autoLev = levSig();
+  return { src, state: "armed", sym: W.insts[key].sym, usd, buyT: b.buy.t, buyPx: b.buy.px, sellT: b.sell.t, sellPx: b.sell.px };
+}
+function doIt(key) {
+  if (skipping) return;
+  const g = newSignal(key, "do");
+  if (!g) return;
+  (C.state(S).auto ||= {})[key] = g;
+  C.mark(S, "oracle", `Oracle: armed ${g.sym} with $${g.usd.toFixed(2)}`, W.t);
+  toast(`🔮 Armed: ${esc(g.sym)} with ${$usd(g.usd)}`, "gold");
+  autoRun();
+  cheatChanged(); drawChartSoon(true);
+}
+async function jumpBuy(key) {
+  if (skipping) return;
+  const g = newSignal(key, "jump");
+  if (!g) return;
+  (C.state(S).auto ||= {})[key] = g; // keeps the coin alive on the way; bought on arrival
+  C.mark(S, "oracle", `Jump to it: ${g.sym}`, W.t);
+  if (g.buyT > W.t) await jumpTo(g.buyT, `to BUY ${esc(g.sym)}`);
+  autoRun();
+  cheatChanged(); renderSheet(); drawChartSoon(true);
+}
+async function jumpSell(key) {
+  const g = signals()[key];
+  if (skipping || g?.state !== "held") return;
+  C.mark(S, "oracle", `Jump to sell: ${g.sym}`, W.t);
+  if (g.sellT > W.t) await jumpTo(g.sellT, `to SELL ${esc(g.sym)}`);
+  if (signals()[key]) try { const t = signalSell(key, signals()[key]); if (t) { celebrate(t); autoNotice([t]); } } catch (e) { toast(esc(e.message), "down"); }
+  cheatChanged(); renderSheet(); drawChartSoon(true);
+}
+/** Second by second, exactly as the Oracle played it. */
+async function jumpTo(t, label) {
+  const n = Math.round((t - W.t) / 1000);
+  if (n > 0) await playAhead([{ dt: 1, n }], `Jumping ${label}…`, true);
+}
+
+// ---------------------------------------------------------------- Rewind (cheat, Sim only)
+let FINE = [], PTS = [], lastPt = null, ptQueue = [], ptWarned = false; // PTS: [{t, key}], oldest first; FINE: [{t, base}]
+const ptKey = t => "sim.pt." + t, fineKey = t => "sim.fpt." + t;
+const ptIndex = () => ["sim.points", { pts: PTS, fine: FINE }];
+/** The save point to go back to: the newest one at or before `target`, fine or main. */
+function findPoint(target) {
+  const i = RW.pointAt(PTS, target), f = FINE[RW.pointAt(FINE, target)];
+  return f && PTS.some(p => p.t === f.base) && (i < 0 || f.t > PTS[i].t) ? { t: f.t, fine: f } : i < 0 ? null : { t: PTS[i].t };
+}
+let ptEnd = 0; // while playing ahead: where it ends (fine points only near the end)
+function addPoint(force = false) {
+  if (!W) return;
+  const last = PTS[PTS.length - 1];
+  if (last && W.t <= last.t) return;
+  if (last && !force && W.t - last.t < RW.EVERY) {
+    const lf = Math.max(last.t, FINE[FINE.length - 1]?.t || 0);
+    if (!lastPt || W.t - lf < RW.FINE_EVERY || (skipping && ptEnd - W.t > RW.FINE_KEEP)) return;
+    ptQueue.push({ ...RW.makePoint(W, S, BOTS, lastPt), fine: true });
+    FINE.push({ t: W.t, base: last.t });
+    if (!skipping) flushPoints();
+    return;
+  }
+  const p = RW.makePoint(W, S, BOTS, lastPt && lastPt.n + 1 < RW.KEY_EVERY ? lastPt : null);
+  lastPt = p;
+  PTS.push({ t: p.t, key: p.key });
+  ptQueue.push(p);
+  if (!skipping) flushPoints();
+}
+async function flushPoints() {
+  if (!ptQueue.length) return;
+  const q = ptQueue, old = RW.expired(PTS, W.t), oldF = FINE.filter(p => p.t < W.t - RW.FINE_KEEP);
+  ptQueue = [];
+  FINE = FINE.slice(oldF.length);
+  PTS = PTS.slice(old.length);
+  try { await kv.setMany([...q.map(p => [(p.fine ? fineKey : ptKey)(p.t), p]), ...old.map(p => [ptKey(p.t), undefined]), ...oldF.map(p => [fineKey(p.t), undefined]), ptIndex()]); }
+  catch (e) {
+    console.warn("Rewind point not saved", e?.message);
+    const bad = new Set(q.map(p => p.t));
+    PTS = PTS.filter(p => !bad.has(p.t)); FINE = FINE.filter(p => !bad.has(p.t)); lastPt = null; // the next one is complete, so no chain is broken
+    if (!ptWarned) { ptWarned = true; toast("⚠️ A Rewind point couldn't be saved (no space?). Your portfolio is saved apart.", "down"); }
+  }
+}
+async function loadPoints() {
+  const saved = await kv.get("sim.points"), good = x => (Array.isArray(x) ? x.filter(p => CLEAN.num(p?.t)) : []);
+  PTS = good(saved?.pts); FINE = good(saved?.fine);
+  const keep = PTS.filter(p => p.t <= W.t), gone = PTS.filter(p => p.t > W.t); // written just before a sudden close
+  const last = keep.length ? await kv.get(ptKey(keep[keep.length - 1].t)) : null;
+  if (keep.length && (!last || last.world.created !== W.created)) { await clearPoints(); }
+  else {
+    const goneF = FINE.filter(p => p.t > W.t);
+    PTS = keep; lastPt = last; FINE = FINE.filter(p => p.t <= W.t);
+    if (gone.length || goneF.length) await kv.setMany([...gone.map(p => [ptKey(p.t), undefined]), ...goneF.map(p => [fineKey(p.t), undefined]), ptIndex()]);
+  }
+  addPoint();
+}
+async function clearPoints() {
+  const old = PTS, oldF = FINE;
+  PTS = []; FINE = []; lastPt = null; ptQueue = [];
+  await kv.setMany([...old.map(p => [ptKey(p.t), undefined]), ...oldF.map(p => [fineKey(p.t), undefined]), ptIndex()]);
+}
+async function rewind(id) {
+  const ms = RW.REWINDS[id];
+  if (!SIM || !W || skipping || !ms) return;
+  if (!findPoint(W.t - ms)) { toast(PTS.length ? `No save point that far back. The oldest is ${dateTime(PTS[0].t)} (Sim).` : "There are no save points yet.", "down"); return; }
+  skipping = true;
+  const before = { W, S, BOTS, PTS, FINE, lastPt, bootAt };
+  try {
+    await flushPoints();
+    const pt = findPoint(W.t - ms);
+    if (!pt) throw new Error("that save point is gone.");
+    const j = RW.pointAt(PTS, pt.fine ? pt.fine.base : pt.t);
+    const chain = [];
+    for (const p of RW.chainOf(PTS, j)) { const r = await kv.get(ptKey(p.t)); if (!r) throw new Error("a save point is damaged."); chain.push(r); }
+    const main = chain[chain.length - 1];
+    if (pt.fine) { const r = await kv.get(fineKey(pt.t)); if (!r) throw new Error("a save point is damaged."); chain.push(r); }
+    const from = W.t, to = pt.t;
+    const back = RW.carryOver(RW.restore(chain), S, BOTS, to);
+    const gone = PTS.slice(j + 1), goneF = FINE.filter(p => p.t > to);
+    W = back.w; S = back.s; S.undoable = true; BOTS = back.bots; bootAt = W.t;
+    PTS = PTS.slice(0, j + 1); lastPt = main; FINE = FINE.filter(p => p.t <= to);
+    C.mark(S, "rewind", `Rewind ${id}: back to ${dateTime(to)} (Sim)`, W.t);
+    const keys = ["portfolio", "world", "bots"];
+    checkData(keys);
+    await kv.setMany([...keys.map(k => VALUES[k]()), ...gone.map(p => [ptKey(p.t), undefined]), ...goneF.map(p => [fineKey(p.t), undefined]), ptIndex()]);
+    W.off = W.t - Date.now(); simSavedAt = W.t;
+    fc = null; oracle = null; oracleVer++; sigStale = true; shakeAt = 0; simListAt = 0;
+    jpKeys.clear(); capSeen = -1; lastTotal = null;
+    for (const k of [...live.keys()]) if (!W.insts[k]) live.delete(k);
+    ticks.clear();
+    hideLastChance();
+    skipping = false;
+    publishSim(false);
+    if (ui.sheet?.kind === "inst" && !W.insts[ui.sheet.key]) closeSheet(true);
+    renderAll(); refreshStandings(); renderSheet(); drawChartSoon(true); showSaved(); frame();
+    toast(`⏪ Back to ${dateTime(to)} (Sim clock, −${countdown(from - to)}) ★`, "gold");
+    return { from, to };
+  } catch (e) {
+    ({ W, S, BOTS, PTS, FINE, lastPt, bootAt } = before);
+    W.off = W.t - Date.now();
+    toast(`Could not rewind: ${esc(e.message || "error")}`, "down");
+  } finally { skipping = false; }
 }
 
 /**
@@ -718,18 +1123,25 @@ function oracleNote(o, inst) {
 async function skipAhead(id) {
   const ms = SW.SKIPS[id];
   if (!SIM || !W || skipping || !ms) return;
+  const label = { "1m": "1 minute", "5m": "5 minutes", "15m": "15 minutes", "1h": "1 hour", "1d": "1 day", "1w": "1 week" }[id];
+  return playAhead(SW.skipPlan(ms), `Skipping ahead ${label}…`, false, label);
+}
+/** exact: 1-second steps that follow the Oracle (Jump to it); no summary at the end. */
+async function playAhead(plan, title, exact, label = "") {
+  addPoint(true);
   skipping = true;
   hideLastChance();
   const box = $("#skipBox");
-  const label = { "1h": "1 hour", "1d": "1 day", "1w": "1 week" }[id];
-  box.innerHTML = `<div class="skip-box"><b>⏩ Skipping ahead ${label}…</b><div class="bar"><i id="skipBar"></i></div><small id="skipTxt">Generating candles, events and the bots' moves</small></div>`;
+  box.innerHTML = `<div class="skip-box"><b>⏩ ${title}</b><div class="bar"><i id="skipBar"></i></div><small id="skipTxt">Generating candles, events and the bots' moves</small></div>`;
   box.hidden = false;
   const total0 = E.totals(S, quoteFor).total, t0 = W.t;
   const tally = { events: {}, coin: 0, pump: 0, moonshot: 0, rug: 0, cascade: 0, news: 0 };
   const mine = [], botMade = [];
   const OPEN = { open: true, since: 0 };
   const trail = trailPct();
-  const plan = SW.skipPlan(ms), steps = plan.reduce((a, x) => a + x.n, 0);
+  const steps = plan.reduce((a, x) => a + x.n, 0);
+  const endT = W.t + plan.reduce((a, x) => a + x.n * x.dt * 1000, 0);
+  ptEnd = endT;
   let done = 0, sinceBots = 0, yieldAt = performance.now();
   try {
     for (const seg of plan) {
@@ -749,13 +1161,16 @@ async function skipAhead(id) {
           const q = { px: wi.px, t: now, liq: wi.liq, quoteUsd: wi.m === "fx" ? W.cur[wi.quote].usd : undefined };
           mine.push(...E.checkKey(S, key, q, now, OPEN, { trail }));
         }
+        if (exact && W.t < endT) for (const trade of autoTrades()) mine.push({ type: "oracle", trade });
+        addPoint();
+        if (ptQueue.length >= 8) await flushPoints();
         sinceBots += seg.dt;
         if (BOTS.length && sinceBots >= 60) {
           sinceBots = 0;
           const entries = Object.values(W.insts).map(i => ({ inst: SW.instOf(i), ...SW.quote(W, i) }));
           for (const b of BOTS) {
             botCheatTick(b, now, { allowed: CFG.botCheats, quoteFor: k => { const i = W.insts[k]; return i ? { px: i.px, t: now, liq: i.liq, quoteUsd: i.m === "fx" ? W.cur[i.quote].usd : undefined } : null; } });
-            for (const t of botStep(b, { entries, now, status: () => OPEN, bootAt, extreme: botExtreme })) botMade.push([b, t]);
+            for (const t of botStep(b, { entries, now, status: () => OPEN, bootAt, extreme: botExtreme, cheats: CFG.botCheats })) botMade.push([b, t]);
           }
         }
         done++;
@@ -771,14 +1186,17 @@ async function skipAhead(id) {
     W.off = W.t - Date.now();
     skipping = false;
   }
+  flushPoints();
+  if (!exact) { sigStale = true; fc = null; }
   oracleVer++;
   publishSim(false);
   const trades = mine.filter(e => e.trade).map(e => e.trade);
   const count = type => mine.filter(e => e.type === type).length;
   for (const p of [...Object.values(S.pos), ...E.marginPositions(S)]) if (!p.jackpot && p.cost > 0) { const v = E.positionValue(S, p, quoteFor(p.key)); if (v / p.cost >= FUN.JACKPOT_X) p.jackpot = true; }
   if (trades.length) afterTrades(trades); else saveSoon(0);
-  if (botMade.length) saveBots();
+  if (botMade.length) saveBots(false);
   saveWorld(); simSavedAt = W.t;
+  if (exact) { box.hidden = true; renderBanners(); renderView(); refreshStandings(); frame(); return { tally, mine, botMade }; }
   const total1 = E.totals(S, quoteFor).total;
   const evs = Object.entries(tally.events).map(([k, n]) => esc(k) + (n > 1 ? ` ×${n}` : "")).join(", ") || "none";
   const yours = [[count("fill"), "order filled", "orders filled"], [count("sl"), "stop loss", "stop losses"], [count("tp"), "take profit", "take profits"], [count("trail"), "trailing stop", "trailing stops"], [count("liq"), "liquidation", "liquidations"], [count("cancel"), "order canceled", "orders canceled"]]
@@ -844,20 +1262,19 @@ function recordsHTML() {
 }
 
 // ---------------------------------------------------------------- rival bots
-const saveBots = () => kv.set(K("bots"), { v: 1, list: BOTS }).catch(() => {});
 
 /** Every bot takes a turn with the live prices the app has right now. Only while the app is on screen. */
 function botTick(now = appNow()) {
-  if (!BOTS.length || (document.hidden && !TEST)) return [];
+  if (!BOTS.length || skipping || (document.hidden && !TEST)) return [];
   const entries = [...live.values()].map(L => ({ ...L, inst: L.inst }));
   const made = [];
   let cheated = 0;
   for (const b of BOTS) {
     cheated += botCheatTick(b, now, { allowed: CFG.botCheats, quoteFor }).length;
-    const trades = botStep(b, { entries, now, status: m => mstatus(m, now), bootAt: TEST ? 0 : bootAt, extreme: botExtreme });
+    const trades = botStep(b, { entries, now, status: m => mstatus(m, now), bootAt: TEST ? 0 : bootAt, extreme: botExtreme, cheats: CFG.botCheats });
     for (const t of trades) made.push([b, t]);
   }
-  if (made.length || cheated) saveBots();
+  if (made.length || cheated) saveBots(false);
   refreshStandings();
   if (ui.sheet?.kind === "bot") renderSheet();
   return made;
@@ -893,15 +1310,49 @@ function leaderboardHTML() {
       <span class="ico ico-rank" aria-label="Rank ${i + 1}">${medal[i] || i + 1}</span>
       <span class="nm"><b>${esc(x.name)}${x.cheat ? ` <span class="star" title="Cheats used">★</span>` : ""}${x.style && !x.name.startsWith(STYLES[x.style].name) ? ` <i class="mk-tag">${STYLES[x.style].name}</i>` : ""}</b><small>${tr("Best", x.best)}</small><small>${tr("Worst", x.worst)}</small>${x.id !== "me" && C.isOn(S, "xray") ? `<small class="xray">${xrayText(x.id)}</small>` : ""}</span>
       <span class="px"><b>${$usd(x.total)}</b><small class="${dirCls(x.pl)}">${$pct(x.plPct * 100)}</small></span>
-    </button>`).join("")}</div>`;
+    </button>${x.id !== "me" && C.isOn(S, "xray") ? frontBtns(x.id) : ""}`).join("")}</div>${BOTS.length && C.isOn(S, "xray") ? frontPctHTML() : ""}`;
+}
+const frontPctHTML = () => `<div class="chips front-pct"><small>Front-run with</small>${[5, 10, 25, 50, 100].map(n => `<button data-frpct="${n}" aria-pressed="${CFG.frontPct === n}">${n}%</button>`).join("")}<small>of your cash</small></div>`;
+function nextMoves(b) {
+  return botPreview(b, { entries: [...live.values()], now: appNow(), status: m => mstatus(m, appNow()), bootAt: TEST ? 0 : bootAt });
+}
+/** Front-run / Sell first, next to a bot's X-ray line. */
+function frontBtns(id) {
+  const b = BOTS.find(x => x.id === id);
+  if (!b) return "";
+  const v = nextMoves(b), out = [];
+  if (v.buy) out.push(`<button class="btn sm" data-front="${esc(id)}" data-key="${esc(v.buy.key)}">Front-run ${esc(v.buy.sym)}</button>`);
+  for (const s of v.sells) out.push(`<button class="btn sm ghost" data-sellfirst="${esc(id)}" data-key="${esc(s.key)}" ${S.pos[s.key] ? "" : "disabled"}>Sell first ${esc(s.sym)}</button>`);
+  return out.length ? `<div class="front">${out.join("")}</div>` : "";
+}
+/** Buy (or sell) the coin of the bot's next move right now, before it does. */
+function frontRun(id, sell, key) {
+  const b = BOTS.find(x => x.id === id), inst = instOf(key);
+  if (!b || !inst || !C.isOn(S, "xray") || skipping) return;
+  try {
+    const now = appNow(), q = quoteFor(key);
+    if (!mstatus(inst.m, now).open) throw new E.TradeError("The market is closed.");
+    const opts = { tags: [sell ? "Sell first" : "Front-run"] };
+    let t;
+    if (sell) {
+      if (!S.pos[key]) throw new E.TradeError("You don't hold this coin.");
+      t = E.executeSell(S, key, 1, q, now, "front", opts);
+    } else {
+      const usd = Math.floor(E.available(S) * CFG.frontPct) / 100;
+      if (!(usd >= 1)) throw new E.TradeError("Not enough cash.");
+      t = E.executeBuy(S, inst, usd, q, now, "front", false, opts);
+    }
+    C.mark(S, "xray", sell ? `Sold ${t.sym} before ${b.name}` : `Front-ran ${b.name} on ${t.sym}`, now);
+    toast(sell ? `🩻 Sold ${esc(t.sym)} before ${esc(b.name)}: ${$usd(t.pl, { sign: true })}` : `🩻 Bought ${$usd(t.usd)} of ${esc(t.sym)} before ${esc(b.name)}`, "up");
+    afterTrades([t]); refreshStandings();
+  } catch (e) { toast(esc(e.message), "down"); }
 }
 
 /** X-ray: a dry run of the bot's next turn with the live prices the app has now. */
 function xrayText(id) {
   const b = BOTS.find(x => x.id === id);
   if (!b) return "";
-  const now = appNow();
-  const v = botPreview(b, { entries: [...live.values()], now, status: m => mstatus(m, now), bootAt: TEST ? 0 : bootAt });
+  const v = nextMoves(b);
   const parts = v.sells.map(x => `sell ${esc(x.sym)} (${esc(x.why)})`);
   if (v.buy) parts.push(`buy ${esc(v.buy.sym)} ~${$usd0(Math.round(v.buy.usd))} (${esc(v.buy.why)})${v.wait > 0 ? ` in ${Math.ceil(v.wait / 1000)} s` : ""}`);
   return "🩻 " + (parts.length ? "Next: " + parts.join(" · ") : "Nothing it would buy right now");
@@ -952,8 +1403,8 @@ function botSheetHTML(b) {
     <div class="sh-body">
       <div class="big">${$usd(x.total)}</div>
       <div class="chg"><span class="${dirCls(x.pl)}">${$usd(x.pl, { sign: true })} (${$pct(x.plPct * 100)})</span> from ${$usd0(b.pf.start)}</div>
-      <p class="foot">${esc(STYLES[b.style].desc)} It trades only while the app is open, with the same costs and market hours as you. ${CFG.botCheats ? "It arms up to 3 cheats a day from the bots' list (Settings → Rival bots)." : "Bot cheats are off in Settings."}${E.isCheated(b.pf) ? ` ★ It has cheated: ${esc((b.pf.cheats.log || []).slice(-3).map(x => x.text).join(" · "))}` : ""}</p>
-      ${C.isOn(S, "xray") ? `<p class="xray card">${xrayText(b.id)}</p>` : ""}
+      <p class="foot">${esc(STYLES[b.style].desc)} It trades only while the app is open, with the same costs and market hours as you. ${CFG.botCheats ? "It arms cheats from the bots' list (Settings → Rival bots) whenever they suit it; Money printer once a day." : "Bot cheats are off in Settings."}${E.isCheated(b.pf) ? ` ★ It has cheated: ${esc((b.pf.cheats.log || []).slice(-3).map(x => x.text).join(" · "))}` : ""}</p>
+      ${C.isOn(S, "xray") ? `<p class="xray card">${xrayText(b.id)}</p>${frontBtns(b.id)}${frontPctHTML()}` : ""}
       <div class="sb-grid card">
         <div><small>Cash</small><b>${$usd(b.pf.cash)}</b></div>
         <div><small>Win rate</small><b>${x.winRate == null ? "—" : Math.round(x.winRate * 100) + "%"}</b><small>${x.closed} closed</small></div>
@@ -985,7 +1436,7 @@ function botsSettingsHTML() {
       <p class="mut">Each bot gets its own portfolio, as big as yours (${$usd0(S.start)}), and decides by itself what to buy, how much and when to sell, with your same costs and market hours. Bots trade only while the app is open: nothing is made up for the time it was closed.</p>
       ${BOTS.map(b => { const x = standing(b.pf, quoteFor); return `<div class="bot-row"><span class="nm"><b>${esc(b.name)}</b><small>${STYLES[b.style].name} · ${$usd(x.total)} · <span class="${dirCls(x.pl)}">${$pct(x.plPct * 100)}</span></small></span><button class="btn ghost sm" data-delbot="${esc(b.id)}">Remove</button></div>`; }).join("")}
       <label class="tog"><input type="checkbox" id="botCheatsTog" ${CFG.botCheats ? "checked" : ""}><span>Bots can cheat</span></label>
-      <small class="mut">Each bot arms up to 3 cheats a day, at random: ${BOT_CHEATS.map(c => c.name).join(", ")}. Never Undo, Ghost trade, Oracle, X-ray, Time machine, Skip ahead or Always on. A bot that cheats gets a ★ on the leaderboard, and its cheats show in Rival moves.</small>
+      <small class="mut">Each bot arms cheats whenever they suit it, with no daily limit (Money printer: once a day): ${BOT_CHEATS.map(c => c.name).join(", ")}. Never Undo, Ghost trade, Oracle, X-ray, Time machine, Skip ahead or Always on. A bot that cheats gets a ★ on the leaderboard, and its cheats show in Rival moves.</small>
       <p class="lbl">Add a bot${full ? ` (max ${MAX_BOTS})` : ""}</p>
       <div class="bot-add">${STYLE_IDS.map(id => `<button class="bot-style" data-addbot="${id}" ${full ? "disabled" : ""}><b>+ ${STYLES[id].name}</b><small>${esc(STYLES[id].desc)}</small></button>`).join("")}</div>`;
 }
@@ -1168,12 +1619,12 @@ function renderBanners() {
   const out = [];
   const now = appNow();
   if (SIM) {
-    if (usingMemory()) out.push(["warn", "This browser won't let the app save data on the phone (private mode?)."]);
+    out.push(...saveBanners());
     $("#banners").innerHTML = simEventHTML() + out.map(([k, h]) => `<div class="banner ${k}" role="status">${h}</div>`).join("");
     return;
   }
   if (offline()) out.push(["warn", "Offline: you're seeing your portfolio and history with the last saved prices. Orders are checked as soon as the connection is back."]);
-  if (usingMemory()) out.push(["warn", "This browser won't let the app save data on the phone (private mode?). Export your portfolio in Settings before closing."]);
+  out.push(...saveBanners());
   const f = src.finnhub?.err;
   if (CFG.finnhubKey && f && !offline()) {
     if (f.kind === "auth") out.push(["err", `Finnhub rejected your key. Check it in <button class="lnk" data-settings>Settings</button>. Stocks are using the last saved price.`]);
@@ -1611,7 +2062,8 @@ function renderSheet() {
       <canvas id="chart" aria-label="${esc(inst.sym)} chart"></canvas>
       <div class="chart-note" id="chartNote">${esc(chart?.note || "")}</div>
       ${SIM ? `<div class="oracle-note" id="oracleNote"></div>` : ""}
-      <div class="skip${SIM ? "" : " off"}" role="group" aria-label="Skip ahead"><span>⏩ Skip ahead${SIM ? "" : ` <small class="sim-only">Sim only</small>`}</span>${Object.keys(SW.SKIPS).map(k => `<button class="btn sm ghost" data-skip="${k}" ${SIM ? "" : "disabled"}>+${k}</button>`).join("")}</div>
+      <div class="skip${SIM ? "" : " off"}" role="group" aria-label="Skip ahead"><span>⏩ Skip ahead${SIM ? "" : ` <small class="sim-only">Sim only</small>`}</span><div class="skip-row">${Object.keys(SW.SKIPS).map(k => `<button class="btn sm ghost" data-skip="${k}" ${SIM ? "" : "disabled"}>+${k}</button>`).join("")}</div></div>
+      <div class="skip${SIM ? "" : " off"}" role="group" aria-label="Rewind"><span>⏪ Rewind ★${SIM ? "" : ` <small class="sim-only">Sim only</small>`}</span><div class="skip-row">${Object.keys(RW.REWINDS).map(k => `<button class="btn sm ghost" data-rewind="${k}" ${SIM ? "" : "disabled"}>−${k}</button>`).join("")}</div></div>
       ${statsFor(inst, L)}`}
       ${posHTML}
       ${marginCardHTML(key)}
@@ -1738,7 +2190,7 @@ function bindTradeBox() {
   const upd = () => { const r = tradePreview(); const qd = $("#quote"); if (qd) qd.innerHTML = r.html; setSwipeEnabled(box, r.ok); };
   upd();
   const amt = $("#amtIn"), lim = $("#limIn");
-  if (amt) amt.oninput = () => { ui.sheet.amount = +amt.value; $$(".chips.amt button").forEach(b => b.setAttribute("aria-pressed", "false")); upd(); };
+  if (amt) amt.oninput = () => { ui.sheet.amtSet = true; ui.sheet.amount = +amt.value; $$(".chips.amt button").forEach(b => b.setAttribute("aria-pressed", "false")); upd(); };
   if (lim) lim.oninput = () => { ui.sheet.limit = +lim.value; upd(); };
   bindSwipe(box, submitTrade);
   box._upd = upd;
@@ -1860,7 +2312,10 @@ function cheatsHTML() {
       <small class="mut">A separate replay portfolio of ${$usd0(S.start)}: your ${SIM ? "Sim" : "real"} one is not touched.${SIM ? " Sim history: minutes older than 6 hours are filled in from each hour's candle." : CFG.twelveKey ? "" : " Stocks and forex need the Twelve Data key."}</small>`
       : `<small class="mut">Waiting for the market lists…</small>`,
     timeSkip: `<small class="mut">Inside a Time machine replay: “+1 hour” and “+1 day”.</small>`,
-    oracle: SIM ? `<small class="mut">${C.isOn(S, "oracle") ? "🔮 On: open any Sim coin and its chart shows the next 30 minutes, faded, with BUY and SELL = max profit." : "Turn it on, then open any Sim coin."}</small>` : `<small class="sim-only">Sim only</small> <small class="mut">The real future isn't known: switch to Sim at the top of the screen.</small>`,
+    oracle: SIM ? `<small class="mut">${C.isOn(S, "oracle") ? "🔮 On: open any Sim coin and its chart shows the next 30 minutes, faded, with BUY and SELL = max profit." : "Turn it on, then open any Sim coin."}</small>
+      <label class="tog"><input type="checkbox" id="oaTog" ${CFG.oracleAuto.on ? "checked" : ""}><span>Oracle Auto: buy at BUY and sell at SELL by itself</span></label>
+      <label class="sel">Use <input id="oaPct" type="number" inputmode="decimal" min="1" max="100" step="1" value="${CFG.oracleAuto.pct}"> % of your cash each time</label>
+      <div class="chips">${[["view", "The coin I'm viewing"], ["all", "Every coin with a mark"]].map(([k, l]) => `<button data-oascope="${k}" aria-pressed="${CFG.oracleAuto.scope === k}">${l}</button>`).join("")}</div>` : `<small class="sim-only">Sim only</small> <small class="mut">The real future isn't known: switch to Sim at the top of the screen.</small>`,
     copycat: leader ? `<button class="btn sm ghost" data-copycat="${esc(leader.id)}">Copy ${esc(leader.name)} (${$usd(leader.total)}, ${$pct(leader.plPct * 100)})</button>` : `<small class="mut">Add a rival bot first (Settings → Rival bots).</small>`,
   };
   const groups = [...new Set(C.CHEATS.map(c => c.group))];
@@ -2246,11 +2701,13 @@ async function importBackup(file) {
     const text = await file.text();
     const d = parseBackup(text);
     S = d.portfolio; S.undoable = true;
+    if (SIM) { await clearPoints(); addPoint(); }
     if (d.achievements) A = mergeAchievements(A, d.achievements);
-    if (d.bots) { BOTS = d.bots; saveBots(); }
+    if (d.bots) BOTS = d.bots;
     const keep = { finnhubKey: CFG.finnhubKey, twelveKey: CFG.twelveKey };
     CFG = { ...DEFAULT_CFG, ...d.settings, ...keep, notif: { ...DEFAULT_CFG.notif, ...(d.settings.notif || {}) } };
-    await Promise.all([flushSave(), saveAch(), saveCfg()]);
+    DUE.add("portfolio"); DUE.add("bots"); DUE.add("achievements");
+    if (!(await saveCfg())) throw new Error("The backup was read but could not be saved.");
     toast(`Backup imported: ${plural(Object.keys(S.pos).length, "position", "positions")}, ${plural(S.trades.length, "trade", "trades")}${BOTS.length ? ", " + plural(BOTS.length, "bot", "bots") : ""}`, "up");
     closeSheet();
     renderAll();
@@ -2322,6 +2779,25 @@ function onClick(e) {
   if (d.lcsell !== undefined) { lastChanceSell(); return; }
   if (d.lckeep !== undefined) { hideLastChance(); return; }
   if (d.skip) { skipAhead(d.skip); return; }
+  if (d.rewind) {
+    if (!t.dataset.sure) {
+      if (!findPoint((W?.t || 0) - RW.REWINDS[d.rewind])) { rewind(d.rewind); return; }
+      t.dataset.sure = "1"; t.textContent = `Sure? −${d.rewind}`;
+      toast("Everything in Sim since then is lost. Tap again to rewind.");
+      setTimeout(() => { if (t.isConnected) { delete t.dataset.sure; t.textContent = `−${d.rewind}`; } }, 4000);
+      return;
+    }
+    delete t.dataset.sure; t.textContent = `−${d.rewind}`;
+    rewind(d.rewind); return;
+  }
+  if (d.doit) { doIt(d.doit); return; }
+  if (d.jumpbuy) { jumpBuy(d.jumpbuy); return; }
+  if (d.jumpsell) { jumpSell(d.jumpsell); return; }
+  if (d.disarm) { dropSignal(d.disarm); oracleVer++; toast("Signal canceled"); drawChartSoon(true); return; }
+  if (d.oascope) { CFG.oracleAuto.scope = d.oascope; saveCfg(); cheatChanged(); return; }
+  if (d.frpct) { CFG.frontPct = +d.frpct; saveCfg(); refreshStandings(); renderSheet(); return; }
+  if (d.front) { frontRun(d.front, false, d.key); return; }
+  if (d.sellfirst) { frontRun(d.sellfirst, true, d.key); return; }
   if (d.skipok !== undefined) { $("#skipBox").hidden = true; return; }
   if (d.bot) { openBot(d.bot); return; }
   if (d.cheats !== undefined) { openPanel({ kind: "cheats" }); return; }
@@ -2371,6 +2847,7 @@ function onClick(e) {
   if (d.back !== undefined) { ui.sheet.side = null; $("#tradeBox").innerHTML = tradeBoxHTML(); bindTradeBox(); return; }
   if (d.type) { ui.sheet.type = d.type; $("#tradeBox").innerHTML = tradeBoxHTML(); bindTradeBox(); return; }
   if (d.amt) {
+    ui.sheet.amtSet = true;
     ui.sheet.amount = d.amt === "max" ? Math.floor(E.available(S) * 100) / 100 : +d.amt;
     $("#tradeBox").innerHTML = tradeBoxHTML(); bindTradeBox(); return;
   }
@@ -2398,6 +2875,9 @@ function onClick(e) {
     saveCfg(); src[d.delkey === "fhKey" ? "finnhub" : "twelvedata"] = {}; renderSheet(); renderBanners(); renderView(); return;
   }
   if (d.askperm !== undefined) { askPermission().then(() => renderSheet()); return; }
+  if (d.savenow !== undefined) { flushSave(); return; }
+  if (d.reload !== undefined) { location.reload(); return; }
+  if (d.issuesok !== undefined) { loadIssues = []; renderBanners(); return; }
   if (d.export !== undefined) { exportBackup(); return; }
   if (d.install !== undefined) { installPrompt?.prompt(); installPrompt = null; return; }
   if (d.start) {
@@ -2415,6 +2895,7 @@ function onClick(e) {
     }
     S = E.newPortfolio(appNow(), start); S.undoable = true; saveSoon(0);
     resetBots(S.start, appNow());
+    if (SIM) clearPoints().then(() => addPoint()).catch(e => console.warn(e?.message));
     CFG.lastBuy = defaultBuy(S.start); saveCfg();
     toast(`Portfolio reset: ${$usd0(S.start)}. Your achievements stay.`, "up");
     closeSheet(); renderAll(); return;
@@ -2494,6 +2975,15 @@ function onChange(e) {
   if (t.id === "lcTrail") { CFG.lc.trail = t.checked; saveCfg(); toast(t.checked ? `Trailing stop on: it sells at −${CFG.lc.pct}% from the high since you bought.` : "Trailing stop off."); for (const k of trackedKeys()) runChecks(k); return; }
   if (t.dataset.cheat === "oracle" && !SIM) { t.checked = false; toast("Oracle works only in Sim mode.", "down"); return; }
   if (t.dataset.cheat) { C.setToggle(S, t.dataset.cheat, t.checked, appNow()); if (t.checked) toast(`${C.CHEAT[t.dataset.cheat].icon} ${C.CHEAT[t.dataset.cheat].name} on`, "gold"); cheatChanged(); return; }
+  if (t.id === "oaTog") {
+    CFG.oracleAuto.on = t.checked; saveCfg();
+    if (t.checked && !C.isOn(S, "oracle")) C.setToggle(S, "oracle", true, appNow());
+    if (t.checked) C.mark(S, "oracle", "Oracle Auto on", appNow());
+    else for (const [k, g] of Object.entries(signals())) if (g.src === "auto") delete S.cheats.auto[k];
+    toast(t.checked ? "🔮 Oracle Auto on" : "Oracle Auto off: what it bought stays yours.", t.checked ? "gold" : "");
+    cheatChanged(); return;
+  }
+  if (t.id === "oaPct") { const v = +t.value; if (v >= 1 && v <= 100) { CFG.oracleAuto.pct = v; saveCfg(); } else { t.value = CFG.oracleAuto.pct; toast("Choose between 1% and 100%.", "down"); } return; }
   if (t.id === "simSoundTog") { CFG.simSound = t.checked; saveCfg(); if (t.checked) sounds.pump(); return; }
   if (t.id === "soundTog") { CFG.sound = t.checked; saveCfg(); if (t.checked) sounds.tap(); return; }
   if (t.id === "importIn" && t.files?.[0]) importBackup(t.files[0]);
@@ -2541,13 +3031,12 @@ async function boot() {
   await openStore(TEST ? "ghost-desk-test" : undefined);
   SIM = (await kv.get("mode")) === "sim";
   document.body.classList.toggle("sim", SIM);
-  S = (await kv.get(K("portfolio"))) || E.newPortfolio(appNow());
-  S.margin ||= {}; S.undoable = true;
-  A = (await kv.get(K("achievements"))) || newAchievements();
-  const savedBots = await kv.get(K("bots"));
-  BOTS = Array.isArray(savedBots?.list) ? savedBots.list : [];
-  const saved = (await kv.get("settings")) || {};
-  CFG = { ...DEFAULT_CFG, ...saved, notif: { ...DEFAULT_CFG.notif, ...(saved.notif || {}) } };
+  const now0 = Date.now();
+  S = await loadClean(K("portfolio"), (v, is) => (v == null ? null : CLEAN.cleanPortfolio(v, now0, is))) || E.newPortfolio(appNow());
+  S.undoable = true;
+  A = await loadClean(K("achievements"), (v, is) => CLEAN.cleanAchievements(v, now0, is));
+  BOTS = await loadClean(K("bots"), (v, is) => CLEAN.cleanBots(v == null ? null : v.list ?? v, now0, is));
+  CFG = await loadClean("settings", (v, is) => CLEAN.cleanSettings(v, DEFAULT_CFG, is));
   for (const p of [...Object.values(S.pos), ...E.marginPositions(S)]) if (!live.get(p.key) && p.lastPx) live.set(p.key, { inst: { ...p.inst }, px: null });
   const h = location.hash.slice(1);
   if (TABS.includes(h)) ui.tab = h;
@@ -2569,12 +3058,16 @@ async function boot() {
   addEventListener("resize", () => drawChartSoon());
   addEventListener("beforeinstallprompt", e => { e.preventDefault(); installPrompt = e; });
   document.addEventListener("visibilitychange", () => {
-    if (document.hidden) { flushSave(); if (SIM) saveWorld(); return; }
+    if (document.hidden) { saveOnExit(); return; }
     for (const n in loops) kick(n);
     renderAll();
   });
-  addEventListener("pagehide", () => { flushSave(); if (SIM) saveWorld(); });
+  addEventListener("pagehide", saveOnExit);
   if (SIM) await loadSim();
+  // Ask the browser not to clear this data on its own (some only grant it after a tap).
+  const persist = () => navigator.storage?.persist?.().catch(() => false);
+  persist();
+  document.addEventListener("click", persist, { once: true });
   renderAll();
   setInterval(secondTick, 1000);
   if (TEST) { setupTestHooks(); return; }
@@ -2591,7 +3084,7 @@ function setupTestHooks() {
     showJackpot: (sym, mult, gain) => showJackpot(sym, mult, gain, appNow()),
     openCheats: () => openPanel({ kind: "cheats" }), startReplay, replay: () => ui.replay, rpTick, runChecks, ticks,
     chooseSide: side => $(`[data-side="${side}"]`)?.click(),
-    lists, live,
+    lists, live, kv, saveSoon, saveOnExit, rewind, points: () => PTS, signals, doIt, jumpBuy, jumpSell, frontRun, nextMoves, forecast, SAVE: flushSave, refreshStandings,
   };
   document.documentElement.dataset.ready = "1";
 }

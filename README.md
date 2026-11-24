@@ -105,15 +105,15 @@ picks up the new version. If you change app files, also bump the `VERSION` strin
   candles (Binance/Coinbase, GeckoTerminal, Twelve Data). Using any cheat marks your portfolio
   with a ★ on the leaderboard and in the history, and achievements earned with cheats are kept apart (earning one
   again without cheats moves it back). Resetting the portfolio removes the star. Cheats work the same in Live and
-  Sim, except Oracle and Skip ahead, which exist only in Sim (in Live they show off, marked "Sim only").
+  Sim, except Oracle, Rewind and Skip ahead, which exist only in Sim (in Live they show off, marked "Sim only").
 - **Always on**: the one-shot cheats (Golden entry, Perfect exit, Sniper, 2x Lucky trade, Ghost trade, Insurance,
   Double or nothing) have an "Always on" switch that arms them again after every trade; those cards show an
   ALWAYS ON tag and the list sits at the top of the Cheats menu.
 - **Double or nothing**: heads doubles the profit of your last winning sale; tails drops the whole portfolio (cash,
   positions, leveraged positions, waiting orders) to $100. A confirmation screen ("If you lose, your whole portfolio
   drops to $100") comes before every flip, also after every win when it's Always on.
-- **Bots cheat too** (Settings → Rival bots → "Bots can cheat", on by default): each bot arms up to 3 cheats a day at
-  random: Zero fees for 1 hour, Insurance 50%, 2x Lucky trade, Rug shield 20% for 1 hour, Golden entry (15-minute
+- **Bots cheat too** (Settings → Rival bots → "Bots can cheat", on by default): each bot arms cheats
+  whenever they suit its next trade, with no daily limit (Money printer: once a day per bot): Zero fees for 1 hour, Insurance 50%, 2x Lucky trade, Rug shield 20% for 1 hour, Golden entry (15-minute
   low), Perfect exit, Leverage 10x or 20x, Money printer 10% of its balance. Never Undo, Ghost trade, Oracle, X-ray,
   Time machine, Skip ahead or Always on. Their cheats show in Rival moves and give their row a ★.
 - **Money cap**: no portfolio (Live, Sim or a bot's) can be worth more than the combined fortune of the world's 100
@@ -131,8 +131,15 @@ picks up the new version. If you change app files, also bump the `VERSION` strin
   when a position reaches 10x. Sim sounds are off until you turn them on in Settings. Sim has its own portfolio,
   bots, achievements and records table (best multiplier, biggest jackpot, worst rug, longest streak), with the same
   costs, orders, bots and cheats as Live. Nothing in Sim is real. The Sim world only moves while the app is open.
-- **Skip ahead** (Sim only, +1h / +1d / +1w under the chart): plays the whole Sim world forward: candles, events,
+- **Skip ahead** (Sim only, +1m / +5m / +15m / +1h / +1d / +1w under the chart): plays the whole Sim world forward: candles, events,
   new coins, rugs and the bots' trades; your limit orders, stop loss, take profit and trailing stop fill on the way.
+- **Rewind** (cheat, Sim only, -1m / -5m / -15m / -1h / -1d / -1w next to Skip ahead): the Sim world, your Sim portfolio and the bots go
+  back to a save point (every 15 Sim minutes and before every jump, up to 1 week; every 20 seconds in the last 20 minutes). Your cheat switches and the star stay.
+- **Oracle Auto** (in the Oracle card): buys at BUY and sells at SELL by itself, with a % of your cash, on the coin
+  you're viewing or on all of them; marks that costs would turn into a loss are left alone. **Do it** arms one signal;
+  **Jump to it** plays the Sim to BUY, and **Jump to sell** to SELL.
+- **Front-run / Sell first** (with X-ray): buy or sell what a bot is about to trade, before it does.
+- **Saving**: after every change and when the app is hidden or closed; damaged data is repaired piece by piece.
 - **Oracle** (cheat, Sim only): plays the next 30 minutes of the coin you're viewing on a copy of the Sim world and
   marks BUY and SELL = max profit on the chart; that future then happens exactly, unless you change it (leverage).
 - **Last chance** (Live and Sim, Settings): after a buy the app follows the high since your buy; at −X% from it

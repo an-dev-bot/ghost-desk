@@ -12,6 +12,7 @@ Extra modes against the real price sources (4th argument):
   sim      the real app in Sim mode for 40 s with its own clock, then a reload: the Sim world continues
   cheats   the real app: Time machine on yesterday's real BTC candles, Golden entry and Sniper on real prices
   bots     the real app with 4 rival bots for ~2 minutes on real prices: what they trade and why
+  persist  (also part of the normal run) changes, the browser killed at once, opened again: all saved
   badkeys  wrong Finnhub / Twelve Data keys: clear notices, nothing blank, nothing cached
   tddemo   Twelve Data's public "demo" key: real EUR/USD candles, saved and reused without a credit
 """
@@ -95,6 +96,8 @@ async def main():
             await p.send("Runtime.enable")
             if MODE == "live":
                 ok = await live_check(p)
+            elif MODE == "persist":
+                ok = await persist_tests()
             elif MODE == "badkeys":
                 ok = await bad_keys_check(p)
             elif MODE == "tddemo":
@@ -110,11 +113,127 @@ async def main():
             else:
                 ok1 = await unit_tests(p)
                 ok2 = await layout_tests(p)
-                ok = ok1 and ok2
+                ok3 = await persist_tests()
+                ok = ok1 and ok2 and ok3
             pump.cancel()
             return ok
     finally:
         proc.terminate()
+
+
+async def persist_tests():
+    """Make changes, kill the whole browser at once (no pagehide, no goodbye) and open it again with the same profile."""
+    port, fails = PORT + 1, []
+    prof = tempfile.mkdtemp(prefix="gd-persist-")
+    url = BASE + "/index.html?test=1#home"
+    ready = "document.documentElement.dataset.ready === '1'"
+
+    def res(good, text):
+        print(("PASS " if good else "FAIL ") + " " + text)
+        if not good:
+            fails.append(text)
+
+    async def session(fn):
+        proc = subprocess.Popen([CHROME, "--headless=new", "--disable-gpu", "--no-first-run", "--no-default-browser-check",
+                                 f"--remote-debugging-port={port}", f"--user-data-dir={prof}", "about:blank"],
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        pump = None
+        try:
+            for _ in range(80):
+                try:
+                    urllib.request.urlopen(f"http://127.0.0.1:{port}/json/version", timeout=1)
+                    break
+                except Exception:
+                    time.sleep(0.25)
+            req = urllib.request.Request(f"http://127.0.0.1:{port}/json/new?about:blank", method="PUT")
+            target = json.load(urllib.request.urlopen(req))
+            async with websockets.connect(target["webSocketDebuggerUrl"], max_size=50_000_000) as ws:
+                p = Page(ws)
+                pump = asyncio.create_task(p.pump())
+                await p.send("Page.enable")
+                await p.send("Runtime.enable")
+                await p.goto(url, ready)
+                r = await fn(p)
+                proc.kill()  # TerminateProcess / SIGKILL on the browser
+                pump.cancel()
+                return r
+        finally:
+            proc.kill()
+            proc.wait()
+            await asyncio.sleep(1)
+
+    CHANGE = """(() => { const g = ghostDesk, s = g.state(), now = g.appNow();
+      const key = g.isSim() ? g.lists.crypto[0] : 'crypto:BTCUSDT';
+      const inst = g.isSim() ? g.SW.instOf(g.sim().insts[key]) : { key, m: 'crypto', id: 'BTCUSDT', sym: 'BTC', name: 'Bitcoin' };
+      if (!g.isSim()) g.setLive(inst, { px: 60000, t: now });
+      const t = g.E.executeBuy(s, inst, 500, { px: g.live.get(key).px, t: now }, now);
+      g.afterTrades([t]);
+      // prices keep coming while the save is due (they used to postpone it forever)
+      setInterval(() => g.runChecks(key), 50);
+      g.openCheats(); const c = document.querySelector('[data-cheat=zeroFees]'); c.checked = true; c.dispatchEvent(new Event('change', { bubbles: true }));
+      g.openSettings(); const i = document.getElementById('lcTrail'); i.checked = !i.checked; i.dispatchEvent(new Event('change', { bubbles: true }));
+      g.addBot('momentum');
+      return true; })()"""
+    LOOK = """(() => { const g = ghostDesk, s = g.state(); return { sim: g.isSim(), cash: s.cash, pos: Object.keys(s.pos), trades: s.trades.length,
+      fees: !!s.cheats?.on?.zeroFees, trail: g.cfg().lc.trail, bots: g.bots().length, banners: document.getElementById('banners').innerText, t: g.sim()?.t || 0 }; })()"""
+
+    async def change(p):
+        await p.js(CHANGE)
+        await asyncio.sleep(0.8)
+        pill = await p.js("!document.getElementById('saved').hidden")
+        return {**await p.js(LOOK), "pill": pill}
+
+    async def change_sim(p):
+        await p.js("document.getElementById('simBtn').click(), true")
+        for _ in range(60):
+            await asyncio.sleep(0.25)
+            try:
+                if await p.js("ghostDesk.isSim() && " + ready):
+                    break
+            except Exception:
+                pass
+        await asyncio.sleep(0.5)
+        return await change(p)
+
+    async def look(p):
+        return await p.js(LOOK)
+
+    same = ["sim", "cash", "pos", "trades", "fees", "trail", "bots"]
+    for name, fn in [("Live", change), ("Sim", change_sim)]:
+        a = await session(fn)
+        b = await session(look)
+        good = a["trades"] == 1 and a["pos"] and all(a[k] == b[k] for k in same) and not b["banners"].count("damaged") and abs(b["t"] - a["t"]) < 15000
+        res(good, f"{name}: changes, browser killed, opened again: " + ("all there " if good else "LOST ") + json.dumps({k: b[k] for k in same}) + ("" if good else " expected " + json.dumps(a)))
+        res(a["pill"], f"{name}: “Saved” indicator shown")
+
+    async def faults(p):
+        out = {}
+        # a dropped connection (iOS in the background): it reopens on its own and saves
+        out["drop"] = await p.js("""(async () => { const T = IDBDatabase.prototype.transaction; let n = 0;
+          IDBDatabase.prototype.transaction = function (...a) { if (!n++) throw new DOMException('Connection to Indexed Database server lost', 'InvalidStateError'); return T.apply(this, a); };
+          const ok = await ghostDesk.saveOnExit(); IDBDatabase.prototype.transaction = T; return ok && n > 1; })()""")
+        # a full phone: clear notice, and it saves once there is room
+        out["fail"] = await p.js("""(async () => { const P = IDBObjectStore.prototype.put;
+          IDBObjectStore.prototype.put = function () { throw new DOMException('full', 'QuotaExceededError'); };
+          const ok = await ghostDesk.saveOnExit(); const t = document.getElementById('banners').innerText;
+          IDBObjectStore.prototype.put = P; document.querySelector('[data-savenow]').click(); await new Promise(r => setTimeout(r, 500));
+          return { ok, t, after: document.getElementById('banners').innerText }; })()""")
+        # damaged data on disk: the app repairs it, says so and keeps the rest
+        await p.js("""(async () => { const g = ghostDesk, s = structuredClone(g.state()); s.cash = NaN; s.pos['crypto:BAD'] = { qty: Infinity };
+          const b = structuredClone({ v: 1, list: g.bots() }); b.list.push({ id: 'x', name: 'Broken', style: 'momentum', pf: null });
+          window.dispatchEvent = () => true; const put = g.kv.setMany; await put([['sim.portfolio', s], ['sim.bots', b]]);
+          IDBObjectStore.prototype.put = function () { throw new Error('closed'); }; return true; })()""")
+        await p.goto(BASE + "/index.html?test=1&r=3#home", ready)
+        out["bad"] = await p.js(LOOK)
+        return out
+
+    f = await session(faults)
+    res(f["drop"], "Dropped IndexedDB connection: reopened and saved")
+    res(f["fail"]["ok"] is False and "not saved" in f["fail"]["t"] and "not saved" not in f["fail"]["after"], f"Save failure: “{f['fail']['t'][:90]}”, gone once it saves")
+    d = f["bad"]
+    res(isinstance(d["cash"], (int, float)) and d["cash"] > 0 and len(d["pos"]) == 1 and d["trades"] == 1 and d["bots"] == 1 and "damaged" in d["banners"],
+        f"Damaged data: cash {d['cash']}, {len(d['pos'])} position, {d['trades']} trade, {d['bots']} bot kept; “{d['banners'][-150:]}”")
+    return not fails
 
 
 async def unit_tests(p):
@@ -535,10 +654,10 @@ async def cheat_ui_tests(p, check):
     res(lad2["me"] == "#101+" and "#100 is" in (lad2["p"] or "") and "to go" in (lad2["p"] or ""), f"Ladder at $1K: {lad2['me']} “{lad2['p']}”", "ladder low")
     # Bots cheat: Rival moves and a ★ on their row; the switch in Settings → Rival bots turns it off
     b0 = await p.js("ghostDesk.bots()[0]?.name")
-    await p.js("(() => { const b = ghostDesk.bots()[0]; b.cheatDay = null; ghostDesk.botTick(); b.cheatPlan = [ghostDesk.appNow() - 1]; b.cheatsToday = ['zeroFees', 'insurance', 'lucky', 'rugShield', 'golden', 'perfect', 'leverage']; ghostDesk.botTick(); ghostDesk.renderAll(); return true; })()")
+    await p.js("(() => { const b = ghostDesk.bots()[0]; b.pf.cash *= 0.5; b.printerDay = null; ghostDesk.botTick(); ghostDesk.renderAll(); return true; })()")
     await p.js("ghostDesk.setTab('home'), true")
     await asyncio.sleep(0.4)
-    feed = await p.js("[...document.querySelectorAll('#botFeed .feed.cheat')].map(x => x.textContent)[0] || ''")
+    feed = await p.js("[...document.querySelectorAll('#botFeed .feed.cheat')].map(x => x.textContent).find(x => x.includes('Money printer')) || ''")
     await check("bot cheat feed")
     await p.js("ghostDesk.setTab('achievements'), true")
     await asyncio.sleep(0.4)
@@ -847,7 +966,7 @@ async def sim_ui_tests(p, check):
     after = await p.js(f"({{ t: ghostDesk.sim().t, clock: ghostDesk.appNow(), last: ghostDesk.state().trades.at(-1), bots: ghostDesk.bots().reduce((a, b) => a + b.pf.trades.length, 0), b1: ghostDesk.sim().insts['{sk}'].b1.slice(-60).every((b, k, a) => !k || b[0] - a[k - 1][0] === 60000) }})")
     await p.js("document.querySelector('[data-skipok]').click(), true")
     moved = after["t"] - before["t"]
-    res(btns == ["+1h", "+1d", "+1w"] and moved == 3600000 and after["clock"] - before["clock"] >= 3600000 - 60000 and after["last"]["reason"] == "sl" and after["last"]["t"] > before["t"] and after["b1"] and "stop loss" in summ,
+    res(btns == ["+1m", "+5m", "+15m", "+1h", "+1d", "+1w"] and moved == 3600000 and after["clock"] - before["clock"] >= 3600000 - 60000 and after["last"]["reason"] == "sl" and after["last"]["t"] > before["t"] and after["b1"] and "stop loss" in summ,
         f"Skip ahead {btns}: +{moved / 60000:.0f} min of Sim, stop loss filled on the way at {after['last']['t'] - before['t']} ms, bots {before['bots']} → {after['bots']} trades; “{summ[:160]}…”", "skip")
     # Skip a whole week: time it
     t0 = time.time()
@@ -882,6 +1001,94 @@ async def sim_ui_tests(p, check):
     star = await p.js("!!document.querySelector('#totalPl .star')")
     res(ok_on and "Oracle" in (on or "") and star and real_ok, f"Oracle on: “{on}”; the real Sim reached the predicted peak exactly: {real_ok}", "oracle")
     await p.js("ghostDesk.closeSheet(true), true")
+
+    # ---- Rewind, Oracle Auto, Do it, Jump to it, Front-run
+    async def sleep_js(expr, s=0.3):
+        r = await p.js(expr)
+        await asyncio.sleep(s)
+        return r
+    await sleep_js("ghostDesk.closeSheet(true), ghostDesk.state().cheats.on.oracle = true, ghostDesk.setTab('home'), true")
+    rk = await p.js("ghostDesk.lists.crypto[1]")
+    await sleep_js(f"ghostDesk.openSheet('{rk}'), true", 0.6)
+    await check("sim rewind buttons")
+    snap = "(() => { const g = ghostDesk, s = g.state(), w = g.sim(); return JSON.stringify([w.t, w.insts, s.cash, s.pos, s.margin, s.orders, s.trades, g.bots().map(b => [b.id, b.pf.cash, b.pf.pos, b.pf.trades])]); })()"
+    r1 = await p.js("""(async () => { const g = ghostDesk, snap = () => %s; const a = snap(); await g.skipAhead('1h'); const mid = snap(); return { same: a === mid, a }; })()""" % snap)
+    await sleep_js("document.querySelector('[data-skipok]')?.click(), true")
+    # the sheet's own button, with its second tap; the moment before the skip is a save point
+    await sleep_js("ghostDesk.sim().t, document.querySelector('[data-rewind=\"1h\"]').click(), true", 0.2)
+    sure = await p.js("document.querySelector('[data-rewind=\"1h\"]').textContent")
+    tb = await p.js("ghostDesk.sim().t")
+    await p.js("document.querySelector('[data-rewind=\"1h\"]').click(), true")
+    okr = await wait(f"ghostDesk.sim().t < {tb} - 3000000", 20)
+    rw = await p.js("({ star: !!ghostDesk.state().cheats.since, rewinds: ghostDesk.state().cheats.used.rewind, last: ghostDesk.points().at(-1).t, t: ghostDesk.sim().t })")
+    res(okr and "Sure" in sure and rw["star"] and rw["rewinds"] == 1 and rw["t"] - rw["last"] < 20000, f"Rewind -1h: {(tb - rw['t']) / 60000:.1f} min back, ★, asks first (“{sure}”)", "rewind")
+    ex = await p.js("""(async () => { const g = ghostDesk, snap = () => %s;
+      const t0 = g.sim().t; await g.skipAhead('1d'); const a = g.points().length;
+      document.querySelector('[data-skipok]')?.click();
+      const r = await g.rewind('1d'); return { to: r && r.to, t0, a, b: g.points().length }; })()""" % snap)
+    res(ex["to"] == ex["t0"] and ex["a"] > ex["b"] + 80, f"Rewind -1d lands exactly on the moment before the skip; {ex['a']} → {ex['b']} save points", "rewind exact")
+    wkr = await p.js("""(async () => { const g = ghostDesk, t0 = g.sim().t; const a = performance.now(); await g.skipAhead('1w'); const b = performance.now(); document.querySelector('[data-skipok]')?.click();
+      const n = g.points().length, r = await g.rewind('1w'); const est = await navigator.storage.estimate(); return { ok: !!r && r.to <= t0 && t0 - r.to < 900000, n, skip: b - a, rew: performance.now() - b, mb: est.usage / 1e6 }; })()""")
+    res(wkr["ok"], f"Rewind -1w: {wkr['n']} points, skip {wkr['skip'] / 1000:.1f} s, rewind {wkr['rew'] / 1000:.1f} s, storage {wkr['mb']:.0f} MB", "rewind week")
+    short = await p.js("""(async () => { const g = ghostDesk, out = {};
+      const run = n => { for (let k = 0; k < n; k++) g.simAdvance(g.sim().t + 10000); };
+      run(130);
+      for (const [id, ms] of [['1m', 60e3], ['5m', 300e3], ['15m', 900e3]]) { const r = await g.rewind(id); out['-' + id] = r ? (r.from - r.to - ms) / 1000 : null; run(130); }
+      for (const id of ['1m', '5m', '15m']) { const t = g.sim().t; await g.skipAhead(id); out['+' + id] = (g.sim().t - t) / 60e3; document.querySelector('[data-skipok]')?.click(); }
+      const r = document.querySelector('.skip-row'); out.row = [r.children.length, r.scrollWidth > r.clientWidth, new Set([...r.children].map(b => b.offsetTop)).size]; return out; })()""")
+    res(all(short[k] is not None and 0 <= short[k] <= 30 for k in ["-1m", "-5m", "-15m"]) and short["+1m"] == 1 and short["+5m"] == 5 and short["+15m"] == 15 and short["row"] == [6, True, 1],
+        f"Short jumps: forward 1/5/15 min exact; back, seconds past the target: {short}", "short jumps")
+    # Do it: armed with a countdown, buys and sells at the marks
+    mark = "(() => { const g = ghostDesk; for (const k of [...g.lists.meme.new, ...g.lists.crypto]) { if (g.state().pos[k]) continue; const o = g.oracleFor(k); if (o?.best && o.best.buy.t > g.sim().t + 5000 && o.best.sell.t > o.best.buy.t + 5000) return k; } return null; })()"
+    dk = await p.js(mark)
+    await sleep_js(f"ghostDesk.openSheet('{dk}'), true", 0.8)
+    line = await p.js("document.getElementById('oracleNote').innerText")
+    await check("oracle buttons")
+    cash = await p.js("ghostDesk.E.available(ghostDesk.state())")
+    await sleep_js("document.querySelector('[data-doit]').click(), true", 1.2)
+    armed = await p.js("document.getElementById('oracleNote').innerText")
+    await check("oracle armed")
+    g0 = await p.js(f"({{ ...ghostDesk.signals()['{dk}'] }})")
+    dr = await p.js(f"(() => {{ const g = ghostDesk, w = g.sim(), n = g.state().trades.length; while (g.sim().t < {g0['sellT']} + 3000) g.simAdvance(g.sim().t + 7000); return g.state().trades.slice(n).filter(t => t.key === '{dk}').map(t => ({{ side: t.side, t: t.t, mid: t.mid, usd: t.usd, reason: t.reason }})); }})()")
+    res("Do it" in line and "Jump to it" in line and "Armed" in armed and len(dr) == 2 and dr[0]["t"] == g0["buyT"] and dr[1]["t"] == g0["sellT"] and abs(dr[1]["mid"] / g0["sellPx"] - 1) < 1e-9 and abs(dr[0]["usd"] - cash * 0.1) < cash * 0.02,
+        f"Do it: “{armed[-60:]}” → bought and sold exactly at BUY and SELL, with 10% of cash {dr} {g0} {cash}", "do it")
+    # Jump to it / Jump to sell
+    jk = await p.js(mark)
+    await sleep_js(f"ghostDesk.closeSheet(true), ghostDesk.openSheet('{jk}'), true", 0.8)
+    best = await p.js(f"ghostDesk.oracleFor('{jk}').best")
+    n0 = await p.js("ghostDesk.state().trades.length")
+    await p.js("document.querySelector('[data-jumpbuy]').click(), true")
+    await wait("!!document.querySelector('[data-jumpsell]')", 30)
+    jb = await p.js(f"ghostDesk.state().trades.slice({n0}).filter(t => t.key === '{jk}').map(t => [t.side, t.t, t.mid])")
+    await check("jump to sell")
+    await sleep_js("document.querySelector('[data-jumpsell]').click(), true")
+    await wait(f"!ghostDesk.signals()['{jk}']", 30)
+    js_ = await p.js(f"ghostDesk.state().trades.slice({n0}).filter(t => t.key === '{jk}').map(t => [t.side, t.t, t.mid])")
+    res(len(jb) == 1 and jb[0][1] == best["buy"]["t"] and len(js_) == 2 and js_[1][1] == best["sell"]["t"] and abs(js_[1][2] / best["sell"]["px"] - 1) < 1e-9, f"Jump to it bought at BUY; Jump to sell sold at SELL ({best['gain'] * 100:.1f}%)", "jump")
+    # Oracle Auto on every coin
+    await sleep_js("ghostDesk.closeSheet(true), ghostDesk.openCheats(), true")
+    await sleep_js("document.querySelector('[data-oascope=all]').click(), true")
+    await sleep_js("document.getElementById('oaTog').click(), true", 1.0)
+    await check("oracle auto card")
+    au = await p.js("""(() => { const g = ghostDesk, n = g.state().trades.length; let ms = performance.now(); g.forecast(); ms = performance.now() - ms;
+      const end = g.sim().t + 15 * 60e3; while (g.sim().t < end) g.simAdvance(g.sim().t + 5000);
+      const ts = g.state().trades.slice(n), sells = ts.filter(t => t.side === 'sell' && t.reason === 'oracle');
+      return { buys: ts.filter(t => t.side === 'buy' && t.reason === 'oracle').length, sells: sells.length, wins: sells.filter(t => t.pl > 0).length, ms, toast: document.getElementById('toast').textContent }; })()""")
+    await sleep_js("document.getElementById('oaTog').click(), true")
+    left = await p.js("Object.values(ghostDesk.signals()).filter(x => x.src === 'auto').length")
+    res(au["buys"] > 3 and au["sells"] > 1 and au["wins"] >= au["sells"] * 0.9 and left == 0, f"Oracle Auto on all coins, 15 min: {au['buys']} buys, {au['sells']} sells, {au['wins']} wins; forecast {au['ms']:.0f} ms; off: nothing left to sell; “{au['toast'][:70]}”", "oracle auto")
+    # Front-run and Sell first
+    await sleep_js("ghostDesk.closeSheet(true), ghostDesk.state().cheats.on.xray = true, ghostDesk.setTab('achievements'), ghostDesk.refreshStandings(), true", 0.5)
+    await p.js("""(() => { const g = ghostDesk; if (!g.bots().length) g.addBot('momentum'); const b = g.bots()[0]; b.style = 'random'; b.pf.pos = {};
+      for (let i = 1; i < 400; i++) { b.seed = i; if (g.nextMoves(b).buy) break; } g.refreshStandings(); return true; })()""")
+    await check("front run")
+    cash = await p.js("ghostDesk.E.available(ghostDesk.state())")
+    fr = await p.js("(() => { const b = document.querySelector('[data-front]'); const n = ghostDesk.state().trades.length, k = b?.dataset.key, txt = b?.textContent; b?.click(); const t = ghostDesk.state().trades.at(-1); return { txt, k, n: ghostDesk.state().trades.length - n, key: t.key, usd: t.usd, tag: t.cheat }; })()")
+    sf = await p.js("""(() => { const g = ghostDesk, b = g.bots()[0], k = '%s', me = g.state().pos[k]; b.pf.pos = {}; b.style = 'momentum';
+      const L = g.live.get(k); g.E.executeBuy(b.pf, L.inst, 100, { px: L.px * 0.2, t: g.appNow(), liq: 1e9, quoteUsd: L.quoteUsd }, g.appNow());
+      g.refreshStandings(); const btn = [...document.querySelectorAll('[data-sellfirst]')].find(x => x.dataset.key === k); const txt = btn?.textContent; btn?.click(); return { txt, gone: !g.state().pos[k], had: !!me }; })()""" % fr["k"])
+    res(fr["n"] == 1 and fr["key"] == fr["k"] and abs(fr["usd"] - cash * 0.1) < 0.02 and "Front-run" in fr["tag"] and sf["had"] and sf["gone"], f"{fr['txt']}: bought {fr['usd']:.2f} (10% of cash); {sf['txt']}: sold mine", "front run")
+    await sleep_js("ghostDesk.closeSheet(true), true")
     # Back to Live with the real button: Live portfolio untouched, no star
     await p.js("ghostDesk.closeSheet(true), document.getElementById('liveDot').click(), true")
     await wait("!document.body.classList.contains('sim') && document.documentElement.dataset.ready === '1'", 15)

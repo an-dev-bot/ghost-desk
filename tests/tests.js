@@ -20,6 +20,8 @@ import * as SW from "../js/sim/world.js";
 import * as FUN from "../js/sim/fun.js";
 import * as RICH from "../js/core/rich.js";
 import * as F from "../js/ui/format.js";
+import * as RW from "../js/sim/rewind.js";
+import * as CLEAN from "../js/core/sanitize.js";
 import { cheatTick, BOT_CHEATS, validBots } from "../js/core/bots.js";
 
 const results = [];
@@ -1174,33 +1176,56 @@ await test("Always on · re-arms a one-shot cheat after every trade; not for tog
   ok(threw, "Undo can't be always on");
 });
 
-await test("Bot cheats · up to 3 a day at random from the list; same engine rules; can be turned off", () => {
+await test("Bot cheats · any time, as it suits them, Money printer once a day; same engine rules; can be turned off", () => {
   const ids = BOT_CHEATS.map(c => c.id);
   deepEq(ids, ["zeroFees", "insurance", "lucky", "rugShield", "golden", "perfect", "leverage", "printer"], "the list");
   for (const bad of ["undo", "ghost", "oracle", "xray", "timeMachine", "skip"]) ok(!ids.includes(bad), "never " + bad);
-  const day0 = new Date(T0); day0.setHours(0, 0, 0, 0);
-  const seen = new Set(), counts = [];
-  for (let seed = 1; seed <= 40; seed++) {
-    const b = newBot("momentum", { id: "b" + seed, start: 100000, now: day0.getTime(), seed });
-    const used = [];
-    for (let t = day0.getTime() + 1; t < day0.getTime() + 86400e3; t += 600e3) used.push(...cheatTick(b, t, { quoteFor: () => null }));
-    counts.push(used.length);
-    ok(new Set(used.map(u => u.id)).size === used.length, "no cheat twice in a day");
-    for (const u of used) { seen.add(u.id); ok(ids.includes(u.id), u.id); }
-    if (used.length) ok(E.isCheated(b.pf), "★ on the bot");
+  const turn = (b, px, t, o = {}) => botStep(b, { entries: [L(o.inst || BTC, px, t, { ch24: 5, ...o.e })], now: t, status: statusAt(t), bootAt: 0, extreme: o.extreme, cheats: o.cheats ?? true });
+  const usedOf = (b, id) => b.pf.cheats?.used?.[id] || 0;
+  // no daily limit: every winning sale uses Perfect exit and 2x Lucky trade
+  const n = newBot("momentum", { id: "n", start: 100000, now: T0, seed: 1 });
+  for (let i = 0; i < 5; i++) {
+    const t = T0 + i * 600e3;
+    cheatTick(n, t, {});
+    turn(n, 60000, t);
+    const [s] = turn(n, 66000, t + 60e3, { extreme: (k, from, kind) => (kind === "high" ? 69000 : null) });
+    ok(s?.cheat?.includes("Perfect exit") && s.cheat.includes("2x Lucky trade"), "winning sale " + i + ": " + JSON.stringify(s?.cheat));
   }
-  ok(Math.max(...counts) <= 3 && Math.min(...counts) >= 1, "1 to 3 a day: " + counts.join(","));
-  ok(seen.size >= 7, "random from the whole list: " + [...seen].join(","));
-  // Money printer: 10% of its balance
+  eq(usedOf(n, "perfect"), 5, "5 Perfect exits in one day"); ok(E.isCheated(n.pf), "★ on the bot");
+  // only when it suits it
+  const c0 = newBot("momentum", { id: "c", start: 100000, now: T0, seed: 2 });
+  turn(c0, 60000, T0); ok(!E.isCheated(c0.pf), "a small, ordinary buy: no cheat");
+  turn(c0, 54000, T0 + 60e3, { extreme: () => 69000 });
+  eq(usedOf(c0, "perfect"), 0, "no Perfect exit on a loss"); eq(usedOf(c0, "insurance"), 1, "Insurance on a loss");
+  // a risky buy: strong signal, so Leverage, and Insurance armed before it
+  const rk = newBot("momentum", { id: "rk", start: 100000, now: T0, seed: 2 });
+  const [rt] = turn(rk, 60000, T0, { e: { ch24: 9 }, extreme: (k, from, kind) => (kind === "low" ? 57000 : null) });
+  eq(rt.lev, 10, "leverage on a strong signal"); ok(C.isArmed(rk.pf, "insurance"), "insured first"); eq(rt.fee, 0, "Zero fees");
+  ok(rt.cheat.includes("Golden entry"), "Golden entry: the low is well below");
+  // a big memecoin bet: Rug shield
+  const dg = newBot("degen", { id: "dg", start: 100000, now: T0, seed: 2 });
+  turn(dg, 0.001, T0, { inst: MEME, e: { ch1h: 40, liq: 1e6 } });
+  ok(C.isOn(dg.pf, "rugShield") && C.isArmed(dg.pf, "insurance"), "shielded and insured: " + JSON.stringify(dg.pf.cheats?.used));
+  // bots not allowed: plain trades
+  const off = newBot("momentum", { id: "off", start: 100000, now: T0, seed: 2 });
+  turn(off, 60000, T0, { e: { ch24: 9 }, extreme: () => 57000, cheats: false }); ok(!off.pf.cheats, "off: no cheats");
+  // Money printer: 10% of its balance, when losing, once a day
   const p = newBot("momentum", { id: "p", start: 100000, now: T0, seed: 9 });
-  p.cheatDay = localDay(T0); p.cheatsToday = BOT_CHEATS.filter(c => c.id !== "printer").map(c => c.id); p.cheatPlan = [T0];
-  const [u] = cheatTick(p, T0, { quoteFor: () => null });
-  eq(u.id, "printer"); near(p.pf.cash, 110000, "+10%");
+  eq(cheatTick(p, T0, {}).length, 0, "not needed yet");
+  p.pf.cash = 90000;
+  const [u] = cheatTick(p, T0, {});
+  eq(u.id, "printer", "losing: prints"); near(p.pf.cash, 99000, "+10%");
+  for (let i = 1; i <= 20; i++) eq(cheatTick(p, T0 + i * 1000, {}).length, 0, "once a day");
+  cheatTick(p, T0 + 30e3, { allowed: false }); eq(cheatTick(p, T0 + 31e3, {}).length, 0, "not again after off and on");
+  eq(cheatTick(p, T0 + 24 * 3600e3, {}).length, 1, "again the next day");
+  const sv = newBot("momentum", { id: "sv", start: 100000, now: T0, seed: 9 });
+  sv.pf.cash = 90000; sv.cheatDay = localDay(T0); sv.cheatsToday = ["printer"]; sv.cheatPlan = [T0];
+  eq(cheatTick(sv, T0, {}).length, 0, "a saved bot that printed today doesn't print again");
   // Zero fees for 1 hour, then it ends
   const z = newBot("momentum", { id: "z", start: 100000, now: T0, seed: 3 });
-  z.cheatDay = localDay(T0); z.cheatsToday = BOT_CHEATS.filter(c => c.id !== "zeroFees").map(c => c.id); z.cheatPlan = [T0];
+  C.state(z.pf).on.zeroFees = true; z.pf.cheats.until = { zeroFees: T0 + 3600e3 };
   cheatTick(z, T0, {});
-  const [zt] = botStep(z, { entries: [L(BTC, 60000, T0, { ch24: 5 })], now: T0, status: statusAt(T0), bootAt: 0 });
+  const [zt] = turn(z, 60000, T0, { cheats: false });
   eq(zt.fee, 0, "no fee during the hour");
   cheatTick(z, T0 + 3600e3 + 1, {}); ok(!C.isOn(z.pf, "zeroFees"), "over after 1 hour");
   // Golden entry: the low of the last 15 minutes; Perfect exit: the high of the day
@@ -1227,13 +1252,81 @@ await test("Bot cheats · up to 3 a day at random from the list; same engine rul
   C.state(k.pf).armed.lucky = true; C.mark(k.pf, "lucky", "2x Lucky trade", T0);
   const [kt] = botStep(k, { entries: [L(BTC, 66000, T0 + 60e3, { ch24: 5 })], now: T0 + 60e3, status: statusAt(T0 + 60e3), bootAt: 0 });
   ok(kt?.cheat?.some(x => /Lucky/.test(x)), "2x Lucky trade on its win: " + JSON.stringify(kt?.cheat));
-  // Settings off: nothing armed, no plan
+  // Settings off: nothing armed
   cheatTick(k, T0 + 1, { allowed: false });
-  eq(k.cheatPlan.length, 0); ok(!C.isArmed(k.pf, "lucky") && !C.isOn(k.pf, "zeroFees"), "Bots can cheat off: nothing armed");
+  ok(!C.isArmed(k.pf, "lucky") && !C.isOn(k.pf, "zeroFees"), "Bots can cheat off: nothing armed");
   ok(E.isCheated(k.pf), "the ★ stays: it cheated before");
   // an imported bot keeps its cheats (but never Undo or Always on)
   const list = [JSON.parse(JSON.stringify(k))]; list[0].pf.cheats.always = { golden: true }; list[0].pf.undo = {};
   ok(validBots(list), "valid"); ok(list[0].pf.cheats && !list[0].pf.cheats.always && !list[0].pf.undo, "cheats kept, Always on and Undo dropped");
+});
+
+await test("Saving · good data is never touched; bad numbers are repaired and the rest is kept", () => {
+  const s = sampleState(), before = canon(s), none = [];
+  CLEAN.cleanPortfolio(s, T0, none);
+  eq(none.length, 0, "no false alarms: " + none.join(", ")); eq(canon(s), before, "untouched");
+  const w = SW.createWorld(7, T0), wb = canon(w);
+  CLEAN.cleanWorld(w, () => SW.createWorld(8, T0), none);
+  eq(none.length, 0, "a good world: " + none.join(", ")); eq(canon(w), wb, "world untouched");
+  const b = newBot("momentum", { id: "q", start: 100000, now: T0, seed: 3 });
+  eq(CLEAN.cleanBots([b], T0, none).length, 1, "bot"); eq(none.length, 0, "good bot: " + none.join(", "));
+  // bad numbers
+  const x = sampleState(), is = [], nTrades = x.trades.length, nPos = Object.keys(x.pos).length;
+  const expect = x.cash; x.cash = NaN;
+  x.pos[BTC.key].qty = Infinity; x.pos[BTC.key].cost = 100;
+  x.pos[AAPL.key].lastPx = 1e200;
+  x.trades[0].fee = NaN; x.trades.push({ t: NaN });
+  CLEAN.cleanPortfolio(x, T0, is);
+  near(x.cash, expect + 100, "cash from the history, plus what the damaged position cost");
+  eq(Object.keys(x.pos).length, nPos - 1, "the other positions stay"); eq(x.pos[AAPL.key].lastPx, null, "huge price cleared");
+  eq(x.trades.length, nTrades, "trades stay"); ok(is.length >= 4, "told: " + is.join(", "));
+  ok(isFinite(E.totals(x, () => null).total), "the total is a number");
+  const inf = sampleState(); inf.cash = Infinity; CLEAN.cleanPortfolio(inf, T0, []); eq(inf.cash, E.WORLD_CAP, "Infinity: the money cap");
+  eq(CLEAN.cleanBots([b, { id: "z", style: "momentum", name: "Z", pf: null }], T0, []).length, 1, "a damaged bot doesn't take the others with it");
+  const cfg = CLEAN.cleanSettings({ sound: true, moveTh: NaN, notif: 5, alerts: [{ key: "a", price: 1 }, { key: "b", price: Infinity }] }, { sound: false, moveTh: 5, notif: { fills: true }, alerts: [] }, []);
+  ok(cfg.sound === true && cfg.moveTh === 5 && cfg.notif.fills === true && cfg.alerts.length === 1, "settings: only the bad ones go back");
+  w.insts["crypto:NBL"].px = NaN; w.insts[w.memes[0]].px = Infinity;
+  const nm = w.memes.length, wi = [];
+  ok(CLEAN.cleanWorld(w, () => SW.createWorld(8, T0), wi) === w, "same world"); eq(w.memes.length, nm - 1, "only that coin goes");
+  ok(w.insts["crypto:NBL"].px > 0 && wi.length === 2, wi.join(", "));
+});
+
+await test("Rewind · a point rebuilt from its chain is exactly the world, portfolio and bots of that moment; it goes on the same", () => {
+  const w = SW.createWorld(21, T0), s = E.newPortfolio(T0), bots = [newBot("momentum", { id: "m", start: 100000, now: T0, seed: 4 })];
+  const idx = [], recs = [], truth = [];
+  let prev = null;
+  for (let n = 0; n < 130; n++) {
+    prev = RW.makePoint(w, s, bots, prev && prev.n + 1 < RW.KEY_EVERY ? prev : null);
+    recs.push(prev); idx.push({ t: prev.t, key: prev.key }); truth.push(canon({ w, s: { ...s, undo: null }, bots: bots.map(b => ({ ...b, pf: { ...b.pf, undo: null } })) }));
+    for (let k = 0; k < 3; k++) SW.stepBy(w, 300, {});
+    const i = w.insts["crypto:NBL"], q = { px: i.px, t: w.t };
+    if (n % 2 === 0) E.executeBuy(s, SW.instOf(i), 100, q, w.t); else E.executeSell(s, i.key, 1, q, w.t);
+    botStep(bots[0], { entries: Object.values(w.insts).map(x => ({ inst: SW.instOf(x), ...SW.quote(w, x) })), now: w.t, status: () => ALWAYS, bootAt: 0 });
+    if (n === 50) { s.trades[s.trades.length - 1].flip = "won"; }
+    if (n === 60) s.trades.splice(5, 1); // a Ghost trade erased it
+  }
+  ok(recs.filter(r => r.key).length === 2, "one complete point a day");
+  for (const n of [0, 1, 40, 51, 61, 95, 96, 129]) {
+    const chain = RW.chainOf(idx, n).map(p => structuredClone(recs.find(r => r.t === p.t)));
+    const b = RW.restore(chain);
+    if (canon({ w: b.w, s: b.s, bots: b.bots }) !== truth[n]) throw new Error("point " + n + " differs");
+  }
+  // a fine point is built on its main point, not on the fine one before it
+  const f1 = RW.makePoint(w, s, bots, prev), was = canon(w); SW.stepBy(w, 20, {}); const f2 = RW.makePoint(w, s, bots, prev);
+  const ch = RW.chainOf(idx, 129).map(p => recs.find(r => r.t === p.t));
+  eq(canon(RW.restore([...ch, f1]).w), was, "fine point 1"); eq(canon(RW.restore([...ch, f2]).w), canon(w), "fine point 2");
+  // from a restored world the future is the same
+  const a = RW.restore(RW.chainOf(idx, 129).map(p => recs.find(r => r.t === p.t))).w, c = structuredClone(a);
+  deepEq(SW.futureAll(a, 60).paths["crypto:NBL"], SW.futureAll(c, 60).paths["crypto:NBL"], "same future");
+  const all = SW.futureAll(a, 120), one = SW.future(a, "crypto:NBL", 120);
+  ok(one.path.every(([, px], n) => all.paths["crypto:NBL"][n] === px), "futureAll = future");
+  eq(RW.pointAt(idx, idx[7].t + 1), 7, "newest at or before"); eq(RW.pointAt(idx, idx[0].t - 1), -1, "too far back");
+  const now = idx[129].t + RW.KEEP - 20 * 60e3;
+  eq(RW.expired(idx, now).length, 96, "a day's complete point goes once the next one covers the week");
+  // the star and the switches stay; the bots' logs go back
+  C.mark(s, "oracle", "x", w.t); s.cheats.on.oracle = true;
+  const back = RW.carryOver(RW.restore([recs[0]]), s, bots, recs[0].t);
+  ok(E.isCheated(back.s) && C.isOn(back.s, "oracle"), "the star stays");
 });
 
 const pass = results.filter(r => r[0]).length;
