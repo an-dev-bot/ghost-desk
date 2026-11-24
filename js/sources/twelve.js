@@ -36,7 +36,7 @@ export function createTwelve({ getKey, budgetStore, cache, onError }) {
     return { used: b.used, cap: DAILY_CAP, exhausted: b.dayOut || b.used >= DAILY_CAP, minuteFree: lim.free() };
   }
 
-  async function fetchSeries(symbol, ivl, now) {
+  async function fetchSeries(symbol, ivl, now, extra = {}) {
     const key = getKey();
     if (!key) throw new SourceError("twelvedata", "nokey", "Twelve Data key missing");
     const b = await loadBudget(now);
@@ -44,7 +44,7 @@ export function createTwelve({ getKey, budgetStore, cache, onError }) {
     if (lim.free() <= 0) throw new SourceError("twelvedata", "limit", "Wait a minute for more candles", 429, "minute");
     await lim.take();
     await spend(now);
-    const qs = new URLSearchParams({ symbol, interval: IVL[ivl], outputsize: "300", timezone: "UTC", order: "ASC" });
+    const qs = new URLSearchParams({ symbol, interval: IVL[ivl], outputsize: "300", timezone: "UTC", order: "ASC", ...extra });
     let d;
     try {
       d = await getJSON(`${BASE}/time_series?${qs}`, { source: "twelvedata", headers: { Authorization: "apikey " + key } });
@@ -94,7 +94,14 @@ export function createTwelve({ getKey, budgetStore, cache, onError }) {
     await cache.set(ck, { bars: mergeBars(cached?.bars, bars), fetchedAt: cached?.fetchedAt || Date.now() });
   }
 
-  return { series, saveLive, status, hasKey: () => !!getKey(), _fetchSeries: fetchSeries };
+  /** Real 1-minute candles between from and to (ms), for the Time machine. Costs 1 credit. */
+  async function history(symbol, from, to, now = Date.now()) {
+    const f = ms => new Date(ms).toISOString().slice(0, 19).replace("T", " ");
+    const bars = await fetchSeries(symbol, "1m", now, { outputsize: "5000", start_date: f(from), end_date: f(to) });
+    return bars.filter(b => b.t >= from && b.t < to);
+  }
+
+  return { series, saveLive, history, status, hasKey: () => !!getKey(), _fetchSeries: fetchSeries };
 }
 
 /** Twelve Data symbol for an instrument. */

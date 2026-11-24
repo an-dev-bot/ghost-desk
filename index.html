@@ -25,13 +25,14 @@
   <header class="top">
     <div class="topbar">
       <div class="brand"><svg viewBox="0 0 32 32" width="22" height="22" aria-hidden="true"><path d="M16 3C9.4 3 5 7.9 5 14v14l3.7-2.6L12 28l4-2.6 4 2.6 3.3-2.6L27 28V14C27 7.9 22.6 3 16 3Z" fill="currentColor"/><circle cx="12" cy="14" r="2.3" fill="#06070b"/><circle cx="20" cy="14" r="2.3" fill="#06070b"/></svg><b>Ghost<span>Desk</span></b></div>
-      <span id="liveDot" class="live wait">Connecting</span>
+      <div class="mode" role="group" aria-label="Mode: Live or Sim"><button id="liveDot" class="live wait" data-setmode="live" aria-pressed="true">Connecting</button><button id="simBtn" class="simb" data-setmode="sim" aria-pressed="false">Sim</button></div>
       <button class="gear" data-settings aria-label="Settings"><svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path d="M12 15.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7Z" fill="none" stroke="currentColor" stroke-width="2"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1Z" fill="none" stroke="currentColor" stroke-width="1.6"/></svg></button>
     </div>
     <div class="total-box">
       <small>Your portfolio</small>
       <b id="total" class="total">$100,000.00</b>
       <div id="totalPl" class="total-pl"></div>
+      <div id="combo" class="combo" hidden></div>
     </div>
     <div class="tape" aria-label="Top movers"><div id="tape" class="tape-track"></div></div>
   </header>
@@ -50,6 +51,7 @@
 <div id="scrim" class="scrim" hidden></div>
 <div id="sheet" class="sheet" role="dialog" aria-modal="true" aria-label="Details" hidden></div>
 <div id="result" class="result" hidden></div>
+<div id="jackpot" class="jackpot" role="status" hidden></div>
 <canvas id="confetti" class="confetti" hidden></canvas>
 <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
 <noscript><p style="padding:16px">Ghost Desk needs JavaScript.</p></noscript>

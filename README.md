@@ -97,6 +97,23 @@ picks up the new version. If you change app files, also bump the `VERSION` strin
   it opened: nothing is made up for the time it was closed. The leaderboard (Trophies, and Home when you have bots)
   shows you vs. each bot: total, % gain, best and worst trade; tap a bot for its positions and history.
   Resetting your portfolio restarts the bots with the same balance. Bots are included in the backup file.
+- **Cheats** (Settings → Cheats, 24 of them): Money printer, Zero fees, Market maker, Leverage 10x/50x/100x
+  (real liquidation when the loss reaches the margin), Short anything, Magic limit, Whale mode, Golden entry,
+  Perfect exit, Sniper, 2x Lucky trade, Ghost trade, Insurance, Double or nothing, Undo, Rug shield, Diamond hands,
+  Second chance, Moon boost, Airdrop, Time machine and Time skip (replay a past day on real 1-minute candles in a
+  separate replay portfolio), Copycat and X-ray. Golden entry, Perfect exit, Sniper and the Time machine use real
+  candles (Binance/Coinbase, GeckoTerminal, Twelve Data). Bots never cheat. Using any cheat marks your portfolio
+  with a ★ on the leaderboard and in the history, and achievements earned with cheats are kept apart (earning one
+  again without cheats moves it back). Resetting the portfolio removes the star.
+- **Sim mode** (the Live / Sim switch at the top): invented markets with invented names in all four types, prices
+  that move on their own every second, always open. Memecoins: a new one every few seconds, pumps of +1,000% in
+  minutes (gold candles), very rare 100x moonshots, rug pulls to near zero, whales. Crypto is volatile, stocks have
+  crashes and rallies, forex is calm except on news. Random events (Bull run, Black swan, Whale alert, Short squeeze,
+  Fed surprise, Elon tweet) with a big banner and a countdown; liquidation cascades when many are leveraged. Effects:
+  screen shake, slot-machine total, big confetti, vibration, a combo multiplier for wins in a row, and a JACKPOT
+  when a position reaches 10x. Sim sounds are off until you turn them on in Settings. Sim has its own portfolio,
+  bots, achievements and records table (best multiplier, biggest jackpot, worst rug, longest streak), with the same
+  costs, orders, bots and cheats as Live. Nothing in Sim is real. The Sim world only moves while the app is open.
 - **Real hours**: stocks 9:30 AM to 4:00 PM New York time (with NYSE holidays and early closes);
   outside hours the order waits and fills at the first price after the open.
   Forex Sunday 5:00 PM to Friday 5:00 PM New York time. Crypto and memecoins always.
@@ -118,5 +135,5 @@ python tests/run.py "C:/Program Files/Google/Chrome/Application/chrome.exe" http
 
 This runs the spec tests with hand-made prices (math, hours, orders, backup, keys, starting balance) and
 checks the app at 375 px wide, buying for real with the slide gesture and resetting from Settings.
-With a fourth argument it runs against the real sources: `live`, `badkeys`, `tddemo`, `offline` or `bots` (see `tests/run.py`).
+With a fourth argument it runs against the real sources: `live`, `badkeys`, `tddemo`, `offline`, `bots` or `cheats`, or `sim` for the real app in Sim mode (see `tests/run.py`).
 You can also open `http://127.0.0.1:8765/tests/` in the browser.

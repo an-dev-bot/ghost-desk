@@ -37,6 +37,13 @@ export function parseBackup(text) {
   }
   for (const t of p.trades) if (!isNum(t.t) || !isNum(t.usd) || !t.m) throw new BackupError("A trade in the backup is damaged.");
   p.days ||= {};
+  if (p.margin != null && typeof p.margin !== "object") throw new BackupError("A position in the backup is damaged.");
+  p.margin ||= {};
+  for (const k in p.margin) {
+    const x = p.margin[k];
+    if (!x?.inst?.m || !isNum(x.qty) || !isNum(x.cost) || !isNum(x.lev) || !isNum(x.avg)) throw new BackupError("A position in the backup is damaged.");
+  }
+  delete p.undo;
   p.seq = Math.max(p.seq || 0, ...p.trades.map(t => t.id || 0), ...p.orders.map(o => o.id || 0));
   // Older backups have no bots: keep the ones on this phone. A damaged bot list is ignored, not imported.
   const bots = d.bots === undefined ? null : validBots(d.bots) ? d.bots : null;
@@ -50,5 +57,12 @@ export function mergeAchievements(a, b) {
   for (const [id, t] of Object.entries(b.unlocked || {})) out.unlocked[id] = Math.min(out.unlocked[id] ?? Infinity, t);
   out.lifetime.trades = Math.max(out.lifetime.trades, b.lifetime?.trades || 0);
   Object.assign(out.lifetime.markets, b.lifetime?.markets || {});
+  // An achievement stays marked "with cheats" only if every copy that has it earned it with cheats.
+  const cheated = {};
+  for (const id in out.unlocked) {
+    const ca = !a.unlocked[id] || a.cheated?.[id], cb = !b.unlocked?.[id] || b.cheated?.[id];
+    if (ca && cb) cheated[id] = (a.cheated?.[id] || b.cheated?.[id]);
+  }
+  out.cheated = cheated;
   return out;
 }

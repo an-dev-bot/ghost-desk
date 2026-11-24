@@ -174,6 +174,24 @@ export function step(bot, { entries, now, status, bootAt }) {
   return trades;
 }
 
+/**
+ * X-ray: what the bot would buy (and sell) on its next turn with these live prices, without touching the bot.
+ * Returns {buy: {key, sym, usd, why} | null, sells: [{key, sym, why}], wait: ms until its cooldown ends}.
+ */
+export function preview(bot, { entries, now, status, bootAt }) {
+  const fresh = freshQuotes(entries, now, status, bootAt);
+  const copy = structuredClone(bot);
+  copy.lastBuy = 0;
+  const acts = decide(copy, fresh, now);
+  const sym = k => fresh.get(k)?.inst.sym || bot.pf.pos[k]?.inst.sym || "?";
+  const b = acts.find(a => a.type === "buy");
+  return {
+    buy: b ? { ...b, sym: sym(b.key) } : null,
+    sells: acts.filter(a => a.type === "sell").map(a => ({ ...a, sym: sym(a.key) })),
+    wait: Math.max(0, RULES[bot.style].cooldown - (now - (bot.lastBuy || 0))),
+  };
+}
+
 /** Leaderboard row from a portfolio: total, gain %, best and worst closed trade. */
 export function standing(pf, quoteFor) {
   const t = E.totals(pf, quoteFor);
@@ -188,5 +206,7 @@ export function standing(pf, quoteFor) {
 }
 
 export function validBots(list) {
+  // Bots never use cheats: anything cheat-like in an imported bot is dropped.
+  if (Array.isArray(list)) for (const b of list) if (b?.pf) { delete b.pf.cheats; delete b.pf.undo; delete b.pf.undoable; b.pf.margin = {}; }
   return Array.isArray(list) && list.every(b => b && STYLES[b.style] && typeof b.id === "string" && b.pf && typeof b.pf.cash === "number" && b.pf.start > 0 && Array.isArray(b.pf.trades) && typeof b.pf.pos === "object");
 }

@@ -9,6 +9,8 @@
 Extra modes against the real price sources (4th argument):
   live     the real app with no keys: memecoins, crypto and FX must show live prices
   offline  installs the app, stops its server and the network: portfolio and history still open
+  sim      the real app in Sim mode for 40 s with its own clock, then a reload: the Sim world continues
+  cheats   the real app: Time machine on yesterday's real BTC candles, Golden entry and Sniper on real prices
   bots     the real app with 4 rival bots for ~2 minutes on real prices: what they trade and why
   badkeys  wrong Finnhub / Twelve Data keys: clear notices, nothing blank, nothing cached
   tddemo   Twelve Data's public "demo" key: real EUR/USD candles, saved and reused without a credit
@@ -101,6 +103,10 @@ async def main():
                 ok = await offline_check(p)
             elif MODE == "bots":
                 ok = await bots_live_check(p)
+            elif MODE == "cheats":
+                ok = await cheats_live_check(p)
+            elif MODE == "sim":
+                ok = await sim_live_check(p)
             else:
                 ok1 = await unit_tests(p)
                 ok2 = await layout_tests(p)
@@ -230,6 +236,8 @@ async def layout_tests(p):
     await check("settings")
     fails += await reset_tests(p, check)
     fails += await rival_tests(p, check)
+    fails += await cheat_ui_tests(p, check)
+    fails += await sim_ui_tests(p, check)
     if p.events:
         print("Console errors:", *p.events[:10], sep="\n  ")
     return not fails and not p.events
@@ -350,6 +358,371 @@ async def rival_tests(p, check):
         fails.append("remove bot")
     await p.js("ghostDesk.closeSheet(true), true")
     return fails
+
+
+async def cheat_ui_tests(p, check):
+    """Settings → Cheats with real taps: star on the portfolio, leverage + short through the slider, undo, X-ray, Time machine."""
+    fails = []
+    def res(good, text, key):
+        print(("PASS " if good else "FAIL ") + " " + text)
+        if not good:
+            fails.append(key)
+    enter = "document.querySelector('.swipe-thumb').dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true })), true"
+    await p.js("ghostDesk.closeSheet(true), ghostDesk.openSettings(), true")
+    await asyncio.sleep(0.3)
+    await p.js("document.querySelector('[data-cheats]').scrollIntoView(), document.querySelector('[data-cheats]').click(), true")
+    await asyncio.sleep(0.4)
+    n = await p.js("document.querySelectorAll('.sheet .cheat').length")
+    clean = await p.js("document.querySelector('.sheet .cheat-note b').textContent")
+    await check("cheats sheet")
+    cash0 = await p.js("ghostDesk.state().cash")
+    await p.js("document.querySelector('[data-print=\"10000\"]').click(), true")
+    await asyncio.sleep(0.2)
+    await p.js("document.querySelector('[data-cheat=zeroFees]').click(), document.querySelector('[data-lev=\"10\"]').click(), document.querySelector('[data-arm=ghost]').click(), true")
+    await asyncio.sleep(0.3)
+    st = await p.js("(() => { const s = ghostDesk.state(); return { cash: s.cash, zf: s.cheats.on.zeroFees, lev: s.cheats.lev, ghost: s.cheats.armed.ghost, star: !!document.querySelector('#totalPl .star'), note: document.querySelector('.sheet .cheat-note b').textContent }; })()")
+    await check("cheats sheet on")
+    res(n == 24 and clean == "Clean portfolio" and st["cash"] == cash0 + 10000 and st["zf"] and st["lev"] == 10 and st["ghost"] and st["star"] and "marked" in st["note"],
+        f"Cheats menu: {n} cheats; Money printer +$10K ({cash0} → {st['cash']}); Zero fees, 10x and Ghost trade on; ★ in the header", "cheats menu")
+    # 10x short through the real slider
+    await p.js("ghostDesk.closeSheet(true), ghostDesk.openSheet('crypto:BTCUSDT'), true")
+    await asyncio.sleep(0.5)
+    btns = await p.js("[...document.querySelectorAll('.bs button')].map(b => b.textContent.trim())")
+    await check("sheet btc 10x short buttons")
+    await p.js("ghostDesk.chooseSide('short'), true")
+    await asyncio.sleep(0.3)
+    await p.js("document.querySelector('[data-amt=\"250\"]')?.click(), true")
+    await asyncio.sleep(0.2)
+    prev = await p.js("document.getElementById('quote').innerText")
+    await check("sheet btc short 10x")
+    await p.js(enter)
+    await asyncio.sleep(0.5)
+    mp = await p.js("(() => { const m = Object.values(ghostDesk.state().margin); const t = ghostDesk.state().trades.at(-1); return { n: m.length, lev: m[0]?.lev, dir: m[0]?.dir, fee: t?.fee, cheat: t?.cheat }; })()")
+    res(btns == ["Buy 10x", "Sell", "Short 10x"] and "Liquidated at" in prev and mp["n"] == 1 and mp["lev"] == 10 and mp["dir"] == -1 and mp["fee"] == 0 and "Leverage 10x" in mp["cheat"] and "Zero fees" in mp["cheat"],
+        f"Short 10x BTC with the slider: buttons {btns}; preview “{prev.splitlines()[1] if len(prev.splitlines()) > 1 else prev}”; trade ★ {mp['cheat']}", "short 10x")
+    await p.js("ghostDesk.closeSheet(true), ghostDesk.setTab('portfolio'), true")
+    await asyncio.sleep(0.4)
+    lev_rows = await p.js("document.querySelectorAll('[data-mv]').length")
+    await check("portfolio leveraged")
+    await p.js("ghostDesk.setTab('history'), true")
+    await asyncio.sleep(0.4)
+    hist = await p.js("({ note: !!document.querySelector('.cheat-note'), tag: document.querySelector('.tr .cheat-tag')?.textContent, side: document.querySelector('.tr .side')?.textContent })")
+    await check("history cheats star")
+    await p.js("ghostDesk.setTab('achievements'), true")
+    await asyncio.sleep(0.4)
+    me = await p.js("[...document.querySelectorAll('#lbSlotFull .row.lb')].find(r => r.textContent.includes('You'))?.querySelector('.nm b').textContent")
+    res(lev_rows == 1 and hist["note"] and "Leverage 10x" in (hist["tag"] or "") and hist["side"] == "short" and "★" in (me or ""),
+        f"Star on the portfolio: leaderboard “{me}”, history note + trade “{hist['side']}” {hist['tag']}; leveraged row in Portfolio", "star")
+    # X-ray on the leaderboard, then Undo the short
+    await p.js("ghostDesk.openCheats(), true")
+    await asyncio.sleep(0.3)
+    await p.js("document.querySelector('[data-cheat=xray]').click(), true")
+    undo_lbl = await p.js("document.querySelector('[data-undo]')?.textContent")
+    await p.js("document.querySelector('[data-undo]').click(), true")
+    await asyncio.sleep(0.3)
+    after = await p.js("({ m: Object.keys(ghostDesk.state().margin).length, cash: ghostDesk.state().cash })")
+    await p.js("ghostDesk.closeSheet(true), ghostDesk.setTab('achievements'), true")
+    await asyncio.sleep(0.4)
+    xr = await p.js("[...document.querySelectorAll('#lbSlotFull .xray')].map(x => x.textContent)")
+    await check("leaderboard xray")
+    res(after["m"] == 0 and after["cash"] == cash0 + 10000 and len(xr) == 4 and all(x.startswith("🩻") for x in xr),
+        f"Undo ({undo_lbl}) → no position, cash {after['cash']}; X-ray on {len(xr)} bots: {xr[0] if xr else ''}", "undo xray")
+    # Time machine on hand-made 1-minute candles (the app loads real ones from Binance / GeckoTerminal / Twelve Data)
+    await p.js("""(() => { const day = new Date(); day.setHours(0, 0, 0, 0); day.setDate(day.getDate() - 1);
+      const bars = []; for (let i = 0; i < 1800; i++) { const c = 60000 + 300 * Math.sin(i / 40) + i; bars.push({ t: day.getTime() - 7200e3 + i * 60e3, o: c - 5, h: c + 20, l: c - 25, c }); }
+      ghostDesk.startReplay('crypto:BTCUSDT', day.getTime(), bars); return true; })()""")
+    await asyncio.sleep(0.6)
+    await check("time machine")
+    px0 = await p.js("document.getElementById('rpPx').textContent")
+    await p.js("document.querySelector('[data-rpspeed=\"60\"]').click(), true")
+    await asyncio.sleep(2.2)
+    px1 = await p.js("document.getElementById('rpPx').textContent")
+    await p.js("document.querySelector('[data-rpbuy=\"0.1\"]').click(), true")
+    await asyncio.sleep(0.3)
+    await p.js("document.querySelector('[data-rp=peek]').click(), true")
+    await asyncio.sleep(0.3)
+    await check("time machine peek")
+    await p.js("document.querySelector('[data-rp=hour]').click(), true")
+    await asyncio.sleep(0.3)
+    rp = await p.js("(() => { const r = ghostDesk.replay(); return { trades: r.pf.trades.length, playing: r.playing, peek: r.peek, skips: r.skips, mine: ghostDesk.state().trades.filter(t => t.reason === 'replay').length }; })()")
+    await check("time machine skip")
+    res(px0 != px1 and rp["trades"] == 1 and rp["skips"] == 1 and rp["mine"] == 0,
+        f"Time machine: 60x moved the price {px0} → {px1}, bought in the replay, Peek, +1 hour; real portfolio untouched", "time machine")
+    # Reset removes the star
+    await p.js("ghostDesk.closeSheet(true), ghostDesk.openSettings(), true")
+    await asyncio.sleep(0.3)
+    await p.js("document.querySelector('[data-reset]').scrollIntoView(), document.querySelector('[data-reset]').click(), document.querySelector('[data-reset]').click(), true")
+    await asyncio.sleep(1)
+    gone = await p.js("({ cheats: ghostDesk.state().cheats || null, star: !!document.querySelector('#totalPl .star') })")
+    res(gone["cheats"] is None and not gone["star"], "Reset: the ★ is gone from the new portfolio", "reset star")
+    return fails
+
+
+async def cheats_live_check(p):
+    """Real app, real sources: Time machine loads yesterday's BTC 1-minute candles; Golden entry and Sniper fill at real prices."""
+    await p.send("Emulation.setDeviceMetricsOverride", width=375, height=812, deviceScaleFactor=2, mobile=True)
+    await p.goto(BASE + "/index.html#home", "!!document.querySelector('#view .cd-card')")
+    await p.js("""(async () => { const st = await import('./js/store.js'), E = await import('./js/core/engine.js');
+      await st.openStore(); await st.kv.set('portfolio', E.newPortfolio(Date.now())); await st.kv.set('bots', { v: 1, list: [] }); return true; })()""")
+    await p.goto(BASE + "/index.html?r=4#markets", "!!document.querySelector('#view .row')")
+    await asyncio.sleep(15)
+    click = lambda sel: p.js(f"(() => {{ const e = document.querySelector({sel!r}); if (!e) return false; e.scrollIntoView(); e.click(); return true; }})()")
+    # Time machine: BTC, yesterday
+    await click("[data-tab=home]")
+    await p.js("document.querySelector('[data-settings], .gear, #gear')?.click() || true")
+    await asyncio.sleep(0.5)
+    await click("[data-cheats]")
+    await asyncio.sleep(0.5)
+    await p.js("(() => { const s = document.getElementById('tmInst'); s.value = 'crypto:BTCUSDT'; return true; })()")
+    await click("[data-tm]")
+    await asyncio.sleep(10)
+    clock = await p.js("document.getElementById('rpClock')?.textContent")
+    px = await p.js("document.getElementById('rpPx')?.textContent")
+    print("Time machine:", clock, "| price", px)
+    await click("[data-rp=peek]")
+    await asyncio.sleep(0.4)
+    await p.shot("live-time-machine")
+    await click("[data-rp=hour]")
+    await asyncio.sleep(0.4)
+    print("After +1 hour:", await p.js("document.getElementById('rpClock')?.textContent"), "| price", await p.js("document.getElementById('rpPx')?.textContent"))
+    tm_ok = bool(clock) and "$" in (px or "")
+    await click("[data-close]")
+    await asyncio.sleep(0.5)
+    # Golden entry on BTC: arm it, buy $1,000 with the slider (keyboard), read the fill
+    await p.js("document.querySelector('[data-settings], .gear, #gear')?.click() || true")
+    await asyncio.sleep(0.4)
+    await click("[data-cheats]")
+    await asyncio.sleep(0.4)
+    await click("[data-arm=golden]")
+    await click("[data-arm=sniper]")
+    await click("[data-close]")
+    await asyncio.sleep(0.4)
+    await p.js("(() => { const b = document.createElement('button'); b.dataset.open = 'crypto:BTCUSDT'; b.hidden = true; document.body.append(b); b.click(); b.remove(); return true; })()")
+    await asyncio.sleep(5)
+    live_px = await p.js("document.querySelector('.sh-body .big')?.textContent")
+    await click("[data-side=buy]")
+    await asyncio.sleep(0.3)
+    await p.js("(() => { const i = document.getElementById('amtIn'); i.value = '1000'; i.dispatchEvent(new Event('input', { bubbles: true })); return true; })()")
+    await asyncio.sleep(0.3)
+    print("Trade box:", (await p.js("document.getElementById('quote').innerText")).replace(chr(10), " | "))
+    await p.js("document.querySelector('.swipe-thumb').dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true })), true")
+    await asyncio.sleep(6)
+    await click("[data-close]")
+    await asyncio.sleep(0.4)
+    # Sniper on the newest memecoin of the "New" list
+    await click("[data-tab=markets]")
+    await click(".seg.mk [data-market=meme]")
+    await click("[data-memeview=new]")
+    await asyncio.sleep(10)
+    await click("#view .row")
+    await asyncio.sleep(5)
+    meme_px = await p.js("document.querySelector('.sh-body .big')?.textContent")
+    await click("[data-side=buy]")
+    await asyncio.sleep(0.3)
+    await p.js("(() => { const i = document.getElementById('amtIn'); i.value = '100'; i.dispatchEvent(new Event('input', { bubbles: true })); return true; })()")
+    await p.js("document.querySelector('.swipe-thumb').dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true })), true")
+    await asyncio.sleep(8)
+    toast = await p.js("document.getElementById('toast').innerText")
+    await p.shot("live-sniper")
+    await asyncio.sleep(1)
+    st = await p.js("""(async () => { const st = await import('./js/store.js'); const s = await st.kv.get('portfolio');
+      return { trades: s.trades.map(t => [t.sym, t.side, +t.mid.toPrecision(8), t.cheat || []]), armed: s.cheats?.armed }; })()""")
+    print("Live BTC price on the sheet:", live_px, "| memecoin price:", meme_px, "| last notice:", toast)
+    for t in st["trades"]:
+        print("  trade:", *t)
+    print("  still armed:", {k: v for k, v in (st["armed"] or {}).items() if v})
+    golden = [t for t in st["trades"] if "Golden entry" in t[3]]
+    live_num = float((live_px or "0").replace("$", "").replace(",", "") or 0)
+    g_ok = bool(golden) and golden[0][2] <= live_num * 1.0001
+    print(("PASS " if tm_ok else "FAIL ") + " Time machine loaded yesterday's real BTC candles")
+    print(("PASS " if g_ok else "FAIL ") + f" Golden entry filled BTC at {golden[0][2] if golden else '—'}, the 15-minute low (live was {live_px})")
+    print("INFO  Sniper:", "filled at the first candle" if any("Sniper" in t[3] for t in st["trades"]) else "not filled: " + (toast or ""))
+    if p.events:
+        print("Console:", *p.events[:10], sep=chr(10) + "  ")
+    await p.js("""(async () => { const st = await import('./js/store.js'), E = await import('./js/core/engine.js'); await st.kv.set('portfolio', E.newPortfolio(Date.now())); return true; })()""")
+    return tm_ok and g_ok and not p.events
+
+
+async def sim_ui_tests(p, check):
+    """Live / Sim switch with a real tap; invented markets; event banner; combo; jackpot; records; Live untouched."""
+    fails = []
+    def res(good, text, key):
+        print(("PASS " if good else "FAIL ") + " " + text)
+        if not good:
+            fails.append(key)
+    async def wait(expr, timeout):
+        t0 = time.time()
+        while time.time() - t0 < timeout:
+            await asyncio.sleep(0.3)
+            try:
+                if await p.js(expr):
+                    return True
+            except Exception:
+                pass
+        return False
+    enter = "document.querySelector('.swipe-thumb').dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true })), true"
+    await p.js("ghostDesk.closeSheet(true), ghostDesk.setTab('home'), true")
+    await asyncio.sleep(0.3)
+    live0 = await p.js("({ cash: ghostDesk.state().cash, trades: ghostDesk.state().trades.length, start: ghostDesk.state().start })")
+    sw = await p.js("[...document.querySelectorAll('.mode button')].map(b => b.textContent.trim() + ':' + b.getAttribute('aria-pressed'))")
+    await p.js("document.getElementById('simBtn').click(), true")
+    await wait("document.body.classList.contains('sim') && document.documentElement.dataset.ready === '1'", 15)
+    await asyncio.sleep(0.6)
+    info = await p.js("""(() => { const g = ghostDesk, L = g.lists; return { sim: g.isSim(), label: document.querySelector('.total-box small').textContent,
+      pressed: document.getElementById('simBtn').getAttribute('aria-pressed'), crypto: L.crypto.length, stock: L.stock.length, fx: L.fx.length, meme: L.meme.new.length,
+      names: L.crypto.slice(0, 3).map(k => g.live.get(k).inst.sym), real: L.crypto.includes('crypto:BTCUSDT'), cash: g.state().cash, trades: g.state().trades.length }; })()""")
+    await check("sim home")
+    res(sw == ["Connecting:true", "Sim:false"] or sw[1] == "Sim:false", f"Live / Sim switch at the top: {sw}", "switch")
+    res(info["sim"] and info["pressed"] == "true" and info["label"] == "Your Sim portfolio" and info["crypto"] == 14 and info["stock"] == 14 and info["fx"] == 8 and info["meme"] >= 20 and not info["real"] and info["trades"] == 0,
+        f"Sim mode: “{info['label']}”, {info['crypto']} crypto ({', '.join(info['names'])}…), {info['stock']} stocks, {info['fx']} forex, {info['meme']} memecoins; own portfolio {info['cash']}", "sim mode")
+    for m in ["meme", "crypto", "stock", "fx"]:
+        await p.js(f"ghostDesk.setTab('markets'), document.querySelector('.seg.mk [data-market=\"{m}\"]').click(), true")
+        await asyncio.sleep(0.4)
+        await check("sim markets " + m)
+    # prices move each second; new coins appear
+    mv = await p.js("""(() => { const g = ghostDesk, w = g.sim(), k = g.lists.crypto[0], a = g.live.get(k).px, n0 = w.coinN;
+      for (let i = 1; i <= 12; i++) g.simAdvance(w.t + 1000);
+      return { a, b: g.live.get(k).px, coins: w.coinN - n0, open: !!document.querySelector('.mkt.open, .cd-strip.sim') || true }; })()""")
+    res(mv["a"] != mv["b"] and mv["coins"] >= 1, f"Prices move every second ({mv['a']:.6g} → {mv['b']:.6g}); {mv['coins']} new memecoins in 12 s", "moves")
+    # a memecoin sheet: Sim candles, buy with the slider
+    key = await p.js("(() => { const w = ghostDesk.sim(); const i = ghostDesk.lists.meme.new.map(k => w.insts[k]).find(i => !i.dead && i.b1.length > 3); i.fate.rugAt = null; i.fate.mult = 0; return i.key; })()")
+    await p.js(f"ghostDesk.closeSheet(true), ghostDesk.openSheet('{key}'), true")
+    await asyncio.sleep(0.7)
+    await check("sim sheet memecoin")
+    note = await p.js("document.getElementById('chartNote')?.textContent")
+    await p.js("ghostDesk.chooseSide('buy'), true")
+    await asyncio.sleep(0.2)
+    await p.js("document.querySelector('[data-amt=\"500\"]').click(), true")
+    await asyncio.sleep(0.2)
+    await p.js(enter)
+    await asyncio.sleep(0.5)
+    t = await p.js("(() => { const t = ghostDesk.state().trades.at(-1); return t ? { sym: t.sym, usd: t.usd, fee: t.fee } : null; })()")
+    res(bool(t) and abs(t["usd"] - 500) < 1e-9 and abs(t["fee"] - 5) < 1e-9 and "Sim candles" in (note or ""),
+        f"Bought $500 of {t and t['sym']} (fee {t and t['fee']}, same 1% as Live); chart “{note}”", "sim buy")
+    # Jackpot: the coin goes 12x
+    await p.js(f"(() => {{ const g = ghostDesk, w = g.sim(); w.insts['{key}'].px *= 12; g.simAdvance(w.t + 1000); return true; }})()")
+    await asyncio.sleep(0.5)
+    jp = await p.js("({ shown: !document.getElementById('jackpot').hidden, text: document.getElementById('jackpot').innerText.replace(/\\n/g, ' '), shake: document.getElementById('app').classList.contains('shake') || true, rec: ghostDesk.rec().jackpot })")
+    await p.shot("sim-jackpot")
+    res(jp["shown"] and "JACKPOT" in jp["text"] and jp["rec"] and jp["rec"]["mult"] >= 10, f"JACKPOT at 10x+: “{jp['text']}”", "jackpot")
+    await p.js("document.getElementById('jackpot').click(), true")
+    # sell it (a win), then two more wins on crypto: combo x2, x3
+    await p.js("ghostDesk.chooseSide('sell'), true")
+    await asyncio.sleep(0.2)
+    await p.js("document.querySelector('[data-frac=\"1\"]')?.click(), true")
+    await asyncio.sleep(0.2)
+    await p.js(enter)
+    await asyncio.sleep(0.5)
+    for k in range(2):
+        ck = await p.js(f"ghostDesk.lists.crypto[{k + 1}]")
+        await p.js(f"ghostDesk.closeSheet(true), ghostDesk.openSheet('{ck}'), true")
+        await asyncio.sleep(0.4)
+        await p.js("ghostDesk.chooseSide('buy'), true")
+        await asyncio.sleep(0.15)
+        await p.js("document.querySelector('[data-amt=\"500\"]').click(), true")
+        await asyncio.sleep(0.15)
+        await p.js(enter)
+        await asyncio.sleep(0.4)
+        await p.js(f"(() => {{ const g = ghostDesk, w = g.sim(); w.insts['{ck}'].px *= 1.2; g.simAdvance(w.t + 1000); return true; }})()")
+        await p.js("ghostDesk.chooseSide('sell'), true")
+        await asyncio.sleep(0.15)
+        await p.js("document.querySelector('[data-frac=\"1\"]')?.click(), true")
+        await asyncio.sleep(0.15)
+        await p.js(enter)
+        await asyncio.sleep(0.5)
+    await p.js("ghostDesk.closeSheet(true), document.getElementById('jackpot').hidden = true, true")
+    await asyncio.sleep(0.3)
+    combo = await p.js("({ text: document.getElementById('combo').hidden ? '' : document.getElementById('combo').textContent, wins: ghostDesk.rec().wins, sells: ghostDesk.state().trades.filter(t => t.side === 'sell').map(t => +t.pl.toFixed(2)) })")
+    await check("sim combo")
+    res(combo["wins"] == 3 and "x3" in combo["text"], f"Combo: “{combo['text']}” after sales {combo['sells']}", "combo")
+    # Event with a giant banner and a real countdown
+    ev = await p.js("(() => { const e = ghostDesk.simForce('elonTweet'); return { title: e.title, until: e.until }; })()")
+    await asyncio.sleep(1.3)
+    ban = await p.js("({ t: document.querySelector('.sim-event .se-t b')?.textContent, cd1: document.querySelector('.sim-event .se-cd')?.textContent, h: document.querySelector('.sim-event')?.getBoundingClientRect().height })")
+    await asyncio.sleep(1.1)
+    cd2 = await p.js("document.querySelector('.sim-event .se-cd')?.textContent")
+    await check("sim event banner")
+    res(ban["t"] == "Elon tweet" and ban["cd1"] and ban["cd1"] != cd2 and ban["h"] >= 60, f"Event banner “{ban['t']}”, {round(ban['h'] or 0)} px tall, countdown {ban['cd1']} → {cd2}", "event")
+    # Records on the Trophies tab; sounds off by default
+    await p.js("ghostDesk.setTab('achievements'), true")
+    await asyncio.sleep(0.5)
+    rec = await p.js("[...document.querySelectorAll('.rec > div')].map(d => d.innerText.replace(/\\n/g, ' '))")
+    await check("sim records")
+    await p.js("ghostDesk.openSettings(), true")
+    await asyncio.sleep(0.3)
+    snd = await p.js("document.getElementById('simSoundTog')?.checked")
+    await check("sim settings")
+    res(len(rec) == 4 and "x3" in rec[0] and "x" in rec[1] and "3 wins" in rec[3] and snd is False, f"Sim records: {rec}; Sim sounds start off", "records")
+    # A rug pull on a coin you hold: RUG PULL screen and the worst-rug record
+    rk = await p.js("(() => { const w = ghostDesk.sim(); const i = ghostDesk.lists.meme.new.map(k => w.insts[k]).find(i => !i.dead); i.fate.rugAt = null; return i.key; })()")
+    await p.js(f"ghostDesk.closeSheet(true), ghostDesk.openSheet('{rk}'), true")
+    await asyncio.sleep(0.5)
+    await p.js("ghostDesk.chooseSide('buy'), true")
+    await asyncio.sleep(0.15)
+    await p.js("document.querySelector('[data-amt=\"500\"]').click(), true")
+    await asyncio.sleep(0.15)
+    await p.js(enter)
+    await asyncio.sleep(0.4)
+    await p.js(f"(() => {{ const g = ghostDesk, w = g.sim(); w.insts['{rk}'].fate.rugAt = w.t + 500; g.simAdvance(w.t + 1000); return true; }})()")
+    await asyncio.sleep(0.4)
+    rug = await p.js("({ text: document.getElementById('result').hidden ? '' : document.getElementById('result').innerText.split(String.fromCharCode(10)).join(' '), rec: ghostDesk.rec().rug })")
+    await p.shot("sim-rug")
+    res("RUG PULL" in rug["text"] and rug["rec"] and rug["rec"]["usd"] > 400, f"Rug pull on a coin you hold: “{rug['text']}”; worst rug {rug['rec'] and round(rug['rec']['usd'], 2)}", "rug")
+    await p.js("ghostDesk.closeSheet(true), true")
+    # Cheats work in Sim, on the Sim portfolio
+    c0 = await p.js("ghostDesk.state().cash")
+    await p.js("ghostDesk.openCheats(), true")
+    await asyncio.sleep(0.3)
+    await p.js("document.querySelector('[data-print=\"10000\"]').click(), true")
+    await asyncio.sleep(0.3)
+    c1 = await p.js("({ cash: ghostDesk.state().cash, star: !!document.querySelector('#totalPl .star') })")
+    res(abs(c1["cash"] - c0 - 10000) < 1e-6 and c1["star"], f"Cheats in Sim: Money printer {c0:.2f} → {c1['cash']:.2f}, ★ on the Sim portfolio", "sim cheats")
+    # Back to Live with the real button: Live portfolio untouched, no star
+    await p.js("ghostDesk.closeSheet(true), document.getElementById('liveDot').click(), true")
+    await wait("!document.body.classList.contains('sim') && document.documentElement.dataset.ready === '1'", 15)
+    await asyncio.sleep(0.6)
+    live1 = await p.js("({ sim: ghostDesk.isSim(), cash: ghostDesk.state().cash, trades: ghostDesk.state().trades.length, start: ghostDesk.state().start, star: !!document.querySelector('#totalPl .star'), label: document.querySelector('.total-box small').textContent, btc: ghostDesk.lists.crypto.length === 0 || !ghostDesk.lists.crypto.some(k => k.startsWith('crypto:NBL')) })")
+    await check("back to live")
+    res(not live1["sim"] and live1["cash"] == live0["cash"] and live1["trades"] == live0["trades"] and not live1["star"] and live1["label"] == "Your portfolio" and live1["btc"],
+        f"Back to Live: portfolio untouched (cash {live1['cash']}, {live1['trades']} trades), no ★, no Sim coins", "back to live")
+    return fails
+
+
+async def sim_live_check(p):
+    """Real app (no test mode) in Sim: the one-second clock, events, new coins, saving, reload, back to Live."""
+    await p.send("Emulation.setDeviceMetricsOverride", width=375, height=812, deviceScaleFactor=2, mobile=True)
+    await p.goto(BASE + "/index.html#home", "!!document.querySelector('#view .stat-row')")
+    live_pf = await p.js("(async () => { const st = await import('./js/store.js'); await st.openStore(); const s = await st.kv.get('portfolio'); return s ? s.trades.length + ':' + s.cash : 'none'; })()")
+    await p.js("document.getElementById('simBtn').click(), true")
+    await asyncio.sleep(4)
+    await p.goto(BASE + "/index.html?r=5#markets", "document.body.classList.contains('sim') && !!document.querySelector('#view .row')")
+    t0 = time.time()
+    a = await p.js("({ total: document.getElementById('total').textContent, rows: document.querySelectorAll('#view .row').length, first: document.querySelector('#view .row .nm b')?.textContent })")
+    await p.js("document.querySelector('.seg.mk [data-market=meme]').click(), true")
+    seen = set()
+    for _ in range(40):
+        await asyncio.sleep(1)
+        seen.add(await p.js("document.querySelector('.tape')?.textContent.slice(0, 80)"))
+    b = await p.js("({ rows: document.querySelectorAll('#view .row').length, ev: document.querySelector('.sim-event .se-t b')?.textContent || null })")
+    await p.shot("live-sim")
+    await asyncio.sleep(31)  # the world is saved every 30 s
+    w1 = await p.js("(async () => { const st = await import('./js/store.js'); const w = await st.kv.get('sim.world'); return { n: w.coinN, t: w.t, memes: w.memes.length }; })()")
+    await p.goto(BASE + "/index.html?r=6#markets", "document.body.classList.contains('sim') && !!document.querySelector('#view .row')")
+    await asyncio.sleep(3)
+    w2 = await p.js("(async () => { const st = await import('./js/store.js'); const rows = document.querySelectorAll('#view .row').length; return { rows, label: document.querySelector('.total-box small').textContent }; })()")
+    await p.js("document.getElementById('liveDot').click(), true")
+    await asyncio.sleep(4)
+    await p.goto(BASE + "/index.html?r=7#home", "!!document.querySelector('#view .stat-row')")
+    back = await p.js("(async () => { const st = await import('./js/store.js'); const s = await st.kv.get('portfolio'); return { sim: document.body.classList.contains('sim'), pf: s ? s.trades.length + ':' + s.cash : 'none' }; })()")
+    print(f"Sim: {a['rows']} crypto listed (first {a['first']}), total {a['total']}; {len(seen)} different tapes in 40 s; {b['rows']} rows after; event: {b['ev']}")
+    print(f"Saved world: {w1['n']} coins born so far, {w1['memes']} alive; after reload: {w2['rows']} rows, “{w2['label']}”")
+    ok1 = a["rows"] >= 14 and len(seen) >= 20 and w1["n"] > 22 and w2["rows"] >= 14 and w2["label"] == "Your Sim portfolio"
+    ok2 = not back["sim"] and back["pf"] == (live_pf if live_pf != "none" else back["pf"]) and back["pf"].startswith("0:")
+    print(("PASS " if ok1 else "FAIL ") + " Sim runs on its own one-second clock, is saved and continues after a reload")
+    print(("PASS " if ok2 else "FAIL ") + f" Back to Live: Live portfolio unchanged (before {live_pf}, after {back['pf']} = trades:cash)")
+    if p.events:
+        print("Console:", *p.events[:10], sep=chr(10) + "  ")
+    return ok1 and ok2 and not p.events
 
 
 async def bots_live_check(p):

@@ -63,23 +63,24 @@ function nonUsdQuote(inst) {
  * Returns {qty, eff, fee, slip, impact} or null when there is no usable price.
  * slip is the dollar cost of spread / slippage / impact versus the mid price.
  */
-export function quoteBuy(inst, usd, q) {
+export function quoteBuy(inst, usd, q, mods = {}) {
   const px = q?.px;
   if (!(px > 0) || !(usd > 0)) return null;
   if (inst.m === "meme") {
-    const impact = memeImpact(usd, q.liq);
+    const impact = mods.zeroFees || mods.marketMaker ? 0 : memeImpact(usd, q.liq);
     const eff = px * (1 + impact);
-    const fee = usd * MEME_FEE;
+    const fee = mods.zeroFees ? 0 : usd * MEME_FEE;
     const qty = (usd - fee) / eff;
     return { qty, eff, fee, slip: usd - fee - qty * px, impact };
   }
   if (inst.m === "crypto") {
-    const eff = px * (1 + CRYPTO_SLIP);
-    const fee = usd * CRYPTO_FEE;
+    const sl = mods.zeroFees || mods.marketMaker ? 0 : CRYPTO_SLIP;
+    const eff = px * (1 + sl);
+    const fee = mods.zeroFees ? 0 : usd * CRYPTO_FEE;
     const qty = (usd - fee) / eff;
-    return { qty, eff, fee, slip: usd - fee - qty * px, impact: CRYPTO_SLIP };
+    return { qty, eff, fee, slip: usd - fee - qty * px, impact: sl };
   }
-  const hs = halfSpread(inst, px);
+  const hs = mods.zeroFees ? 0 : halfSpread(inst, px);
   const qu = quoteToUsd(inst, q);
   if (!(qu > 0)) return null;
   const eff = px + hs;
@@ -91,7 +92,7 @@ export function quoteBuy(inst, usd, q) {
  * Sell `frac` (0..1] of position pos at quote q.
  * Returns {qty, eff, fee, slip, proceeds, costPart, pl, plPct, impact}.
  */
-export function quoteSell(inst, pos, frac, q) {
+export function quoteSell(inst, pos, frac, q, mods = {}) {
   const px = q?.px;
   if (!(px > 0) || !pos || !(pos.qty > 0)) return null;
   frac = Math.min(1, Math.max(0, frac));
@@ -101,21 +102,21 @@ export function quoteSell(inst, pos, frac, q) {
   let eff, fee = 0, slip, proceeds, impact;
   if (inst.m === "meme") {
     const gross = qty * px;
-    impact = memeImpact(gross, q.liq);
+    impact = mods.zeroFees || mods.marketMaker ? 0 : memeImpact(gross, q.liq);
     const afterImpact = gross * (1 - impact);
-    fee = afterImpact * MEME_FEE;
+    fee = mods.zeroFees ? 0 : afterImpact * MEME_FEE;
     proceeds = afterImpact - fee;
     slip = gross * impact;
     eff = afterImpact / qty;
   } else if (inst.m === "crypto") {
-    impact = CRYPTO_SLIP;
-    eff = px * (1 - CRYPTO_SLIP);
+    impact = mods.zeroFees || mods.marketMaker ? 0 : CRYPTO_SLIP;
+    eff = px * (1 - impact);
     const gross = qty * eff;
-    fee = gross * CRYPTO_FEE;
+    fee = mods.zeroFees ? 0 : gross * CRYPTO_FEE;
     proceeds = gross - fee;
-    slip = qty * px * CRYPTO_SLIP;
+    slip = qty * px * impact;
   } else {
-    const hs = halfSpread(inst, px);
+    const hs = mods.zeroFees ? 0 : halfSpread(inst, px);
     impact = hs / px;
     eff = px - hs;
     if (nonUsdQuote(inst)) {
@@ -138,9 +139,71 @@ export function markValue(inst, pos, q) {
   if (!pos) return 0;
   const px = q?.px;
   if (!(px > 0)) return null;
+  if (isMargin(pos)) {
+    const qu = quoteToUsd(inst, q);
+    if (!(qu > 0)) return null;
+    return marginEquity(pos, px, qu);
+  }
   if (nonUsdQuote(inst)) {
     if (!(q.quoteUsd > 0)) return null;
     return pos.cost + pos.qty * (px - pos.avg) * q.quoteUsd;
   }
   return pos.qty * px;
+}
+
+// ---------------------------------------------------------------- leverage and shorts (Cheats)
+// A margin position: you put `cost` dollars of margin, it controls cost × lev dollars of the asset,
+// long (dir 1) or short (dir -1). Same fees and slippage as a normal trade, charged on the full size.
+// Its value is margin − entry fee ± qty × (price − entry); when that reaches 0 it is liquidated.
+
+export const isMargin = p => !!p && ((p.lev || 1) > 1 || (p.dir || 1) === -1);
+
+function feeRate(inst, mods) {
+  if (mods.zeroFees) return 0;
+  return inst.m === "meme" ? MEME_FEE : inst.m === "crypto" ? CRYPTO_FEE : 0;
+}
+/** Price slippage as a fraction of the price for a trade of `usd` dollars. */
+function slipFrac(inst, usd, q, mods) {
+  if (inst.m === "meme") return mods.zeroFees || mods.marketMaker ? 0 : memeImpact(usd, q.liq);
+  if (inst.m === "crypto") return mods.zeroFees || mods.marketMaker ? 0 : CRYPTO_SLIP;
+  return mods.zeroFees ? 0 : halfSpread(inst, q.px) / q.px;
+}
+
+/** Open margin × lev, long (dir 1) or short (dir -1). Returns {qty, eff, fee, slip, notional, impact}. */
+export function quoteOpenMargin(inst, margin, lev, dir, q, mods = {}) {
+  const px = q?.px, qu = quoteToUsd(inst, q || {});
+  if (!(px > 0) || !(margin > 0) || !(qu > 0)) return null;
+  const notional = margin * lev;
+  const fee = notional * feeRate(inst, mods);
+  const sf = slipFrac(inst, notional, q, mods);
+  const eff = px * (1 + dir * sf);
+  const qty = notional / (px * qu);
+  return { qty, eff, fee, slip: notional * sf, notional, impact: sf };
+}
+
+/** Equity of a margin position at price px (USD per unit of quote currency: qu). */
+export function marginEquity(pos, px, qu = 1) {
+  return pos.cost - (pos.entryFee || 0) + (pos.dir || 1) * pos.qty * (px - pos.avg) * qu;
+}
+
+/** Price at which the equity reaches 0 (liquidation). */
+export function liquidationPrice(pos, qu = 1) {
+  return pos.avg - (pos.dir || 1) * (pos.cost - (pos.entryFee || 0)) / (pos.qty * qu);
+}
+
+/** Close `frac` of a margin position. Proceeds can't go below 0 unless allowNegative (Diamond hands). */
+export function quoteCloseMargin(inst, pos, frac, q, mods = {}, allowNegative = false) {
+  const px = q?.px, qu = quoteToUsd(inst, q || {});
+  if (!(px > 0) || !(qu > 0) || !pos) return null;
+  frac = Math.min(1, Math.max(0, frac));
+  if (!(frac > 0)) return null;
+  const dir = pos.dir || 1, qty = pos.qty * frac, costPart = pos.cost * frac;
+  const size = qty * px * qu;
+  const sf = slipFrac(inst, size, q, mods);
+  const eff = px * (1 - dir * sf);
+  const fee = size * feeRate(inst, mods);
+  let proceeds = frac * (pos.cost - (pos.entryFee || 0)) + dir * qty * (eff - pos.avg) * qu - fee;
+  if (!allowNegative) proceeds = Math.max(0, proceeds);
+  const pl = proceeds - costPart;
+  return { qty, eff, fee, slip: size * sf, proceeds, costPart, pl, plPct: costPart > 0 ? pl / costPart : 0, impact: sf };
 }

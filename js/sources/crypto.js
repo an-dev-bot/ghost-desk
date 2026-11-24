@@ -135,6 +135,31 @@ export function createCrypto({ onTick, onKline, onState }) {
     return d.map(r => ({ t: r[0] * 1000, l: +r[1], h: +r[2], o: +r[3], c: +r[4] })).sort((a, b) => a.t - b.t);
   }
 
+  /** Real 1-minute candles between from and to (ms), for the Time machine. */
+  async function history(id, from, to) {
+    await loadPairs();
+    const out = new Map();
+    if (mode === "binance") {
+      let start = from;
+      for (let i = 0; i < 8 && start < to; i++) {
+        const d = await bn(`/api/v3/klines?symbol=${encodeURIComponent(id)}&interval=1m&startTime=${start}&endTime=${to - 1}&limit=1000`);
+        if (!Array.isArray(d) || !d.length) break;
+        for (const k of d) out.set(k[0], { t: k[0], o: +k[1], h: +k[2], l: +k[3], c: +k[4] });
+        start = d[d.length - 1][0] + 60e3;
+        if (d.length < 1000) break;
+      }
+    } else {
+      const prod = id.replace(/USDT$/, "") + "-USD";
+      for (let a = from; a < to; a += 300 * 60e3) {
+        const b = Math.min(to, a + 300 * 60e3);
+        const d = await getJSON(`${CB}/products/${encodeURIComponent(prod)}/candles?granularity=60&start=${new Date(a).toISOString()}&end=${new Date(b).toISOString()}`, { source: "coinbase" });
+        if (!Array.isArray(d)) throw new SourceError("coinbase", "http", "No candles");
+        for (const r of d) out.set(r[0] * 1000, { t: r[0] * 1000, l: +r[1], h: +r[2], o: +r[3], c: +r[4] });
+      }
+    }
+    return [...out.values()].filter(b => b.t >= from && b.t < to).sort((a, b) => a.t - b.t);
+  }
+
   // ---- live stream ----
   const bnStreams = () => [...[...want].map(id => id.toLowerCase() + "@miniTicker"), ...(chart ? [chart.id.toLowerCase() + "@kline_" + chart.ivl] : [])];
 
@@ -192,5 +217,5 @@ export function createCrypto({ onTick, onKline, onState }) {
     return true;
   }
 
-  return { top, find, tickers, hourChange, candles, watch, watchChart, inst, meta, get mode() { return mode; }, pause: () => sock?.stop(), resume: () => { if (sock) sock.start(); } };
+  return { top, find, tickers, hourChange, candles, history, watch, watchChart, inst, meta, get mode() { return mode; }, pause: () => sock?.stop(), resume: () => { if (sock) sock.start(); } };
 }

@@ -62,7 +62,13 @@ export function winStreak(trades) {
   return best;
 }
 
-const REASON = { manual: "manual", limit: "limit order", open: "waiting order (market open)", sl: "stop loss", tp: "take profit", bot: "bot" };
+const REASON = { manual: "manual", limit: "limit order", open: "waiting order (market open)", sl: "stop loss", tp: "take profit", bot: "bot", liq: "liquidation", airdrop: "airdrop", replay: "time machine" };
+
+/** buy / sell, or short / cover for a short position. */
+export function sideLabel(t) {
+  if (t.dir === -1) return t.side === "buy" ? "short" : "cover";
+  return t.side === "buy" ? "buy" : "sell";
+}
 
 /** US format a spreadsheet reads as a date: 11/23/2026 4:05:09 PM (phone's local time). */
 export function usDateTime(ms) {
@@ -71,7 +77,7 @@ export function usDateTime(ms) {
 }
 
 export function toCSV(trades) {
-  const head = ["date", "market", "symbol", "name", "side", "quantity", "price", "amount_usd", "fee_usd", "slippage_usd", "pl_usd", "pl_pct", "reason"];
+  const head = ["date", "market", "symbol", "name", "side", "quantity", "price", "amount_usd", "fee_usd", "slippage_usd", "pl_usd", "pl_pct", "reason", "leverage", "cheats"];
   const cell = v => {
     const s = v == null ? "" : String(v);
     return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
@@ -79,9 +85,10 @@ export function toCSV(trades) {
   // Token names come from the internet: never let a spreadsheet read them as formulas.
   const text = v => (/^[=+\-@\t\r]/.test(String(v ?? "")) ? "'" : "") + (v ?? "");
   const rows = trades.map(t => [
-    usDateTime(t.t), MARKET_LABEL[t.m] || t.m, text(t.sym), text(t.name), t.side === "buy" ? "buy" : "sell",
+    usDateTime(t.t), MARKET_LABEL[t.m] || t.m, text(t.sym), text(t.name), sideLabel(t),
     +t.qty.toPrecision(10), +t.px.toPrecision(10), t.usd.toFixed(2), (t.fee || 0).toFixed(4), (t.slip || 0).toFixed(4),
     t.side === "sell" ? t.pl.toFixed(2) : "", t.side === "sell" ? (t.plPct * 100).toFixed(2) : "", REASON[t.reason] || t.reason,
+    t.lev > 1 ? t.lev + "x" : "", (t.cheat || []).join("; "),
   ].map(cell).join(","));
   return "﻿" + [head.join(","), ...rows].join("\r\n") + "\r\n";
 }
