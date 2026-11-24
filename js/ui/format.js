@@ -4,25 +4,43 @@ export const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;"
 
 const nf = (min, max) => new Intl.NumberFormat("en-US", { minimumFractionDigits: min, maximumFractionDigits: max });
 const NF2 = nf(2, 2), NF0 = nf(0, 0);
+const NFDP = {};
+const NF_DP = dp => (NFDP[dp] ||= new Intl.NumberFormat("en-US", { minimumFractionDigits: dp, maximumFractionDigits: dp, useGrouping: false }));
 
-export function usd(n, { sign = false, compact = false } = {}) {
+// Big numbers are abbreviated everywhere: $1.25K, $3.4M, $12.7B, $1.05T (3 significant figures, trailing zeros
+// dropped), and never in scientific notation. tap() wraps one so that tapping it shows the full number.
+const SUFFIX = ["", "K", "M", "B", "T", "Qa", "Qi", "Sx", "Sp", "Oc", "No", "Dc"];
+/** 1250 → "1.25K", 3400000 → "3.4M", 999.5 → "1K". a ≥ 1000, positive. */
+export function abbr(a) {
+  let k = Math.min(SUFFIX.length - 1, Math.floor(Math.log10(a) / 3));
+  let m = a / 10 ** (3 * k);
+  let r = Number(m.toPrecision(3));
+  if (r >= 1000 && k < SUFFIX.length - 1) { k++; r = Number((m / 1000).toPrecision(3)); }
+  const digits = r >= 100 ? 0 : r >= 10 ? 1 : 2;
+  let txt = r >= 1000 ? NF0.format(Math.round(r)) : r.toFixed(digits);
+  if (txt.includes(".")) txt = txt.replace(/\.?0+$/, "");
+  return txt + SUFFIX[k];
+}
+
+/** Dollars. Abbreviated from $1,000 up; {full: true} gives every digit. */
+export function usd(n, { sign = false, full = false } = {}) {
   if (n == null || !isFinite(n)) return "—";
   const a = Math.abs(n);
   const s = n < 0 ? "-" : sign && n > 0 ? "+" : "";
-  if (compact) {
-    if (a >= 1e12) return s + "$" + (a / 1e12).toFixed(2) + "T";
-    if (a >= 1e9) return s + "$" + (a / 1e9).toFixed(2) + "B";
-    if (a >= 1e6) return s + "$" + (a / 1e6).toFixed(2) + "M";
-    if (a >= 1e4) return s + "$" + (a / 1e3).toFixed(1) + "K";
-  }
+  if (!full && a >= 1000) return s + "$" + abbr(a);
   return s + "$" + NF2.format(a);
+}
+/** HTML for a number that may be abbreviated: tapping it shows the full one. */
+export function tap(short, full) {
+  return short === full ? short : `<span class="ab" data-full="${esc(full)}">${short}</span>`;
 }
 
 /** Price with sensible decimals; dp forces decimals (FX pairs). */
-export function price(p, dp) {
+export function price(p, dp, { full = false } = {}) {
   if (p == null || !isFinite(p)) return "—";
-  if (dp != null) return p.toFixed(dp);
   const a = Math.abs(p);
+  if (dp != null) return !full && a >= 1e6 ? abbr(a) : NF_DP(dp).format(p);
+  if (!full && a >= 1000) return (p < 0 ? "-$" : "$") + abbr(a);
   if (a >= 1000) return "$" + NF2.format(p);
   if (a >= 1) return "$" + p.toFixed(a >= 100 ? 2 : 4).replace(/(\.\d{2}\d*?)0+$/, "$1");
   if (p === 0) return "$0";
@@ -30,18 +48,23 @@ export function price(p, dp) {
   return "$" + p.toFixed(Math.min(z + 4, 12));
 }
 
-export function pct(n, digits = 2) {
+/** Percent; huge ones abbreviated (+12.1K%, +1.2M%), never in scientific notation. */
+export function pct(n, digits = 2, { full = false } = {}) {
   if (n == null || !isFinite(n)) return "—";
-  return (n > 0 ? "+" : "") + n.toFixed(digits) + "%";
+  const a = Math.abs(n), s = n > 0 ? "+" : n < 0 ? "-" : "";
+  if (a >= 10000 && !full) return s + abbr(a) + "%";
+  return s + (a >= 1e21 ? NF0.format(a) : a.toFixed(digits)) + "%";
 }
 export const dirCls = n => (n > 0 ? "up" : n < 0 ? "down" : "flat");
 
-export function qty(n) {
+export function qty(n, { full = false } = {}) {
   if (n == null || !isFinite(n)) return "—";
   const a = Math.abs(n);
-  if (a >= 1e6) return NF0.format(n);
+  if (a >= 1e6) return full ? NF0.format(n) : (n < 0 ? "-" : "") + abbr(a);
   if (a >= 1) return nf(0, 4).format(n);
-  return n.toPrecision(4);
+  if (a === 0) return "0";
+  const z = Math.max(0, Math.floor(-Math.log10(a)));
+  return n.toFixed(Math.min(z + 4, 20)).replace(/0+$/, ""); // never 1.234e-7
 }
 
 /** 00:12:41, or "2 d 03:12:41" beyond a day. */

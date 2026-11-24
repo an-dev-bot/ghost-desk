@@ -97,14 +97,31 @@ picks up the new version. If you change app files, also bump the `VERSION` strin
   it opened: nothing is made up for the time it was closed. The leaderboard (Trophies, and Home when you have bots)
   shows you vs. each bot: total, % gain, best and worst trade; tap a bot for its positions and history.
   Resetting your portfolio restarts the bots with the same balance. Bots are included in the backup file.
-- **Cheats** (Settings → Cheats, 24 of them): Money printer, Zero fees, Market maker, Leverage 10x/50x/100x
+- **Cheats** (Settings → Cheats, 25 of them): Money printer, Zero fees, Market maker, Leverage 10x/50x/100x
   (real liquidation when the loss reaches the margin), Short anything, Magic limit, Whale mode, Golden entry,
   Perfect exit, Sniper, 2x Lucky trade, Ghost trade, Insurance, Double or nothing, Undo, Rug shield, Diamond hands,
   Second chance, Moon boost, Airdrop, Time machine and Time skip (replay a past day on real 1-minute candles in a
   separate replay portfolio), Copycat and X-ray. Golden entry, Perfect exit, Sniper and the Time machine use real
-  candles (Binance/Coinbase, GeckoTerminal, Twelve Data). Bots never cheat. Using any cheat marks your portfolio
+  candles (Binance/Coinbase, GeckoTerminal, Twelve Data). Using any cheat marks your portfolio
   with a ★ on the leaderboard and in the history, and achievements earned with cheats are kept apart (earning one
-  again without cheats moves it back). Resetting the portfolio removes the star.
+  again without cheats moves it back). Resetting the portfolio removes the star. Cheats work the same in Live and
+  Sim, except Oracle and Skip ahead, which exist only in Sim (in Live they show off, marked "Sim only").
+- **Always on**: the one-shot cheats (Golden entry, Perfect exit, Sniper, 2x Lucky trade, Ghost trade, Insurance,
+  Double or nothing) have an "Always on" switch that arms them again after every trade; those cards show an
+  ALWAYS ON tag and the list sits at the top of the Cheats menu.
+- **Double or nothing**: heads doubles the profit of your last winning sale; tails drops the whole portfolio (cash,
+  positions, leveraged positions, waiting orders) to $100. A confirmation screen ("If you lose, your whole portfolio
+  drops to $100") comes before every flip, also after every win when it's Always on.
+- **Bots cheat too** (Settings → Rival bots → "Bots can cheat", on by default): each bot arms up to 3 cheats a day at
+  random: Zero fees for 1 hour, Insurance 50%, 2x Lucky trade, Rug shield 20% for 1 hour, Golden entry (15-minute
+  low), Perfect exit, Leverage 10x or 20x, Money printer 10% of its balance. Never Undo, Ghost trade, Oracle, X-ray,
+  Time machine, Skip ahead or Always on. Their cheats show in Rival moves and give their row a ★.
+- **Money cap**: no portfolio (Live, Sim or a bot's) can be worth more than the combined fortune of the world's 100
+  richest people, $7.27T (Forbes Real-Time Billionaires, Nov 23, 2026, in `js/core/rich.js`; Settings shows the
+  date). A gain past it is cut, with a "World's richest" notice. Trophies has a **Billionaire ladder**: where your
+  total would rank among the 100 and how much you need to pass the next one.
+- **Big numbers** are abbreviated everywhere ($1.25K, $3.4M, $12.7B, $1.05T, +1.2M%), never in scientific notation;
+  tap one to see it in full. The live price at the top of a coin's page and the trade inputs stay full.
 - **Sim mode** (the Live / Sim switch at the top): invented markets with invented names in all four types, prices
   that move on their own every second, always open. Memecoins: a new one every few seconds, pumps of +1,000% in
   minutes (gold candles), very rare 100x moonshots, rug pulls to near zero, whales. Crypto is volatile, stocks have
@@ -114,6 +131,12 @@ picks up the new version. If you change app files, also bump the `VERSION` strin
   when a position reaches 10x. Sim sounds are off until you turn them on in Settings. Sim has its own portfolio,
   bots, achievements and records table (best multiplier, biggest jackpot, worst rug, longest streak), with the same
   costs, orders, bots and cheats as Live. Nothing in Sim is real. The Sim world only moves while the app is open.
+- **Skip ahead** (Sim only, +1h / +1d / +1w under the chart): plays the whole Sim world forward: candles, events,
+  new coins, rugs and the bots' trades; your limit orders, stop loss, take profit and trailing stop fill on the way.
+- **Oracle** (cheat, Sim only): plays the next 30 minutes of the coin you're viewing on a copy of the Sim world and
+  marks BUY and SELL = max profit on the chart; that future then happens exactly, unless you change it (leverage).
+- **Last chance** (Live and Sim, Settings): after a buy the app follows the high since your buy; at −X% from it
+  (10% by default) a big warning offers to sell, or an optional trailing stop sells by itself.
 - **Real hours**: stocks 9:30 AM to 4:00 PM New York time (with NYSE holidays and early closes);
   outside hours the order waits and fills at the first price after the open.
   Forex Sunday 5:00 PM to Friday 5:00 PM New York time. Crypto and memecoins always.

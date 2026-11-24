@@ -62,7 +62,7 @@ export function winStreak(trades) {
   return best;
 }
 
-const REASON = { manual: "manual", limit: "limit order", open: "waiting order (market open)", sl: "stop loss", tp: "take profit", bot: "bot", liq: "liquidation", airdrop: "airdrop", replay: "time machine" };
+const REASON = { manual: "manual", limit: "limit order", open: "waiting order (market open)", sl: "stop loss", tp: "take profit", bot: "bot", liq: "liquidation", airdrop: "airdrop", replay: "time machine", trail: "trailing stop" };
 
 /** buy / sell, or short / cover for a short position. */
 export function sideLabel(t) {

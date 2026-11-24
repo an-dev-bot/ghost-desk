@@ -18,6 +18,9 @@ import * as C from "../js/core/cheats.js";
 import * as RP from "../js/core/replay.js";
 import * as SW from "../js/sim/world.js";
 import * as FUN from "../js/sim/fun.js";
+import * as RICH from "../js/core/rich.js";
+import * as F from "../js/ui/format.js";
+import { cheatTick, BOT_CHEATS, validBots } from "../js/core/bots.js";
 
 const results = [];
 async function test(name, fn) {
@@ -532,7 +535,7 @@ await test("Cheats · a clean portfolio has no star; any cheat marks it; a reset
   C.setToggle(s, "zeroFees", false, T0 + 1);
   ok(E.isCheated(s), "turning it off doesn't remove the mark");
   ok(!E.isCheated(E.newPortfolio(T0 + 2)), "a reset portfolio is clean");
-  eq(C.CHEATS.length, 24, "24 cheats in the menu");
+  eq(C.CHEATS.length, 25, "25 cheats in the menu (Oracle included)");
 });
 
 await test("Cheats · Zero fees and Market maker", () => {
@@ -654,9 +657,18 @@ await test("Cheats · Ghost trade erases a losing position; Double or nothing fl
   ok(threw, "once per win");
   const e = cheated();
   E.executeBuy(e, BTC, 1000, { px: 60000, t: T0 }, T0);
-  const w2 = E.executeSell(e, BTC.key, 1, { px: 66000, t: T0 }, T0);
-  C.doubleOrNothing(e, 0.7, T0 + 1);
-  eq(w2.pl, 0, "tails: the profit is gone"); near(e.cash, 100000, "back to what it cost");
+  E.executeBuy(e, AAPL, 5000, { px: 200, t: T0 }, T0);
+  E.openMargin(e, BTC, 2000, 10, 1, { px: 66000, t: T0 }, T0);
+  E.placeOrder(e, BTC, { side: "buy", type: "limit", amount: 100, limit: 1 }, { px: 66000, t: T0 }, T0, ALWAYS);
+  eq(e.orders.length, 1, "an order waiting");
+  E.executeSell(e, BTC.key, 1, { px: 66000, t: T0 }, T0);
+  const lost = C.doubleOrNothing(e, 0.7, T0 + 1);
+  ok(!lost.won, "tails");
+  eq(e.cash, 100, "tails: the whole portfolio drops to $100");
+  eq(Object.keys(e.pos).length + E.marginPositions(e).length + e.orders.length, 0, "no positions, leveraged positions or orders left");
+  near(E.totals(e, () => ({ px: 66000, t: T0 })).total, 100, "worth exactly $100");
+  ok(lost.before > 100000, "the confirmation knew what was at stake");
+  ok(E.isCheated(e), "★");
 });
 
 await test("Cheats · Magic limit, Golden entry / Perfect exit / Sniper prices, Whale mode", () => {
@@ -679,7 +691,7 @@ await test("Cheats · Magic limit, Golden entry / Perfect exit / Sniper prices, 
   near(E.positionView(w.pos[MEME.key], { px: 1, liq: 100000 }).value, w.pos[MEME.key].qty, "the real price is unchanged");
 });
 
-await test("Cheats · Moon boost, Airdrop once a day, Copycat; bots never cheat", () => {
+await test("Cheats · Moon boost, Airdrop once a day, Copycat; my cheats never apply to a bot", () => {
   const s = cheated();
   E.executeBuy(s, MEME, 1000, { px: 1, liq: 1e9, t: T0 }, T0);
   const qty1 = s.pos[MEME.key].qty;
@@ -699,7 +711,7 @@ await test("Cheats · Moon boost, Airdrop once a day, Copycat; bots never cheat"
   const bot = newBot("momentum", { id: "c", start: 100000, now: T0, seed: 1 });
   C.setToggle(a, "whale", true, T0); C.setToggle(a, "zeroFees", true, T0);
   const [bt] = botStep(bot, { entries: [L(BTC, 60000, T0, { ch24: 5 })], now: T0, status: statusAt(T0), bootAt: 0 });
-  near(bt.fee, 6, "my Zero fees don't apply to the bot: it pays 0.1% on $6,000"); ok(!bot.pf.cheats && !bt.cheat, "the bot has no cheats");
+  near(bt.fee, 6, "my Zero fees don't apply to the bot: it pays 0.1% on $6,000"); ok(!bot.pf.cheats && !bt.cheat, "the bot has no cheats of its own yet");
   const me = cheated();
   C.copycat(me, bot, T0 + 1);
   near(me.cash, bot.pf.cash, "same cash"); deepEq(Object.keys(me.pos), Object.keys(bot.pf.pos), "same positions");
@@ -855,7 +867,7 @@ await test("Sim: whales shake memecoins; stocks crash and rally; forex calm exce
   const sd = Math.sqrt(calm.reduce((a, x) => a + x * x, 0) / calm.length);
   ok(sd < 0.00005, "forex 1-second moves are tiny: " + sd);
   const st = w.insts["stock:NVMT"], cr = w.insts["crypto:VTX"];
-  const vol = i => { const b = i.b1.slice(-30); let a = 0; for (let k = 1; k < b.length; k++) a += Math.log(b[k][4] / b[k - 1][4]) ** 2; return Math.sqrt(a / (b.length - 1)); };
+  const vol = i => { const b = i.b1.slice(-60), r = []; for (let k = 1; k < b.length; k++) r.push(Math.abs(Math.log(b[k][4] / b[k - 1][4]))); r.sort((x, y) => x - y); return r[r.length >> 1]; }; // median: a news jump does not count
   ok(vol(cr) > vol(fx) * 5, "crypto moves much more than forex");
   ok(seen.coin > 150 && seen.gone > 0, `new coins ${seen.coin}, old ones pruned`);
   ok(byM(w, "meme").length <= SW.MAX_MEMES, "memecoins capped at " + SW.MAX_MEMES);
@@ -948,6 +960,105 @@ await test("Sim: the app sees Sim prices like a real source: same costs, orders,
   ok(SW.search(w, "stock", "nova").includes("stock:NVMT"), "search by name");
 });
 
+await test("Oracle: the future it plays on a copy of the Sim world is exactly what then happens", () => {
+  const w = fresh(41);
+  const coin = byM(w, "meme").filter(i => !i.dead).sort((a, b) => b.born - a.born)[0];
+  const keep = new Set([coin.key, "crypto:NBL"]);
+  const lev = { "crypto:NBL": 50000 };
+  const t = w.t, px0 = coin.px;
+  const f = SW.future(w, coin.key, 600, { keep, lev });
+  eq(w.t, t, "the real world did not move"); eq(coin.px, px0, "nor its price");
+  eq(f.path.length, 600, "600 seconds ahead");
+  const real = [];
+  for (let s = 1; s <= 600; s++) { SW.step(w, t + s * 1000, { keep, lev }); real.push([w.t, w.insts[coin.key].px]); }
+  eq(JSON.stringify(real), JSON.stringify(f.path), "same prices, second by second");
+  eq(JSON.stringify(f.inst.b1.slice(-3)), JSON.stringify(w.insts[coin.key].b1.slice(-3)), "same candles");
+  // other coins dropped differently do not change this coin's future (each coin has its own random stream)
+  const w2 = fresh(41), c2 = w2.insts[coin.key];
+  const f2 = SW.future(w2, coin.key, 300, { keep: new Set([coin.key]), lev });
+  for (let s = 1; s <= 300; s++) SW.step(w2, t + s * 1000, { keep: new Set([coin.key, ...byM(w2, "meme").slice(0, 8).map(i => i.key)]), lev });
+  eq(c2.px, f2.path.at(-1)[1], "a different keep set, same future for this coin");
+});
+
+await test("Oracle: BUY at the best moment to enter, SELL = max profit at the peak", () => {
+  const path = [[1, 9], [2, 7], [3, 12], [4, 5], [5, 11], [6, 13], [7, 4], [8, 6]];
+  const b = SW.bestTrade(path, 0, 10);
+  eq(b.buy.t, 4, "buy at the low before the biggest gain"); eq(b.buy.px, 5, "buy price");
+  eq(b.sell.t, 6, "sell at the peak after it"); eq(b.sell.px, 13, "sell price"); near(b.gain, 1.6, "+160%");
+  eq(SW.bestTrade([[1, 9], [2, 8], [3, 7]], 0, 10), null, "only goes down: no trade");
+  near(SW.bestTrade([[1, 12]], 0, 10).gain, 0.2, "buy now if now is the low");
+  eq(SW.bestTrade([[1, 12]], 0, 10).buy.t, 0, "now");
+});
+
+await test("Skip ahead: +1h / +1d / +1w plans, long steps keep pumps and events to their real length", () => {
+  const sum = p => p.reduce((a, x) => a + x.dt * x.n * 1000, 0);
+  deepEq(SW.skipPlan(SW.SKIPS["1h"]), [{ dt: 20, n: 180 }], "1 hour: 20-second steps");
+  deepEq(SW.skipPlan(SW.SKIPS["1d"]), [{ dt: 300, n: 216 }, { dt: 20, n: 1080 }], "1 day: 5-minute steps, then the last 6 hours in 20 s");
+  for (const k in SW.SKIPS) eq(sum(SW.skipPlan(SW.SKIPS[k])), SW.SKIPS[k], k + " adds up");
+  // a +1,000% pump of 3 minutes inside one 5-minute step: the full pump, not more
+  const w = fresh(42);
+  const c = byM(w, "meme").filter(i => !i.dead).at(-1);
+  Object.assign(c.fate, { kind: "pump", pumpAt: w.t + 60e3, pumpDur: 180, mult: 11, rugAt: null });
+  c.pumping = false;
+  const p0 = c.px;
+  const out = SW.stepBy(w, 300, { keep: new Set([c.key]) });
+  ok(c.px / p0 > 4 && c.px / p0 < 40, `pump x${(c.px / p0).toFixed(1)} in one long step`);
+  ok(out.some(e => e.kind === "pump" && e.key === c.key) && c.b1.at(-1)[5] === 1, "pump reported, gold candle");
+  // a 75-second Bull run inside one 5-minute step moves crypto like 75 seconds of Bull run
+  const w1 = fresh(43), w2 = fresh(43);
+  SW.forceEvent(w1, "bull"); SW.forceEvent(w2, "bull");
+  const a = Object.fromEntries(byM(w1, "crypto").map(i => [i.key, i.px]));
+  SW.stepBy(w1, 300); for (let s = 0; s < 300; s++) SW.stepBy(w2, 1);
+  const avg = w => byM(w, "crypto").reduce((x, i) => x + Math.log(i.px / a[i.key]), 0) / 14;
+  ok(Math.abs(avg(w1) - avg(w2)) < 0.012 && avg(w1) > 0.02, `long step ${avg(w1).toFixed(4)} vs 1-second steps ${avg(w2).toFixed(4)} (bull: +0.0006/s × 75 s)`);
+});
+
+await test("Skip ahead: a whole week of Sim runs fast and leaves complete candles", () => {
+  const w = fresh(44);
+  const t0 = w.t, t = performance.now(), seen = {};
+  for (const seg of SW.skipPlan(SW.SKIPS["1w"])) for (let k = 0; k < seg.n; k++) for (const e of SW.stepBy(w, seg.dt, { keep: new Set(["crypto:NBL"]) })) seen[e.kind] = (seen[e.kind] || 0) + 1;
+  const ms = performance.now() - t;
+  eq(w.t, t0 + SW.SKIPS["1w"], "a week later");
+  ok(ms < 15000, `a week in ${Math.round(ms)} ms`);
+  const i = w.insts["crypto:NBL"], b1 = i.b1;
+  eq(b1.length, 360, "6 hours of 1-minute candles");
+  ok(b1.every((b, k) => !k || b[0] - b1[k - 1][0] === 60e3), "no gaps in the 1-minute candles");
+  ok(i.bh.filter(b => b[0] > t0).length >= 167, "hourly candles for the whole week");
+  ok(seen.event > 80 && seen.coin > 1000 && seen.rug > 100 && seen.pump > 50, JSON.stringify(seen));
+  ok(byM(w, "meme").length <= SW.MAX_MEMES + 1, "memecoins still capped");
+  const rs = [...byM(w, "crypto"), ...byM(w, "stock"), ...byM(w, "fx")].map(x => [x.sym, x.px / (x.m === "fx" ? x.bd[0][4] : x.px0)]).sort((a, b) => a[1] - b[1]);
+  const show = rs.slice(0, 2).concat(rs.slice(-2)).map(([k, r]) => `${k} x${r.toFixed(2)}`).join(", ");
+  ok(rs[0][1] > 1 / 8 && rs.at(-1)[1] < 8, "prices stay in a sane range after a week of events: " + show);
+});
+
+await test("Last chance: the high since you bought, the drop from it, and the trailing stop", () => {
+  const s = E.newPortfolio(ST0), BTC = { key: "crypto:BTCUSDT", m: "crypto", id: "BTCUSDT", sym: "BTC", name: "Bitcoin" };
+  const OPEN = { open: true, since: 0 };
+  E.executeBuy(s, BTC, 1000, { px: 100, t: ST0 }, ST0);
+  eq(s.pos[BTC.key].best, 100, "starts at the buy price");
+  E.checkKey(s, BTC.key, { px: 120, t: ST0 + 1 }, ST0 + 1, OPEN, { trail: 0.1 });
+  E.checkKey(s, BTC.key, { px: 115, t: ST0 + 2 }, ST0 + 2, OPEN, { trail: 0.1 });
+  eq(s.pos[BTC.key].best, 120, "the high since you bought");
+  near(E.drawdown(s.pos[BTC.key], 108), 0.1, "−10% from 120 at 108");
+  eq(E.checkKey(s, BTC.key, { px: 108.5, t: ST0 + 3 }, ST0 + 3, OPEN, { trail: 0.1 }).length, 0, "−9.6%: still held");
+  eq(E.checkKey(s, BTC.key, { px: 107, t: ST0 + 4 }, ST0 + 4, OPEN).length, 0, "no trailing stop without the setting");
+  const ev = E.checkKey(s, BTC.key, { px: 107, t: ST0 + 5 }, ST0 + 5, OPEN, { trail: 0.1 });
+  eq(ev.length, 1, "−10.8%: sold"); eq(ev[0].type, "trail", "trailing stop"); eq(ev[0].trade.reason, "trail", "reason"); eq(ev[0].best, 120, "from the high");
+  ok(!s.pos[BTC.key], "position closed");
+  // closed market: the high is tracked, nothing sells
+  const s2 = E.newPortfolio(ST0), AAPL = { key: "stock:AAPL", m: "stock", id: "AAPL", sym: "AAPL", name: "Apple" };
+  E.executeBuy(s2, AAPL, 1000, { px: 200, t: ST0 }, ST0);
+  eq(E.checkKey(s2, AAPL.key, { px: 150, t: ST0 + 1 }, ST0 + 1, { open: false }, { trail: 0.1 }).length, 0, "market closed: waits");
+  // a short watches the low
+  const s3 = E.newPortfolio(ST0);
+  E.openMargin(s3, BTC, 1000, 10, -1, { px: 100, t: ST0 }, ST0, "manual");
+  const m = Object.values(s3.margin)[0];
+  E.checkKey(s3, BTC.key, { px: 95, t: ST0 + 1 }, ST0 + 1, OPEN);
+  eq(m.best, 95, "short: the low since you opened"); near(E.drawdown(m, 99.75), 0.05, "+5% from the low");
+  const ev3 = E.checkKey(s3, BTC.key, { px: 99.8, t: ST0 + 2 }, ST0 + 2, OPEN, { trail: 0.05 });
+  ok(ev3.length === 1 && ev3[0].type === "trail" && !Object.keys(s3.margin).length, "short closed by the trailing stop");
+});
+
 await test("Sim: combo multiplier, jackpots at 10x and the records table", () => {
   eq([1, 2, 3, 4, 5, 6, 40].map(FUN.comboMult).join(), "1,2,3,5,8,13,100", "x1 x2 x3 x5 x8 x13 … x100");
   const r = FUN.newRecords();
@@ -999,6 +1110,132 @@ await test("Candles: the live price moves the last candle or opens a new one", (
 });
 
 // ---------------------------------------------------------------- report
+await test("Numbers · big ones abbreviated ($1.25K, $3.4M, $12.7B, $1.05T, +1.2M%), never e+24; full on request", () => {
+  eq(F.usd(1250), "$1.25K"); eq(F.usd(3.4e6), "$3.4M"); eq(F.usd(12.7e9), "$12.7B"); eq(F.usd(1.05e12), "$1.05T");
+  eq(F.usd(999.99), "$999.99", "under $1,000: every cent"); eq(F.usd(1000), "$1K"); eq(F.usd(999999), "$1M", "rounds up a suffix");
+  eq(F.usd(100000), "$100K"); eq(F.usd(-25000), "-$25K"); eq(F.usd(1234, { sign: true }), "+$1.23K");
+  eq(F.usd(1250, { full: true }), "$1,250.00", "full number");
+  eq(F.usd(7.268689556e12, { full: true }), "$7,268,689,556,000.00");
+  eq(F.pct(1.2e6), "+1.2M%"); eq(F.pct(12345), "+12.3K%"); eq(F.pct(-45.678), "-45.68%"); eq(F.pct(9999.5, 0), "+10000%");
+  for (const x of [F.usd(1e24), F.usd(1e40), F.pct(1e26), F.pct(1e26, 2, { full: true }), F.qty(1e-9), F.qty(3e25), F.price(1e-9), F.price(2e22), F.price(1e9, 5), F.usd(1e24, { full: true })])
+    ok(!/e[+-]?\d/.test(x), "no scientific notation: " + x);
+  eq(F.usd(1e24), "$1Sp"); eq(F.price(123456), "$123K"); eq(F.price(123456, null, { full: true }), "$123,456.00"); eq(F.price(1.08765, 5), "1.08765");
+  eq(F.qty(2.5e6), "2.5M"); eq(F.qty(0.000012345), "0.00001234");
+  eq(F.tap("$1.25K", "$1,250.00"), `<span class="ab" data-full="$1,250.00">$1.25K</span>`, "tap shows the full number");
+  eq(F.tap("$5.00", "$5.00"), "$5.00", "nothing to tap when it's already full");
+});
+
+await test("Money cap · no portfolio passes the world's 100 richest together; Billionaire ladder", () => {
+  eq(RICH.RICHEST.length, 100); ok(RICH.AS_OF > 0 && RICH.SOURCE.includes("Forbes"), "source and date");
+  near(RICH.WORLD_CAP, RICH.RICHEST.reduce((a, r) => a + r[2], 0), "the sum of the 100");
+  ok(RICH.RICHEST.every((r, i) => !i || r[2] <= RICH.RICHEST[i - 1][2]), "sorted");
+  const s = E.newPortfolio(T0, 100000);
+  s.cash = RICH.WORLD_CAP - 1e9;
+  E.executeBuy(s, BTC, 1e9, { px: 60000, t: T0 }, T0);
+  const tr = E.executeSell(s, BTC.key, 1, { px: 600000, t: T0 + 1 }, T0 + 1); // 10x
+  ok(tr.capped > 7.9e9 && tr.capped < 8e9, "the gain past the cap is cut (8B over, less fees): " + tr.capped);
+  near(E.totals(s, () => null).total, RICH.WORLD_CAP, "the portfolio stays at the cap", 1e-12);
+  ok(E.totals(s, () => null).capped, "capped flag");
+  const cut = E.addCash(s, 1e6);
+  near(cut, 1e6, "Money printer at the cap prints nothing", 1e-6); near(s.cash, RICH.WORLD_CAP, "still at the cap", 1e-12);
+  // a position worth more than the cap on paper: the total shows the cap
+  const h = E.newPortfolio(T0, 100000);
+  E.executeBuy(h, MEME, 1000, { px: 1, liq: 1e30, t: T0 }, T0);
+  ok(E.totals(h, () => ({ px: 1e12, liq: 1e30, t: T0 })).total <= RICH.WORLD_CAP, "a moonshot shows the cap");
+  // Double or nothing at the cap
+  const d = cheated(); d.cash = RICH.WORLD_CAP - 2e9;
+  E.executeBuy(d, BTC, 1e9, { px: 60000, t: T0 }, T0); E.executeSell(d, BTC.key, 1, { px: 66000, t: T0 }, T0);
+  C.doubleOrNothing(d, 0.1, T0 + 1);
+  ok(d.cash <= RICH.WORLD_CAP + 0.01, "doubling stops at the cap too");
+  // the ladder
+  const lo = RICH.ladder(5000);
+  eq(lo.place, 101, "$5K: not in the top 100"); eq(lo.above[0], 100, "#100 is the one to reach");
+  const top = RICH.ladder(RICH.RICHEST[0][2] + 1);
+  eq(top.place, 1, "richer than #1"); eq(top.above, null, "nobody above");
+  const mid = RICH.ladder(RICH.RICHEST[2][2] + 1);
+  eq(mid.place, 3, "just above #3 takes #3"); eq(mid.above[0], 2, "#2 is next");
+  eq(RICH.ladder(RICH.RICHEST[2][2]).place, 4, "a tie doesn't pass them");
+});
+
+await test("Always on · re-arms a one-shot cheat after every trade; not for toggles", () => {
+  const s = cheated();
+  for (const id of C.ALWAYS) ok(C.CHEAT[id].kind === "arm" || id === "don", id + " is a one-shot cheat");
+  C.setAlways(s, "golden", true, T0);
+  ok(C.isAlways(s, "golden") && C.isArmed(s, "golden"), "on and armed"); ok(E.isCheated(s), "★");
+  s.cheats.armed.golden = false; // used by a buy
+  deepEq(C.rearm(s), ["golden"], "armed again after the trade"); ok(C.isArmed(s, "golden"));
+  deepEq(C.rearm(s), [], "nothing to do while it's armed");
+  C.setAlways(s, "golden", false, T0 + 1); s.cheats.armed.golden = false;
+  deepEq(C.rearm(s), [], "off: it stays used up");
+  C.setAlways(s, "don", true, T0); ok(C.isAlways(s, "don"), "Double or nothing can be always on (it asks after every win)");
+  let threw = false; try { C.setAlways(s, "printer", true, T0); } catch { threw = true; }
+  ok(threw, "Money printer can't be always on");
+  threw = false; try { C.setAlways(s, "undo", true, T0); } catch { threw = true; }
+  ok(threw, "Undo can't be always on");
+});
+
+await test("Bot cheats · up to 3 a day at random from the list; same engine rules; can be turned off", () => {
+  const ids = BOT_CHEATS.map(c => c.id);
+  deepEq(ids, ["zeroFees", "insurance", "lucky", "rugShield", "golden", "perfect", "leverage", "printer"], "the list");
+  for (const bad of ["undo", "ghost", "oracle", "xray", "timeMachine", "skip"]) ok(!ids.includes(bad), "never " + bad);
+  const day0 = new Date(T0); day0.setHours(0, 0, 0, 0);
+  const seen = new Set(), counts = [];
+  for (let seed = 1; seed <= 40; seed++) {
+    const b = newBot("momentum", { id: "b" + seed, start: 100000, now: day0.getTime(), seed });
+    const used = [];
+    for (let t = day0.getTime() + 1; t < day0.getTime() + 86400e3; t += 600e3) used.push(...cheatTick(b, t, { quoteFor: () => null }));
+    counts.push(used.length);
+    ok(new Set(used.map(u => u.id)).size === used.length, "no cheat twice in a day");
+    for (const u of used) { seen.add(u.id); ok(ids.includes(u.id), u.id); }
+    if (used.length) ok(E.isCheated(b.pf), "★ on the bot");
+  }
+  ok(Math.max(...counts) <= 3 && Math.min(...counts) >= 1, "1 to 3 a day: " + counts.join(","));
+  ok(seen.size >= 7, "random from the whole list: " + [...seen].join(","));
+  // Money printer: 10% of its balance
+  const p = newBot("momentum", { id: "p", start: 100000, now: T0, seed: 9 });
+  p.cheatDay = localDay(T0); p.cheatsToday = BOT_CHEATS.filter(c => c.id !== "printer").map(c => c.id); p.cheatPlan = [T0];
+  const [u] = cheatTick(p, T0, { quoteFor: () => null });
+  eq(u.id, "printer"); near(p.pf.cash, 110000, "+10%");
+  // Zero fees for 1 hour, then it ends
+  const z = newBot("momentum", { id: "z", start: 100000, now: T0, seed: 3 });
+  z.cheatDay = localDay(T0); z.cheatsToday = BOT_CHEATS.filter(c => c.id !== "zeroFees").map(c => c.id); z.cheatPlan = [T0];
+  cheatTick(z, T0, {});
+  const [zt] = botStep(z, { entries: [L(BTC, 60000, T0, { ch24: 5 })], now: T0, status: statusAt(T0), bootAt: 0 });
+  eq(zt.fee, 0, "no fee during the hour");
+  cheatTick(z, T0 + 3600e3 + 1, {}); ok(!C.isOn(z.pf, "zeroFees"), "over after 1 hour");
+  // Golden entry: the low of the last 15 minutes; Perfect exit: the high of the day
+  const g = newBot("momentum", { id: "g", start: 100000, now: T0, seed: 4 });
+  C.state(g.pf).armed.golden = true;
+  let span = null;
+  const [gt] = botStep(g, { entries: [L(BTC, 60000, T0, { ch24: 5 })], now: T0, status: statusAt(T0), bootAt: 0, extreme: (k, from, kind) => { span = T0 - from; return kind === "low" ? 57000 : null; } });
+  eq(span, 15 * 60e3, "the last 15 minutes");
+  ok(gt.px < 58000 && gt.cheat?.includes("Golden entry"), "bought near the 15-minute low: " + gt.px); ok(!C.isArmed(g.pf, "golden"), "used up");
+  C.state(g.pf).armed.perfect = true;
+  const [st] = botStep(g, { entries: [L(BTC, 54000, T0 + 60e3, { ch24: 5 })], now: T0 + 60e3, status: statusAt(T0 + 60e3), bootAt: 0, extreme: (k, from, kind) => kind === "high" ? 63000 : null });
+  ok(st?.side === "sell" && st.px > 62000 && st.cheat?.includes("Perfect exit"), "sold at the day's high: " + st?.px);
+  // Leverage 20x: a margin position the bot closes, or is liquidated with the real rules
+  const v = newBot("momentum", { id: "v", start: 100000, now: T0, seed: 5 });
+  C.state(v.pf).lev = 20;
+  const [vt] = botStep(v, { entries: [L(BTC, 60000, T0, { ch24: 5 })], now: T0, status: statusAt(T0), bootAt: 0 });
+  eq(vt.lev, 20, "20x"); eq(E.marginPositions(v.pf).length, 1, "a leveraged position"); eq(C.leverage(v.pf), 1, "only on that buy");
+  const out = botStep(v, { entries: [L(BTC, 56000, T0 + 60e3, { ch24: 5 })], now: T0 + 60e3, status: statusAt(T0 + 60e3), bootAt: 0 });
+  ok(out.some(t => t.why === "liquidated"), "-6.7% at 20x: liquidated: " + out.map(t => t.why).join(","));
+  eq(E.marginPositions(v.pf).length, 0, "closed");
+  // Lucky trade doubles the bot's win, with the same rule as yours
+  const k = newBot("momentum", { id: "k", start: 100000, now: T0, seed: 6 });
+  botStep(k, { entries: [L(BTC, 60000, T0, { ch24: 5 })], now: T0, status: statusAt(T0), bootAt: 0 });
+  C.state(k.pf).armed.lucky = true; C.mark(k.pf, "lucky", "2x Lucky trade", T0);
+  const [kt] = botStep(k, { entries: [L(BTC, 66000, T0 + 60e3, { ch24: 5 })], now: T0 + 60e3, status: statusAt(T0 + 60e3), bootAt: 0 });
+  ok(kt?.cheat?.some(x => /Lucky/.test(x)), "2x Lucky trade on its win: " + JSON.stringify(kt?.cheat));
+  // Settings off: nothing armed, no plan
+  cheatTick(k, T0 + 1, { allowed: false });
+  eq(k.cheatPlan.length, 0); ok(!C.isArmed(k.pf, "lucky") && !C.isOn(k.pf, "zeroFees"), "Bots can cheat off: nothing armed");
+  ok(E.isCheated(k.pf), "the ★ stays: it cheated before");
+  // an imported bot keeps its cheats (but never Undo or Always on)
+  const list = [JSON.parse(JSON.stringify(k))]; list[0].pf.cheats.always = { golden: true }; list[0].pf.undo = {};
+  ok(validBots(list), "valid"); ok(list[0].pf.cheats && !list[0].pf.cheats.always && !list[0].pf.undo, "cheats kept, Always on and Undo dropped");
+});
+
 const pass = results.filter(r => r[0]).length;
 document.getElementById("results").innerHTML = results.map(r => `<span class="${r[0] ? "pass" : "fail"}">${r[0] ? "PASS" : "FAIL"}</span> ${r[1]}${r[0] ? "" : "\n       → " + r[2]}`).join("\n");
 document.getElementById("summary").innerHTML = `<b class="${pass === results.length ? "pass" : "fail"}">${pass}/${results.length} pass</b>`;

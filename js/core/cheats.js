@@ -1,5 +1,5 @@
-// Cheats: the owner's menu of unfair advantages. Pure state changes on the owner's portfolio (s.cheats);
-// bots never get s.cheats, so they always trade with the plain rules.
+// Cheats: the owner's menu of unfair advantages. Pure state changes on a portfolio's s.cheats. The bots arm
+// their own (a shorter list, see bots.js) through the same state and the same engine rules.
 //
 // Any cheat that is turned on, armed or used marks the portfolio (s.cheats.since): the leaderboard and the
 // history show a star, and achievements unlocked while it is marked are kept apart. Resetting the portfolio
@@ -31,6 +31,7 @@ export const CHEATS = [
   { id: "airdrop", group: "Memecoins", icon: "🪂", name: "Airdrop", desc: "Once a day, a random memecoin for free." },
   { id: "timeMachine", group: "Time", icon: "⏪", name: "Time machine", desc: "Replay a past day on real 1-minute candles at 0.25x, 1x, 10x or 60x, with Peek at the next 5 minutes. Only the past." },
   { id: "timeSkip", group: "Time", icon: "⏩", name: "Time skip", desc: "In the Time machine, jump 1 hour or 1 day ahead and see where your positions stand." },
+  { id: "oracle", group: "Time", icon: "🔮", name: "Oracle", kind: "toggle", desc: "Sim mode only: see the next 30 minutes of the coin you're viewing. The chart marks BUY at the best moment to enter and SELL = max profit at the peak, before it happens." },
   { id: "copycat", group: "Rivals", icon: "🐒", name: "Copycat", desc: "Copy the leading bot's portfolio into yours." },
   { id: "xray", group: "Rivals", icon: "🩻", name: "X-ray", kind: "toggle", desc: "See what each bot will buy before it does." },
 ];
@@ -39,6 +40,9 @@ export const PRINTER = [10000, 100000, 1000000];
 export const LEVERAGE = [1, 10, 50, 100];
 export const BOOST_MS = 10 * 60e3;
 export const AIRDROP_SHARE = 0.01;   // an airdrop is worth 1% of your starting balance at the live price
+export const DON_FLOOR = 100;        // Double or nothing lost: the whole portfolio drops to $100
+/** One-shot cheats that can be set to "Always on": re-armed by themselves after every trade. */
+export const ALWAYS = ["golden", "perfect", "sniper", "lucky", "ghost", "insurance", "don"];
 
 export function state(s) {
   return (s.cheats ||= { on: {}, armed: {}, lev: 1, whale: {}, boost: null, log: [], used: {}, since: null });
@@ -51,6 +55,23 @@ export function mark(s, id, text, now) {
   if (c.log.length > 300) c.log.shift();
 }
 export const isOn = (s, id) => !!s.cheats?.on?.[id];
+export const isAlways = (s, id) => !!s.cheats?.always?.[id];
+
+/** Always on: the cheat is armed now and re-arms itself after every trade (Double or nothing asks after every win). */
+export function setAlways(s, id, val, now) {
+  if (!ALWAYS.includes(id)) throw new E.TradeError("This cheat can't be always on.");
+  const c = state(s);
+  (c.always ||= {})[id] = !!val;
+  if (val) { if (CHEAT[id].kind === "arm") c.armed[id] = true; mark(s, id, `${CHEAT[id].name}: always on`, now); }
+  else c.log.push({ t: now, id, text: `${CHEAT[id].name}: always on off` });
+}
+/** After a trade: arm again every Always on cheat that was used up. Returns the ids re-armed. */
+export function rearm(s) {
+  const c = s.cheats, out = [];
+  if (!c?.always) return out;
+  for (const id in c.always) if (c.always[id] && CHEAT[id]?.kind === "arm" && !c.armed[id]) { c.armed[id] = true; out.push(id); }
+  return out;
+}
 export const isArmed = (s, id) => !!s.cheats?.armed?.[id];
 export const leverage = s => s.cheats?.lev || 1;
 
@@ -82,8 +103,9 @@ export function canShort(s, inst) {
 
 export function printMoney(s, usd, now) {
   if (!PRINTER.includes(usd)) throw new E.TradeError("Pick $10K, $100K or $1M.");
-  E.addCash(s, usd);
-  mark(s, "printer", `Money printer: +$${usd.toLocaleString("en-US")}`, now);
+  const cut = E.addCash(s, usd);
+  mark(s, "printer", `Money printer: +$${(usd - cut).toLocaleString("en-US", { maximumFractionDigits: 2 })}${cut ? " (stopped at the money cap)" : ""}`, now);
+  return cut;
 }
 
 export function undo(s, now) {
@@ -97,19 +119,30 @@ export function lastWin(s) {
   const t = s.trades[s.trades.length - 1];
   return t && t.side === "sell" && t.pl > 0 && !t.flip ? t : null;
 }
-/** Double or nothing on the last winning sale. coin: a random number in [0, 1). */
+/**
+ * Double or nothing on the last winning sale. coin: a random number in [0, 1).
+ * Win: the profit doubles. Lose: the whole portfolio (cash and positions) drops to $100; waiting orders are canceled.
+ */
 export function doubleOrNothing(s, coin, now) {
   const t = lastWin(s);
   if (!t) throw new E.TradeError("Double or nothing needs a winning sale as your last trade.");
   const won = coin < 0.5, gain = t.pl;
-  if (won) { s.cash += gain; t.usd += gain; t.pl = gain * 2; }
-  else { s.cash -= gain; t.usd -= gain; t.pl = 0; }
-  t.plPct = t.cost > 0 ? t.pl / t.cost : 0;
+  let before = null;
+  if (won) {
+    s.cash += gain; t.usd += gain; t.pl = gain * 2;
+    t.plPct = t.cost > 0 ? t.pl / t.cost : 0;
+    const cut = E.capCash(s);
+    if (cut) t.capped = (t.capped || 0) + cut;
+  } else {
+    before = E.totals(s, () => null).total;
+    s.cash = DON_FLOOR; s.pos = {}; s.margin = {}; s.orders = [];
+    if (s.cheats?.boost) s.cheats.boost = null;
+  }
   t.flip = won ? "won" : "lost";
-  (t.cheat ||= []).push(won ? "Double or nothing (won)" : "Double or nothing (lost)");
+  (t.cheat ||= []).push(won ? "Double or nothing (won)" : "Double or nothing (lost: portfolio to $100)");
   s.undo = null; // the flip is final
-  mark(s, "don", `Double or nothing on ${t.sym}: ${won ? "doubled to" : "lost the"} $${Math.abs(won ? gain * 2 : gain).toFixed(2)}`, now);
-  return { won, gain, trade: t };
+  mark(s, "don", won ? `Double or nothing on ${t.sym}: doubled to $${(gain * 2).toFixed(2)}` : `Double or nothing on ${t.sym}: lost, the portfolio dropped from $${before.toFixed(2)} to $${DON_FLOOR}`, now);
+  return { won, gain, before, trade: t };
 }
 
 /** Moon boost on a memecoin you hold, from its live price now. */

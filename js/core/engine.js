@@ -6,14 +6,20 @@
 // produced (ms). Market state is mkt = {open, since}: an order only fills while the market is open and
 // with a price produced after the current session started (stocks wait for the opening bell).
 //
-// Cheats live in s.cheats (see cheats.js). A portfolio without s.cheats (every bot) trades with the plain
-// rules: real costs, no leverage, no shields. The owner's portfolio sets s.undoable so Undo can step back.
+// Cheats live in s.cheats (see cheats.js), on the owner's portfolio and on the bots' (theirs are armed by
+// bots.js). A portfolio without s.cheats trades with the plain rules. The owner's portfolio sets s.undoable so
+// Undo can step back.
+//
+// Money cap: no portfolio can be worth more than the combined fortune of the world's 100 richest people
+// (WORLD_CAP, rich.js). Cash that would push it past that is cut (trade.capped says how much).
 
 import {
   START_CASH, START_MIN, START_MAX, quoteBuy, quoteSell, markValue, memeImpact,
   quoteOpenMargin, quoteCloseMargin, marginEquity, quoteToUsd,
 } from "./money.js";
 import { localDay } from "./stats.js";
+import { WORLD_CAP } from "./rich.js";
+export { WORLD_CAP };
 
 export class TradeError extends Error {}
 
@@ -98,10 +104,25 @@ export function undoLast(s) {
   s.undo = null;
   return gone;
 }
-/** Cash that arrives outside a trade (Money printer, Moon boost payout) survives an undo. */
+/** Cash that arrives outside a trade (Money printer, Moon boost payout) survives an undo. Returns the dollars cut by the cap. */
 export function addCash(s, usd) {
   s.cash += usd;
   if (s.undo) s.undo.cash += usd;
+  const cut = capCash(s);
+  if (cut && s.undo) s.undo.cash = Math.max(0, s.undo.cash - cut);
+  return cut;
+}
+
+/** The money cap: if the portfolio is worth more than WORLD_CAP, cash above it is cut. Returns the dollars cut. */
+export function capCash(s) {
+  let held = 0;
+  for (const p of [...Object.values(s.pos), ...marginPositions(s)]) { const v = positionValue(s, p, null); held += v == null ? p.cost : v; }
+  const over = s.cash + held - WORLD_CAP;
+  if (!(over > 0.005)) return 0;
+  const cut = Math.min(over, Math.max(0, s.cash));
+  s.cash -= cut;
+  s.capCut = (s.capCut || 0) + cut;
+  return cut;
 }
 
 // ---------------------------------------------------------------- buy / sell
@@ -122,7 +143,7 @@ export function executeBuy(s, inst, usd, q, now, reason = "manual", fromOrder = 
   const plain = mods.zeroFees || mods.marketMaker ? quoteBuy(inst, usd, gq) : r;
   let p = s.pos[inst.key];
   if (!p) {
-    p = s.pos[inst.key] = { key: inst.key, inst: slimInst(inst), qty: 0, cost: 0, avg: 0, sl: null, tp: null, openedAt: now, minRatio: 1, lastPx: q.px, lastT: q.t ?? now, lastQu: q.quoteUsd ?? null };
+    p = s.pos[inst.key] = { key: inst.key, inst: slimInst(inst), qty: 0, cost: 0, avg: 0, sl: null, tp: null, openedAt: now, minRatio: 1, lastPx: q.px, lastT: q.t ?? now, lastQu: q.quoteUsd ?? null, best: q.px };
   }
   p.avg = (p.avg * p.qty + r.eff * r.qty) / (p.qty + r.qty);
   p.qty += r.qty;
@@ -149,12 +170,14 @@ function freeBuy(s, inst, usd, q, now, opts) {
   snap(s);
   const qty = usd / q.px;
   let p = s.pos[inst.key];
-  if (!p) p = s.pos[inst.key] = { key: inst.key, inst: slimInst(inst), qty: 0, cost: 0, avg: 0, sl: null, tp: null, openedAt: now, minRatio: 1, lastPx: q.px, lastT: q.t ?? now, lastQu: null };
+  if (!p) p = s.pos[inst.key] = { key: inst.key, inst: slimInst(inst), qty: 0, cost: 0, avg: 0, sl: null, tp: null, openedAt: now, minRatio: 1, lastPx: q.px, lastT: q.t ?? now, lastQu: null, best: q.px };
   p.avg = p.avg * p.qty / (p.qty + qty);
   p.qty += qty;
   const tr = { id: ++s.seq, t: now, key: inst.key, m: inst.m, sym: inst.sym, name: inst.name, side: "buy", qty, px: 0, mid: q.px, usd: 0, worth: usd, fee: 0, slip: 0, reason: "airdrop" };
   for (const n of opts.tags || []) tag(tr, n);
   s.trades.push(tr);
+  const cut = capCash(s);
+  if (cut) tr.capped = cut;
   return tr;
 }
 
@@ -210,6 +233,8 @@ export function executeSell(s, key, frac, q, now, reason = "manual", opts = {}) 
     if (s.cheats?.boost?.key === key) s.cheats.boost = null;
   }
   settleGhost(s, p, tr, closed, now);
+  const cut = capCash(s);
+  if (cut) tr.capped = cut;
   return tr;
 }
 
@@ -253,7 +278,7 @@ export function openMargin(s, inst, margin, lev, dir, q, now, reason = "manual",
   const id = "x" + (s.seq + 1);
   const p = s.margin[id] = {
     id, key: inst.key, inst: slimInst(inst), lev, dir, qty: r.qty, cost: margin, avg: r.eff, entryFee: r.fee,
-    openedAt: now, minRatio: 1, lastPx: q.px, lastT: q.t ?? now, lastQu: q.quoteUsd ?? null,
+    openedAt: now, minRatio: 1, lastPx: q.px, lastT: q.t ?? now, lastQu: q.quoteUsd ?? null, best: q.px,
   };
   s.cash -= margin;
   if (Math.abs(s.cash) < EPS) s.cash = 0;
@@ -312,6 +337,8 @@ export function closeMargin(s, id, frac, q, now, reason = "manual", opts = {}) {
   const closed = frac === 1 || p.qty <= EPS;
   if (closed) delete s.margin[id];
   settleGhost(s, p, tr, closed, now);
+  const cut = capCash(s);
+  if (cut) tr.capped = cut;
   return tr;
 }
 
@@ -372,11 +399,29 @@ export function setStops(s, key, { sl, tp }) {
  * Called on every price update and when the app opens (so a price that already passed still fills).
  * Returns events: {type:'fill'|'cancel'|'sl'|'tp'|'liq'|'saved', order?, trade?, reason?, pos?}.
  */
-export function checkKey(s, key, q, now, mkt) {
+// ---------------------------------------------------------------- Last chance / trailing stop
+/** Track the best price since you bought: the high for a long, the low for a short. */
+function trackBest(p, px) {
+  const dir = p.dir || 1;
+  if (!(p.best > 0)) p.best = px;
+  else if (dir > 0 ? px > p.best : px < p.best) p.best = px;
+}
+/** How far the price is from that best price, against you (0.12 = 12%). 0 when it's at the best. */
+export function drawdown(p, px) {
+  if (!(p?.best > 0) || !(px > 0)) return 0;
+  return Math.max(0, (p.dir || 1) > 0 ? 1 - px / p.best : px / p.best - 1);
+}
+
+/**
+ * Check one instrument against a new price: waiting orders, stop loss / take profit, trailing stop, liquidations.
+ * opts.trail (0.1 = 10%): sell a position when the price falls that much from its best since you bought.
+ */
+export function checkKey(s, key, q, now, mkt, opts = {}) {
   const events = [];
   if (!(q?.px > 0)) return events;
   const p0 = s.pos[key];
   if (p0) {
+    trackBest(p0, q.px);
     p0.lastPx = q.px; p0.lastT = q.t ?? now;
     if (q.quoteUsd) p0.lastQu = q.quoteUsd;
     const v = markValue(p0.inst, p0, gameQuote(s, key, q));
@@ -386,6 +431,7 @@ export function checkKey(s, key, q, now, mkt) {
   if (b && b.key === key && now <= b.until && (q.t ?? now) >= b.from) b.lastPx = q.px * whaleMult(s, key);
   for (const p of marginPositions(s)) {
     if (p.key !== key) continue;
+    trackBest(p, q.px);
     p.lastPx = q.px; p.lastT = q.t ?? now;
     if (q.quoteUsd) p.lastQu = q.quoteUsd;
     const v = markValue(p.inst, p, gameQuote(s, key, q));
@@ -420,6 +466,12 @@ export function checkKey(s, key, q, now, mkt) {
   if (p) {
     if (p.sl != null && q.px <= p.sl) events.push({ type: "sl", trade: executeSell(s, key, 1, q, now, "sl") });
     else if (p.tp != null && q.px >= p.tp) events.push({ type: "tp", trade: executeSell(s, key, 1, q, now, "tp") });
+    else if (opts.trail > 0 && drawdown(p, q.px) >= opts.trail) events.push({ type: "trail", best: p.best, trade: executeSell(s, key, 1, q, now, "trail") });
+  }
+  if (opts.trail > 0) {
+    for (const m of marginPositions(s)) {
+      if (m.key === key && drawdown(m, q.px) >= opts.trail) events.push({ type: "trail", best: m.best, trade: closeMargin(s, m.id, 1, q, now, "trail") });
+    }
   }
 
   // Liquidation: when the loss reaches the margin. Diamond hands and Rug shield skip it; Second chance saves it once a day.
@@ -464,8 +516,8 @@ export function totals(s, quoteFor) {
     const v = positionValue(s, p, q);
     held += v == null ? p.cost : v;
   }
-  const total = s.cash + held;
-  return { cash: s.cash, held, total, pl: total - s.start, plPct: (total - s.start) / s.start, reserved: reserved(s), stale };
+  const raw = s.cash + held, total = Math.min(raw, WORLD_CAP); // positions can be worth more on paper; the portfolio stops at the cap
+  return { cash: s.cash, held, total, pl: total - s.start, plPct: (total - s.start) / s.start, reserved: reserved(s), stale, capped: raw >= WORLD_CAP - 0.005 };
 }
 
 /** Value of a position plus unrealized P&L. Pass the portfolio to include its cheats. */

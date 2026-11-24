@@ -7,7 +7,7 @@ import { scoreboard, greenStreak, localDay, toCSV, MARKET_LABEL, realizedByDay, 
 import { ACHIEVEMENTS, newAchievements, evaluate, achievementById } from "./core/achievements.js";
 import { applyTick, ticksToBars, INTERVALS } from "./core/candles.js";
 import { buildBackup, parseBackup, mergeAchievements } from "./core/backup.js";
-import { STYLES, STYLE_IDS, MAX_BOTS, newBot, botName, step as botStep, standing, preview as botPreview } from "./core/bots.js";
+import { STYLES, STYLE_IDS, MAX_BOTS, newBot, botName, step as botStep, cheatTick as botCheatTick, cheatFeed as botCheatFeed, BOT_CHEATS, standing, preview as botPreview } from "./core/bots.js";
 import * as C from "./core/cheats.js";
 import * as RP from "./core/replay.js";
 import * as SW from "./sim/world.js";
@@ -19,7 +19,8 @@ import { createCrypto } from "./sources/crypto.js";
 import { createFinnhub, STOCKS_DEFAULT, stockInst } from "./sources/stocks.js";
 import { createTwelve, tdSymbol, DAILY_CAP } from "./sources/twelve.js";
 import * as fx from "./sources/fx.js";
-import { esc, usd, price, pct, dirCls, qty, countdown, ago, dateTime, clock, weekdayTime } from "./ui/format.js";
+import { esc, usd, price, pct, dirCls, qty, countdown, ago, dateTime, clock, weekdayTime, tap } from "./ui/format.js";
+import * as RICH from "./core/rich.js";
 import { drawChart } from "./ui/chart.js";
 import { confetti, shake, bigResult, vibrate, sounds, rollNumber, jackpot as jackpotFx } from "./ui/effects.js";
 import { swipeHTML, bindSwipe, setSwipeEnabled } from "./ui/swipe.js";
@@ -39,7 +40,8 @@ const CHIP_FRACS = [0.001, 0.005, 0.01, 0.05, 0.1];
 
 const DEFAULT_CFG = {
   finnhubKey: "", twelveKey: "", sound: false, simSound: false,
-  notif: { fills: true, moves: true, price: true, summary: true, streak: true }, moveTh: 5,
+  lc: { pct: 10, warn: true, trail: false }, // Last chance: warn (or sell with the trailing stop) at −pct% from the high since you bought
+  notif: { fills: true, moves: true, price: true, summary: true, streak: true }, moveTh: 5, botCheats: true,
   alerts: [], lastBuy: defaultBuy(START_CASH), chartMode: "candles", ivl: "5m", lastSummary: "", lastStreakDay: "",
 };
 
@@ -49,12 +51,19 @@ let S, A, CFG;
 // Switching between Live and Sim reloads the app, so the two never share prices or state.
 const jpKeys = new Set(); // positions that already had their JACKPOT (no second one when you sell them)
 let SIM = false, W = null, REC = null, simTimer = null, simSavedAt = 0, shakeAt = 0, simListAt = 0;
+let skipping = false, oracle = null, oracleVer = 0;
+let capSeen = -1; // S.capCut already announced (−1: not read yet)
+/**
+ * The app's clock. Live: real time. Sim: the Sim clock (W.off ahead of or behind real time): it stops while the
+ * app is closed or hidden and jumps forward with Skip ahead, so trades, candles, events and countdowns agree.
+ */
+function appNow() { return Date.now() + (SIM && W ? W.off || 0 : 0); }
 const K = k => (SIM ? "sim." + k : k);
 /** Sounds: Live uses "Sounds when trading"; Sim has its own switch, off until you turn it on. */
 function sfx(name) { if (SIM ? CFG.simSound : CFG.sound) sounds[name]?.(); }
 const needFinnhub = () => !SIM && !CFG.finnhubKey;
 let BOTS = [];                // rival bots: [{id, style, name, pf (own portfolio), lastBuy, seed}]
-const bootAt = Date.now();    // bots never trade on a price produced before the app was opened
+let bootAt = Date.now();      // bots never trade on a price produced before the app was opened (Sim: the Sim clock at load)
 const live = new Map();   // key → {inst, px, t, ch24, ch1h, liq, mc, vol, quoteUsd, dir, ...}
 const ticks = new Map();  // key → [{t, px}] recorded while the app is open
 const dirty = new Set();
@@ -108,7 +117,7 @@ function setLive(inst, d, { check = true } = {}) {
   const prev = L.px;
   for (const f in d) { const v = d[f]; if (v != null && !(typeof v === "number" && !isFinite(v))) L[f] = v; }
   if (d.px > 0) {
-    const t = d.t || Date.now();
+    const t = d.t || appNow();
     if (prev > 0 && d.px !== prev) L.dir = d.px > prev ? 1 : -1;
     dirty.add(k);
     pushTick(k, t, d.px);
@@ -130,14 +139,14 @@ function pushTick(k, t, px) {
 function quoteFor(key) {
   const L = live.get(key);
   if (!(L?.px > 0)) return null;
-  return { px: L.px, t: L.t || Date.now(), liq: L.liq, quoteUsd: L.quoteUsd };
+  return { px: L.px, t: L.t || appNow(), liq: L.liq, quoteUsd: L.quoteUsd };
 }
 
 function instOf(key) {
   return live.get(key)?.inst || S.pos[key]?.inst || E.marginPositions(S).find(p => p.key === key)?.inst || S.orders.find(o => o.key === key)?.inst || CFG.alerts.find(a => a.key === key)?.inst || null;
 }
 
-function mstatus(m, now = Date.now()) {
+function mstatus(m, now = appNow()) {
   if (SIM) return { open: true, since: 0 }; // Sim markets never close
   return H.marketStatus(m, now);
 }
@@ -160,15 +169,105 @@ function afterPrice(k) {
 }
 
 // ---------------------------------------------------------------- orders, stops, fills
-function runChecks(k, now = Date.now()) {
+function runChecks(k, now = appNow()) {
   const p = S.pos[k], o = S.orders.find(x => x.key === k), mp = E.marginPositions(S).find(x => x.key === k);
   if (!p && !o && !mp && S.cheats?.boost?.key !== k) return;
   const q = quoteFor(k);
   if (!q) return;
   const m = (p || o || mp)?.inst.m || k.split(":")[0];
-  const events = E.checkKey(S, k, q, now, mstatus(m, now));
+  const events = E.checkKey(S, k, q, now, mstatus(m, now), { trail: trailPct() });
   if (events.length) handleEvents(events);
   else saveSoon(3000);
+  lastChanceCheck(k);
+}
+
+// ---------------------------------------------------------------- Double or nothing
+/** The confirmation before the flip: what you can win, and that a loss drops the whole portfolio to $100. */
+function askDon() {
+  const t = C.lastWin(S);
+  if (!t) { toast("Double or nothing needs a winning sale as your last trade.", "down"); return; }
+  const total = E.totals(S, quoteFor).total;
+  const el = $("#confirm");
+  el.innerHTML = `<div class="skip-box lc-box cf-box don" role="alertdialog" aria-labelledby="cfT" aria-describedby="cfD">
+    <span class="lc-i" aria-hidden="true">🪙</span><b id="cfT">Double or nothing</b>
+    <p>Flip a coin on your ${$usd(t.pl, { sign: true })} win on ${esc(t.sym)}. Heads: you get another ${$usd(t.pl)}.</p>
+    <p id="cfD" class="warn-big">If you lose, your whole portfolio drops to $100</p>
+    <p class="mut">Today it's worth ${$usd(total)}: cash and every position${E.marginPositions(S).length ? " (leveraged ones too)" : ""}, and your waiting orders are canceled.${C.isAlways(S, "don") ? " Always on: you'll get this question after every win." : ""}</p>
+    <div class="two"><button class="btn sell" data-donflip>Flip the coin</button><button class="btn ghost" data-donno>Not this time</button></div></div>`;
+  el.hidden = false;
+}
+
+// ---------------------------------------------------------------- money cap and Billionaire ladder
+const richDate = () => new Date(RICH.AS_OF).toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" });
+function worldsRichest(cut) {
+  toast(`🌍 World's richest: your ${SIM ? "Sim " : ""}portfolio stops at ${$usd(RICH.WORLD_CAP)}, the combined fortune of the world's 100 richest people. ${$usd(cut)} stayed out.`, "gold");
+  vibrate([60, 40, 60]);
+}
+function ladderHTML() {
+  const total = E.totals(S, quoteFor).total, L = RICH.ladder(total);
+  const row = (r, me) => me
+    ? `<div class="lad me"><span class="rk">#${L.place > 100 ? "101+" : L.place}</span><span class="nm"><b>You</b><small>${SIM ? "Sim portfolio" : "Live portfolio"}</small></span><b>${$usd(total)}</b></div>`
+    : `<div class="lad"><span class="rk">#${r[0]}</span><span class="nm"><b>${esc(r[1])}</b></span><b>${$usd(r[2])}</b></div>`;
+  const i = L.place - 1;
+  const above = RICH.RICHEST.slice(Math.max(0, i - 2), i), below = RICH.RICHEST.slice(i, i + 2);
+  const head = L.place > 100
+    ? `Not in the top 100 yet. #100 is ${esc(L.above[1])} with ${$usd(L.above[2])}: ${$usd(L.above[2] - total)} to go.`
+    : L.place === 1 ? `You'd be the richest person in the world.` : `You'd be <b>#${L.place}</b>. Next up: #${L.above[0]} ${esc(L.above[1])} with ${$usd(L.above[2])}, ${$usd(L.above[2] - total)} to go.`;
+  return `<h2>Billionaire ladder</h2><div class="card ladder"><p>${head}</p>
+    ${above.map(r => row(r)).join("")}${row(null, true)}${below.map(r => row(r)).join("")}
+    <small class="mut">${RICH.SOURCE}, ${richDate()}. Your portfolio can't pass the 100 together: ${$usd(RICH.WORLD_CAP)}.</small></div>`;
+}
+
+// ---------------------------------------------------------------- Last chance
+const trailPct = () => (CFG.lc.trail ? CFG.lc.pct / 100 : 0);
+function lastChanceCheck(k) {
+  if (!CFG.lc.warn || CFG.lc.trail || ui.lc) return;
+  const q = quoteFor(k);
+  if (!q) return;
+  const th = CFG.lc.pct / 100;
+  for (const p of [S.pos[k], ...E.marginPositions(S).filter(m => m.key === k)]) {
+    if (!p || !(p.best > 0) || p.lcBest === p.best) continue;
+    const dd = E.drawdown(p, q.px);
+    if (dd >= th) { p.lcBest = p.best; saveSoon(); showLastChance(p, q.px, dd); return; }
+  }
+}
+
+function showLastChance(p, px, dd) {
+  ui.lc = { key: p.key, id: S.margin?.[p.id] === p ? p.id : null };
+  const inst = p.inst, short = (p.dir || 1) < 0;
+  const val = E.positionValue(S, p, quoteFor(p.key)) ?? 0, pl = val - p.cost;
+  const el = $("#lastChance");
+  el.innerHTML = `<div class="lc-box" role="alertdialog" aria-labelledby="lcT" aria-describedby="lcD">
+    <span class="lc-i" aria-hidden="true">⏳</span><b id="lcT">LAST CHANCE</b>
+    <p id="lcD"><b>${esc(inst.sym)}</b>${p.lev > 1 ? ` ${p.lev}x ${short ? "short" : "long"}` : ""} ${short ? "rose" : "fell"} <b class="down">${$pct(dd * 100, 1).replace("+", "")}</b> from its ${short ? "low" : "high"} of ${$px(inst, p.best)} since you bought. Now ${$px(inst, px)}.</p>
+    <p class="mut">Your position: ${$usd(val)} · <span class="${dirCls(pl)}">${$usd(pl, { sign: true })} (${$pct(p.cost > 0 ? (pl / p.cost) * 100 : 0, 1)})</span></p>
+    <div class="two"><button class="btn sell" data-lcsell>Sell now</button><button class="btn ghost" data-lckeep>Keep it</button></div>
+    <small class="mut">You get this at −${CFG.lc.pct}% from the ${short ? "low" : "high"}. Change it, or let a trailing stop sell for you, in Settings.</small></div>`;
+  el.hidden = false;
+  vibrate([200, 100, 200]); sfx("loss");
+  alertPhone("moves", `Last chance: ${inst.sym}`, `${short ? "Up" : "Down"} ${(dd * 100).toFixed(1)}% from its ${short ? "low" : "high"} since you bought. Open the app to sell.`, "lc-" + p.key);
+}
+
+function hideLastChance() { $("#lastChance").hidden = true; ui.lc = null; }
+
+function lastChanceSell() {
+  const x = ui.lc;
+  hideLastChance();
+  if (!x) return;
+  const now = appNow();
+  try {
+    if (x.id) {
+      const m = S.margin?.[x.id]; if (!m) return;
+      if (!mstatus(m.inst.m, now).open) throw new E.TradeError("The market is closed: it can be closed when it opens.");
+      const q = quoteFor(m.key); if (!q) throw new E.TradeError("No live price to close at.");
+      const tr = E.closeMargin(S, m.id, 1, q, now, "manual");
+      celebrate(tr); afterTrades([tr]); return;
+    }
+    const p = S.pos[x.key]; if (!p) return;
+    const r = E.placeOrder(S, p.inst, { side: "sell", type: "market", frac: 1 }, quoteFor(x.key), now, mstatus(p.inst.m, now));
+    if (r.trade) { celebrate(r.trade); afterTrades([r.trade]); }
+    else { toast(`The market is closed: your ${esc(p.inst.sym)} sale fills at the open.`); saveSoon(0); renderView(); renderSheet(); }
+  } catch (e) { toast(e.message, "down"); vibrate(80); }
 }
 
 function handleEvents(events) {
@@ -178,20 +277,25 @@ function handleEvents(events) {
     if (e.type === "fill") {
       trades.push(t);
       const kind = e.order.type === "limit" ? "Your limit order filled" : "Your order filled at the market open";
-      const body = `${t.side === "buy" ? "Bought" : "Sold"} ${t.sym} at ${fmtPx(instOf(t.key), t.px)} · ${usd(t.usd)}${t.side === "sell" ? " · " + usd(t.pl, { sign: true }) : ""}`;
+      const body = `${t.side === "buy" ? "Bought" : "Sold"} ${t.sym} at ${$px(instOf(t.key), t.px)} · ${$usd(t.usd)}${t.side === "sell" ? " · " + usd(t.pl, { sign: true }) : ""}`;
       toast(kind + ": " + body, t.side === "sell" ? (t.pl >= 0 ? "up" : "down") : "");
       alertPhone("fills", kind, body, "fill-" + t.id);
     } else if (e.type === "sl" || e.type === "tp") {
       trades.push(t);
       const kind = e.type === "sl" ? "Your stop loss triggered" : "Your take profit triggered";
-      const body = `Sold ${t.sym} at ${fmtPx(instOf(t.key), t.px)} · ${usd(t.pl, { sign: true })} (${pct(t.plPct * 100, 1)})`;
+      const body = `Sold ${t.sym} at ${$px(instOf(t.key), t.px)} · ${$usd(t.pl, { sign: true })} (${$pct(t.plPct * 100, 1)})`;
       toast(kind + ": " + body, t.pl >= 0 ? "up" : "down");
       alertPhone("fills", kind, body, "stop-" + t.id);
+    } else if (e.type === "trail") {
+      trades.push(t);
+      const body = `Sold ${t.sym} at ${$px(instOf(t.key) || { m: t.m }, t.px)} · ${$usd(t.pl, { sign: true })} (${$pct(t.plPct * 100, 1)}), ${CFG.lc.pct}% off its best since you bought (${$px(instOf(t.key) || { m: t.m }, e.best)})`;
+      toast("📉 Trailing stop: " + body, t.pl >= 0 ? "up" : "down");
+      alertPhone("fills", "Your trailing stop sold", body, "trail-" + t.id);
     } else if (e.type === "cancel") {
       toast(`Your ${e.order.inst.sym} order was canceled: ${e.reason}`, "down");
     } else if (e.type === "liq") {
       trades.push(t);
-      const body = `${t.sym} ${t.lev}x ${t.dir === -1 ? "short" : "long"}: the loss reached your ${usd(t.cost)} margin` + (t.usd > 0 ? ` · Insurance paid back ${usd(t.usd)}` : "");
+      const body = `${t.sym} ${t.lev}x ${t.dir === -1 ? "short" : "long"}: the loss reached your ${$usd(t.cost)} margin` + (t.usd > 0 ? ` · Insurance paid back ${$usd(t.usd)}` : "");
       toast("💥 Liquidated: " + body, "down");
       alertPhone("fills", "Liquidated", body, "liq-" + t.id);
     } else if (e.type === "saved") {
@@ -206,11 +310,14 @@ function handleEvents(events) {
 }
 
 function afterTrades(trades) {
-  if (SIM) simAfterTrades(trades);
+  if (SIM) { simAfterTrades(trades); oracleVer++; }
+  // Always on: used-up cheats arm themselves again; Double or nothing asks after every win
+  if (C.rearm(S).length) cheatChanged();
+  if (C.isAlways(S, "don") && trades.includes(C.lastWin(S)) && !skipping) setTimeout(askDon, 900);
   const tot = E.totals(S, quoteFor).total;
-  const st = H.stockStatus(Date.now());
+  const st = H.stockStatus(appNow());
   const kept = trades.filter(t => !t.ghosted && S.trades.includes(t)); // a Ghost trade that was erased never happened
-  const got = evaluate(A, kept, { trades: S.trades, total: tot, start: S.start, now: Date.now(), stockOpenSince: st.open ? st.since : null, cheated: E.isCheated(S) });
+  const got = evaluate(A, kept, { trades: S.trades, total: tot, start: S.start, now: appNow(), stockOpenSince: st.open ? st.since : null, cheated: E.isCheated(S) });
   for (const id of got) {
     const a = achievementById(id);
     setTimeout(() => toast(`${a.icon} Achievement: ${a.name}${A.cheated?.[id] ? " ★ (with cheats)" : ""}`, "gold"), 1400);
@@ -226,14 +333,14 @@ function afterTrades(trades) {
 const cheatTxt = t => (t.cheat?.length ? " ★ " + t.cheat.join(", ") : "");
 function celebrate(t) {
   if (!t) return;
-  if (t.ghosted) { toast(`👻 Ghost trade: the ${usd(t.ghosted)} loss on ${esc(t.sym)} never happened`, "gold"); vibrate(30); return; }
+  if (t.ghosted) { toast(`👻 Ghost trade: the ${$usd(t.ghosted)} loss on ${esc(t.sym)} never happened`, "gold"); vibrate(30); return; }
   if (t.side === "sell") {
     const win = t.pl >= 0;
-    bigResult($("#result"), { text: usd(t.pl, { sign: true }), sub: `${t.sym} · ${pct(t.plPct * 100, 1)}${cheatTxt(t)}`, win });
+    bigResult($("#result"), { text: usd(t.pl, { sign: true }), sub: `${t.sym} · ${$pct(t.plPct * 100, 1)}${cheatTxt(t)}`, win });
     if (win) { confetti($("#confetti"), { big: SIM }); vibrate(SIM ? [40, 30, 40, 30, 40, 30, 120] : [25, 40, 25, 40, 60]); sfx(SIM ? "sell" : "win"); if (SIM) sfx("win"); }
     else { shake($("#app")); vibrate(220); sfx("loss"); }
   } else {
-    if (t.reason === "manual") toast(`${t.dir === -1 ? "Shorted" : "Bought"} ${usd(t.usd)} of ${esc(t.sym)}${t.lev > 1 ? ` at ${t.lev}x` : ""}${cheatTxt(t)}`, "up");
+    if (t.reason === "manual") toast(`${t.dir === -1 ? "Shorted" : "Bought"} ${$usd(t.usd)} of ${esc(t.sym)}${t.lev > 1 ? ` at ${t.lev}x` : ""}${cheatTxt(t)}`, "up");
     vibrate(20);
     sfx(SIM ? "buy" : "fill");
   }
@@ -241,6 +348,8 @@ function celebrate(t) {
 
 function alertPhone(kind, title, body, tag) {
   if (!CFG.notif[kind]) return;
+  const plain = x => String(x).replace(/<[^>]*>/g, "");
+  title = plain(title); body = plain(body);
   if (document.visibilityState === "visible" && document.hasFocus()) return; // the toast already said it
   notify(title, body, { tag });
 }
@@ -253,7 +362,7 @@ function priceAlerts(k) {
   CFG.alerts = CFG.alerts.filter(a => !hit.includes(a));
   saveCfg();
   for (const a of hit) {
-    const text = `${L.inst.sym} hit ${fmtPx(L.inst, a.price)}`;
+    const text = `${L.inst.sym} hit ${$px(L.inst, a.price)}`;
     toast("🔔 " + text, "gold");
     sfx(SIM ? "buy" : "fill");
     alertPhone("price", text, `Live price: ${fmtPx(L.inst, L.px)}`, "alert-" + a.id);
@@ -286,7 +395,7 @@ function moveAlert(k) {
 }
 
 function streakCheck() {
-  const now = Date.now(), today = localDay(now);
+  const now = appNow(), today = localDay(now);
   if (CFG.lastStreakDay === today) return;
   const real = realizedByDay(S.trades)[today];
   const n = greenStreak(S.trades, now);
@@ -312,8 +421,8 @@ function dailySummary(now) {
   const todayTrades = S.trades.filter(t => localDay(t.t) === localDay(now));
   const real = todayTrades.reduce((a, t) => a + (t.side === "sell" ? t.pl : 0), 0);
   const n = todayTrades.length;
-  const text = `Your portfolio is worth ${usd(tot)}` + (day ? ` (${usd(tot - day.first, { sign: true })} since ${clock(day.firstT)})` : "") +
-    ` · ${n} ${n === 1 ? "trade" : "trades"} today · realized ${usd(real, { sign: true })}`;
+  const text = `Your portfolio is worth ${$usd(tot)}` + (day ? ` (${$usd(tot - day.first, { sign: true })} since ${clock(day.firstT)})` : "") +
+    ` · ${n} ${n === 1 ? "trade" : "trades"} today · realized ${$usd(real, { sign: true })}`;
   toast("🔔 Wall Street closed. " + text);
   alertPhone("summary", "Closing summary", text, "summary");
 }
@@ -370,7 +479,7 @@ async function memeLoop() {
   toks.forEach(applyMeme);
 }
 function applyMeme(t) {
-  setLive(t, { px: t.px, t: Date.now(), liq: t.liq, mc: t.mc, vol: t.vol, ch24: t.ch.h24, ch1h: t.ch.h1, ch5m: t.ch.m5, ch6h: t.ch.h6 });
+  setLive(t, { px: t.px, t: appNow(), liq: t.liq, mc: t.mc, vol: t.vol, ch24: t.ch.h24, ch1h: t.ch.h1, ch5m: t.ch.m5, ch6h: t.ch.h6 });
 }
 async function loadMemeList(view) {
   const toks = view === "trending" ? await dex.trending() : await dex.newest();
@@ -407,7 +516,7 @@ async function cryptoHourLoop() {
 let stockListAt = 0, statusAt = 0, holidaysAt = 0;
 async function stockLoop() {
   if (!fh.hasKey()) return;
-  const now = Date.now();
+  const now = appNow();
   if (!lists.stock.length) lists.stock = STOCKS_DEFAULT.map(([s, n]) => stockInst(s, n).key);
   if (now - holidaysAt > 24 * 3600e3) {
     holidaysAt = now;
@@ -489,21 +598,10 @@ async function setMode(m) {
 
 async function loadSim() {
   REC = (await kv.get("sim.records")) || FUN.newRecords();
-  const now = Date.now();
   W = await kv.get("sim.world");
-  if (!W || W.v !== 1) W = SW.createWorld(TEST ? 12345 : Math.floor(Math.random() * 2147483647), now);
-  else {
-    // The Sim only moves while the app is open: every pending timer moves forward by the time it was closed.
-    const gap = Math.max(0, now - W.t);
-    W.nextEventAt += gap; W.nextCoinAt += gap;
-    if (W.event) { W.event.start += gap; W.event.until += gap; }
-    for (const i of Object.values(W.insts)) {
-      if (i.fate) { i.fate.pumpAt += gap; if (i.fate.rugAt) i.fate.rugAt += gap; }
-      if (i.reg) i.reg.until += gap;
-      if (i.casc) i.casc.until += gap;
-    }
-    W.t = now;
-  }
+  if (!W || W.v !== SW.VERSION) W = SW.createWorld(TEST ? 12345 : Math.floor(Math.random() * 2147483647), Date.now());
+  W.off = W.t - Date.now(); // the Sim clock continues exactly where it stopped
+  bootAt = appNow();
   document.querySelector(".total-box small").textContent = "Your Sim portfolio";
   publishSim(false);
 }
@@ -515,25 +613,35 @@ function publishSim(check) {
   lists.crypto = L.crypto; lists.stock = L.stock; lists.fx = L.fx;
   const memeSig = lists.meme.new.join(",");
   lists.meme.trending = L.trending; lists.meme.new = L.fresh;
-  lists.memeAt.trending = lists.memeAt.new = Date.now();
+  lists.memeAt.trending = lists.memeAt.new = appNow();
   return memeSig !== L.fresh.join(",");
 }
 
 function simSecond() {
-  if (!W || document.hidden) return;
-  simAdvance(Date.now());
+  if (!W || document.hidden || skipping) return;
+  // The Sim only moves while the app is open: after a pause the Sim clock moves back instead of skipping time.
+  const gap = appNow() - W.t;
+  if (gap > SW.MAX_GAP) W.off -= gap - 1000;
+  simAdvance(appNow());
+}
+
+/** What the Sim must not drop: everything you, your orders, alerts and bots touch, plus the top trending coins. */
+function simKeep() {
+  const keep = new Set(trackedKeys());
+  for (const k of lists.meme.trending.slice(0, 10)) keep.add(k);
+  return keep;
 }
 
 /** Advance the Sim world to `now` and react: prices, banners, effects, jackpots, rugs. */
 function simAdvance(now) {
+  if (now > appNow()) W.off += now - appNow(); // tests drive the Sim clock directly
   const mine = [...Object.values(S.pos), ...E.marginPositions(S)];
   const before = new Map(), pxBefore = new Map();
   for (const p of mine) {
     before.set(p.key, (before.get(p.key) || 0) + (E.positionValue(S, p, quoteFor(p.key)) || 0));
     pxBefore.set(p.key, live.get(p.key)?.px);
   }
-  const keep = new Set(trackedKeys());
-  for (const k of lists.meme.trending.slice(0, 10)) keep.add(k);
+  const keep = simKeep();
   const out = SW.step(W, now, { keep, lev: SW.leverageByKey([S]) });
   const changed = publishSim(true);
   for (const e of out) if (e.kind === "gone") for (const k of e.keys) if (!keep.has(k)) { live.delete(k); ticks.delete(k); }
@@ -553,7 +661,7 @@ function simAdvance(now) {
 const heldKey = k => !!S.pos[k] || E.marginPositions(S).some(p => p.key === k);
 const watching = k => heldKey(k) || (ui.sheet?.kind === "inst" && ui.sheet.key === k);
 function simEvents(out, before = new Map()) {
-  const now = Date.now();
+  const now = appNow();
   for (const e of out) {
     const i = e.key ? W.insts[e.key] : null, sym = esc(i?.sym || "");
     if (e.kind === "event") {
@@ -564,24 +672,138 @@ function simEvents(out, before = new Map()) {
       const after = [...Object.values(S.pos), ...E.marginPositions(S)].filter(p => p.key === e.key).reduce((a, p) => a + (E.positionValue(S, p, quoteFor(p.key)) || 0), 0);
       const lost = Math.max(0, (before.get(e.key) || 0) - after);
       FUN.onRug(REC, { sym: i.sym, usd: lost, pct: e.drop }, now); saveRec();
-      bigResult($("#result"), { text: "RUG PULL", sub: `${sym} −${Math.round(e.drop * 100)}% · you lost ${usd(lost)}`, win: false });
+      bigResult($("#result"), { text: "RUG PULL", sub: `${sym} −${Math.round(e.drop * 100)}% · you lost ${$usd(lost)}`, win: false });
       shake($("#app")); vibrate([300, 80, 300]); sfx("rug");
     } else if (e.kind === "rug" && watching(e.key)) { toast(`💀 ${sym} got rugged: −${Math.round(e.drop * 100)}%`, "down"); sfx("rug"); }
     else if ((e.kind === "pump" || e.kind === "moonshot") && (watching(e.key) || e.kind === "moonshot")) {
       toast(e.kind === "moonshot" ? `🌕 MOONSHOT: ${sym} is going vertical` : `🚀 ${sym} is pumping`, "gold"); sfx("pump");
     } else if (e.kind === "whale" && watching(e.key)) {
-      toast(`🐋 A whale ${e.up ? "bought" : "dumped"} ${sym}: ${pct(e.move * 100, 0)}`, e.up ? "up" : "down");
+      toast(`🐋 A whale ${e.up ? "bought" : "dumped"} ${sym}: ${$pct(e.move * 100, 0)}`, e.up ? "up" : "down");
       if (heldKey(e.key)) { shake($("#app")); vibrate(e.up ? [30, 30, 30] : 200); }
     } else if ((e.kind === "crash" || e.kind === "rally") && watching(e.key)) toast(e.kind === "crash" ? `📉 ${sym} is crashing` : `📈 ${sym} is rallying`, e.kind === "crash" ? "down" : "up");
     else if (e.kind === "news") toast(`📰 News: the ${esc(W.cur[e.cur].name)} ${e.move > 0 ? "jumps" : "drops"} ${pct(Math.abs(e.move) * 100, 1).replace("+", "")}`, e.move > 0 ? "up" : "down");
-    else if (e.kind === "cascade") { toast(`💥 Liquidation cascade: ${usd(e.usd, { compact: true })} of ${sym} longs liquidated`, "down"); shake($("#app")); vibrate([120, 40, 120]); sfx("loss"); }
+    else if (e.kind === "cascade") { toast(`💥 Liquidation cascade: ${$usd(e.usd, { compact: true })} of ${sym} longs liquidated`, "down"); shake($("#app")); vibrate([120, 40, 120]); sfx("loss"); }
   }
+}
+
+// ---------------------------------------------------------------- Oracle (cheat, Sim only)
+const ORACLE_SECS = 30 * 60;
+/** The next 30 minutes of this coin, played on a copy of the Sim world. Cached; replayed every 5 Sim minutes. */
+function oracleFor(key) {
+  if (!SIM || !W || !C.isOn(S, "oracle") || !W.insts[key]) return null;
+  if (oracle && oracle.key === key && oracle.ver === oracleVer && W.t >= oracle.at && W.t < oracle.at + 5 * 60e3) return oracle;
+  const f = SW.future(W, key, ORACLE_SECS, { keep: simKeep(), lev: SW.leverageByKey([S]) });
+  const wi = W.insts[key];
+  oracle = { key, at: W.t, ver: oracleVer, inst: f.inst, best: SW.bestTrade(f.path, W.t, wi.px), until: W.t + ORACLE_SECS * 1000 };
+  return oracle;
+}
+
+function oracleNote(o, inst) {
+  const el = $("#oracleNote");
+  if (!el) return;
+  if (!o) { el.hidden = true; return; }
+  el.hidden = false;
+  const now = W.t, b = o.best;
+  const when = t => (t <= now ? "now" : t - now < 60e3 ? `in ${Math.ceil((t - now) / 1000)} s` : `in ${countdown(t - now)}`);
+  el.innerHTML = b
+    ? `🔮 <b>Oracle</b> · BUY ${b.buy.t <= now ? "now" : when(b.buy.t)} at ${$px(inst, b.buy.px)} · SELL = max profit ${b.sell.t <= now ? "passed" : when(b.sell.t)} at ${$px(inst, b.sell.px)} · <b class="up">${$pct(b.gain * 100, 1)}</b>`
+    : `🔮 <b>Oracle</b> · no profitable trade in the next 30 minutes: it only goes down from here.`;
+}
+
+/**
+ * Skip ahead (Sim only): play the whole Sim world forward by 1 hour, 1 day or 1 week. Candles, events, new coins,
+ * rugs and the bots' trades happen as if the time had passed; your limit orders, stop loss, take profit and
+ * trailing stop fill on the way at the prices of that moment.
+ */
+async function skipAhead(id) {
+  const ms = SW.SKIPS[id];
+  if (!SIM || !W || skipping || !ms) return;
+  skipping = true;
+  hideLastChance();
+  const box = $("#skipBox");
+  const label = { "1h": "1 hour", "1d": "1 day", "1w": "1 week" }[id];
+  box.innerHTML = `<div class="skip-box"><b>⏩ Skipping ahead ${label}…</b><div class="bar"><i id="skipBar"></i></div><small id="skipTxt">Generating candles, events and the bots' moves</small></div>`;
+  box.hidden = false;
+  const total0 = E.totals(S, quoteFor).total, t0 = W.t;
+  const tally = { events: {}, coin: 0, pump: 0, moonshot: 0, rug: 0, cascade: 0, news: 0 };
+  const mine = [], botMade = [];
+  const OPEN = { open: true, since: 0 };
+  const trail = trailPct();
+  const plan = SW.skipPlan(ms), steps = plan.reduce((a, x) => a + x.n, 0);
+  let done = 0, sinceBots = 0, yieldAt = performance.now();
+  try {
+    for (const seg of plan) {
+      for (let k = 0; k < seg.n; k++) {
+        const keep = simKeep();
+        const out = SW.stepBy(W, seg.dt, { keep, lev: SW.leverageByKey([S]) });
+        for (const e of out) {
+          if (e.kind === "event") tally.events[e.ev.title] = (tally.events[e.ev.title] || 0) + 1;
+          else if (e.kind in tally) tally[e.kind]++;
+          else if (e.kind === "gone") for (const g of e.keys) if (!keep.has(g)) { live.delete(g); ticks.delete(g); }
+        }
+        const now = W.t;
+        const mineKeys = new Set([...Object.keys(S.pos), ...E.marginPositions(S).map(x => x.key), ...S.orders.map(o => o.key)]);
+        for (const key of mineKeys) {
+          const wi = W.insts[key];
+          if (!wi) continue;
+          const q = { px: wi.px, t: now, liq: wi.liq, quoteUsd: wi.m === "fx" ? W.cur[wi.quote].usd : undefined };
+          mine.push(...E.checkKey(S, key, q, now, OPEN, { trail }));
+        }
+        sinceBots += seg.dt;
+        if (BOTS.length && sinceBots >= 60) {
+          sinceBots = 0;
+          const entries = Object.values(W.insts).map(i => ({ inst: SW.instOf(i), ...SW.quote(W, i) }));
+          for (const b of BOTS) {
+            botCheatTick(b, now, { allowed: CFG.botCheats, quoteFor: k => { const i = W.insts[k]; return i ? { px: i.px, t: now, liq: i.liq, quoteUsd: i.m === "fx" ? W.cur[i.quote].usd : undefined } : null; } });
+            for (const t of botStep(b, { entries, now, status: () => OPEN, bootAt, extreme: botExtreme })) botMade.push([b, t]);
+          }
+        }
+        done++;
+        if (performance.now() - yieldAt > 50) {
+          $("#skipBar").style.width = Math.round((done / steps) * 100) + "%";
+          $("#skipTxt").textContent = `${dateTime(now)} (Sim) · ${tally.coin.toLocaleString("en-US")} new coins, ${tally.rug} rugs`;
+          await new Promise(r => setTimeout(r, 0));
+          yieldAt = performance.now();
+        }
+      }
+    }
+  } finally {
+    W.off = W.t - Date.now();
+    skipping = false;
+  }
+  oracleVer++;
+  publishSim(false);
+  const trades = mine.filter(e => e.trade).map(e => e.trade);
+  const count = type => mine.filter(e => e.type === type).length;
+  for (const p of [...Object.values(S.pos), ...E.marginPositions(S)]) if (!p.jackpot && p.cost > 0) { const v = E.positionValue(S, p, quoteFor(p.key)); if (v / p.cost >= FUN.JACKPOT_X) p.jackpot = true; }
+  if (trades.length) afterTrades(trades); else saveSoon(0);
+  if (botMade.length) saveBots();
+  saveWorld(); simSavedAt = W.t;
+  const total1 = E.totals(S, quoteFor).total;
+  const evs = Object.entries(tally.events).map(([k, n]) => esc(k) + (n > 1 ? ` ×${n}` : "")).join(", ") || "none";
+  const yours = [[count("fill"), "order filled", "orders filled"], [count("sl"), "stop loss", "stop losses"], [count("tp"), "take profit", "take profits"], [count("trail"), "trailing stop", "trailing stops"], [count("liq"), "liquidation", "liquidations"], [count("cancel"), "order canceled", "orders canceled"]]
+    .filter(([n]) => n).map(([n, a, b]) => plural(n, a, b)).join(", ") || "nothing triggered";
+  box.innerHTML = `<div class="skip-box done" role="dialog" aria-labelledby="skipT">
+    <b id="skipT">⏩ +${label}</b><small>Sim clock: ${dateTime(t0)} → <b>${dateTime(W.t)}</b></small>
+    <ul>
+      <li><span>Events</span><b>${evs}</b></li>
+      <li><span>Memecoins</span><b>${tally.coin.toLocaleString("en-US")} new · ${tally.pump} pumps · ${tally.moonshot} moonshots · ${tally.rug} rugs</b></li>
+      <li><span>Your orders</span><b>${yours}</b></li>
+      <li><span>Rival bots</span><b>${botMade.length ? plural(botMade.length, "trade", "trades") : "no trades"}</b></li>
+      <li><span>Your Sim portfolio</span><b>${$usd(total0)} → <span class="${dirCls(total1 - total0)}">${$usd(total1)}</span></b></li>
+    </ul>
+    <button class="btn" data-skipok>OK</button></div>`;
+  renderBanners(); renderView(); refreshStandings();
+  if (ui.sheet?.kind === "inst") { renderSheet(); drawChartSoon(true); }
+  frame();
+  for (const k of trackedKeys()) lastChanceCheck(k);
+  return { tally, mine, botMade };
 }
 
 function simEventHTML() {
   const ev = W?.event;
-  if (!ev || Date.now() > ev.until) return "";
-  return `<div class="sim-event ev-${ev.type}" role="status"><span class="se-i" aria-hidden="true">${ev.icon}</span><div class="se-t"><b>${esc(ev.title)}</b><small>${esc(ev.text)}</small></div><b class="se-cd" data-cd="${ev.until}">${countdown(ev.until - Date.now())}</b></div>`;
+  if (!ev || appNow() > ev.until) return "";
+  return `<div class="sim-event ev-${ev.type}" role="status"><span class="se-i" aria-hidden="true">${ev.icon}</span><div class="se-t"><b>${esc(ev.title)}</b><small>${esc(ev.text)}</small></div><b class="se-cd" data-cd="${ev.until}">${countdown(ev.until - appNow())}</b></div>`;
 }
 
 function showJackpot(sym, mult, gain, now) {
@@ -591,7 +813,7 @@ function showJackpot(sym, mult, gain, now) {
 }
 
 function simAfterTrades(trades) {
-  const now = Date.now();
+  const now = appNow();
   for (const t of trades) {
     if (t.side !== "sell" || t.reason === "bot" || t.ghosted) continue;
     const r = FUN.onSale(REC, t, now);
@@ -625,18 +847,32 @@ function recordsHTML() {
 const saveBots = () => kv.set(K("bots"), { v: 1, list: BOTS }).catch(() => {});
 
 /** Every bot takes a turn with the live prices the app has right now. Only while the app is on screen. */
-function botTick(now = Date.now()) {
+function botTick(now = appNow()) {
   if (!BOTS.length || (document.hidden && !TEST)) return [];
   const entries = [...live.values()].map(L => ({ ...L, inst: L.inst }));
   const made = [];
+  let cheated = 0;
   for (const b of BOTS) {
-    const trades = botStep(b, { entries, now, status: m => mstatus(m, now), bootAt: TEST ? 0 : bootAt });
+    cheated += botCheatTick(b, now, { allowed: CFG.botCheats, quoteFor }).length;
+    const trades = botStep(b, { entries, now, status: m => mstatus(m, now), bootAt: TEST ? 0 : bootAt, extreme: botExtreme });
     for (const t of trades) made.push([b, t]);
   }
-  if (made.length) saveBots();
+  if (made.length || cheated) saveBots();
   refreshStandings();
   if (ui.sheet?.kind === "bot") renderSheet();
   return made;
+}
+
+/**
+ * Lowest / highest price of `key` since `from`, for the bots' Golden entry and Perfect exit. Sim: its 1-minute
+ * candles. Live: the live prices this app has seen (bots only trade while the app is open). null when unknown.
+ */
+function botExtreme(key, from, kind) {
+  let xs = [];
+  if (SIM) { const wi = W?.insts[key]; if (wi) for (const b of wi.b1) if (b[0] + 60e3 > from) xs.push(kind === "low" ? b[3] : b[2]); }
+  else xs = (ticks.get(key) || []).filter(x => x.t >= from).map(x => x.px);
+  if (!xs.length) return null;
+  return kind === "low" ? Math.min(...xs) : Math.max(...xs);
 }
 
 function refreshStandings() {
@@ -646,17 +882,17 @@ function refreshStandings() {
 
 function participants() {
   const me = { id: "me", name: "You", cheat: E.isCheated(S), ...standing(S, quoteFor) };
-  return [me, ...BOTS.map(b => ({ id: b.id, name: b.name, style: b.style, ...standing(b.pf, quoteFor) }))].sort((a, b) => b.plPct - a.plPct);
+  return [me, ...BOTS.map(b => ({ id: b.id, name: b.name, style: b.style, cheat: E.isCheated(b.pf), ...standing(b.pf, quoteFor) }))].sort((a, b) => b.plPct - a.plPct);
 }
 
 function leaderboardHTML() {
   const medal = ["🥇", "🥈", "🥉"];
-  const tr = (label, t) => t ? `${label} <span class="${dirCls(t.pl)}">${usd(t.pl, { sign: true })}</span> ${esc(t.sym)}` : `${label} —`;
+  const tr = (label, t) => t ? `${label} <span class="${dirCls(t.pl)}">${$usd(t.pl, { sign: true })}</span> ${esc(t.sym)}` : `${label} —`;
   return `<div class="list">${participants().map((x, i) => `
     <button class="row lb ${x.id === "me" ? "me" : ""}" ${x.id === "me" ? `data-tab="history"` : `data-bot="${esc(x.id)}"`}>
       <span class="ico ico-rank" aria-label="Rank ${i + 1}">${medal[i] || i + 1}</span>
       <span class="nm"><b>${esc(x.name)}${x.cheat ? ` <span class="star" title="Cheats used">★</span>` : ""}${x.style && !x.name.startsWith(STYLES[x.style].name) ? ` <i class="mk-tag">${STYLES[x.style].name}</i>` : ""}</b><small>${tr("Best", x.best)}</small><small>${tr("Worst", x.worst)}</small>${x.id !== "me" && C.isOn(S, "xray") ? `<small class="xray">${xrayText(x.id)}</small>` : ""}</span>
-      <span class="px"><b>${usd(x.total)}</b><small class="${dirCls(x.pl)}">${pct(x.plPct * 100)}</small></span>
+      <span class="px"><b>${$usd(x.total)}</b><small class="${dirCls(x.pl)}">${$pct(x.plPct * 100)}</small></span>
     </button>`).join("")}</div>`;
 }
 
@@ -664,17 +900,21 @@ function leaderboardHTML() {
 function xrayText(id) {
   const b = BOTS.find(x => x.id === id);
   if (!b) return "";
-  const now = Date.now();
+  const now = appNow();
   const v = botPreview(b, { entries: [...live.values()], now, status: m => mstatus(m, now), bootAt: TEST ? 0 : bootAt });
   const parts = v.sells.map(x => `sell ${esc(x.sym)} (${esc(x.why)})`);
-  if (v.buy) parts.push(`buy ${esc(v.buy.sym)} ~${usd0(Math.round(v.buy.usd))} (${esc(v.buy.why)})${v.wait > 0 ? ` in ${Math.ceil(v.wait / 1000)} s` : ""}`);
+  if (v.buy) parts.push(`buy ${esc(v.buy.sym)} ~${$usd0(Math.round(v.buy.usd))} (${esc(v.buy.why)})${v.wait > 0 ? ` in ${Math.ceil(v.wait / 1000)} s` : ""}`);
   return "🩻 " + (parts.length ? "Next: " + parts.join(" · ") : "Nothing it would buy right now");
 }
 
 function botFeedHTML() {
-  const recent = BOTS.flatMap(b => b.pf.trades.slice(-5).map(t => [b, t])).sort((a, b) => b[1].t - a[1].t).slice(0, 4);
+  const trades = BOTS.flatMap(b => b.pf.trades.slice(-5).map(t => ({ b, t: t.t, tr: t })));
+  const cheats = botCheatFeed(BOTS, 4).map(x => ({ b: x.bot, t: x.t, ch: x }));
+  const recent = [...trades, ...cheats].sort((a, b) => b.t - a.t).slice(0, 5);
   if (!recent.length) return `<div class="empty sm">The bots trade only while the app is open. Their first moves show up here.</div>`;
-  return `<div class="list">${recent.map(([b, t]) => `<button class="feed" data-bot="${esc(b.id)}"><b>${esc(b.name)}</b> ${t.side === "buy" ? "bought" : "sold"} ${esc(t.sym)} · ${usd(t.usd)}${t.side === "sell" ? ` · <span class="${dirCls(t.pl)}">${usd(t.pl, { sign: true })}</span>` : ""} <small>${clock(t.t)}</small></button>`).join("")}</div>`;
+  return `<div class="list">${recent.map(x => x.ch
+    ? `<button class="feed cheat" data-bot="${esc(x.b.id)}"><b>${esc(x.b.name)} <span class="star">★</span></b> used a cheat: ${esc(x.ch.text)} <small>${clock(x.t)}</small></button>`
+    : `<button class="feed" data-bot="${esc(x.b.id)}"><b>${esc(x.b.name)}</b> ${sideLabel(x.tr) === "short" ? "shorted" : x.tr.side === "buy" ? (x.tr.lev > 1 ? `bought ${x.tr.lev}x` : "bought") : "sold"} ${esc(x.tr.sym)} · ${$usd(x.tr.usd)}${x.tr.side === "sell" ? ` · <span class="${dirCls(x.tr.pl)}">${$usd(x.tr.pl, { sign: true })}</span>` : ""}${x.tr.cheat?.length ? ` <span class="star" title="${esc(x.tr.cheat.join(", "))}">★</span>` : ""} <small>${clock(x.t)}</small></button>`).join("")}</div>`;
 }
 
 function rivalsHome() {
@@ -684,10 +924,10 @@ function rivalsHome() {
 
 function addBot(style) {
   if (BOTS.length >= MAX_BOTS || !STYLES[style]) return;
-  const now = Date.now();
+  const now = appNow();
   const b = newBot(style, { id: "bot" + now.toString(36) + Math.floor(Math.random() * 1296).toString(36), name: botName(style, BOTS), start: S.start, now, seed: Math.floor(Math.random() * 2147483647) });
   BOTS.push(b); saveBots();
-  toast(`🤖 ${b.name} joined with ${usd0(b.pf.start)}`, "up");
+  toast(`🤖 ${b.name} joined with ${$usd0(b.pf.start)}`, "up");
   kick("meme"); kick("stock");
 }
 
@@ -699,23 +939,23 @@ function resetBots(start, now) {
 
 function botSheetHTML(b) {
   const x = standing(b.pf, quoteFor);
-  const tr = t => t ? `<b class="${dirCls(t.pl)}">${usd(t.pl, { sign: true })}</b><small>${esc(t.sym)} · ${pct(t.plPct * 100, 1)}</small>` : "<b>—</b>";
+  const tr = t => t ? `<b class="${dirCls(t.pl)}">${$usd(t.pl, { sign: true })}</b><small>${esc(t.sym)} · ${$pct(t.plPct * 100, 1)}</small>` : "<b>—</b>";
   const pos = Object.values(b.pf.pos).sort((a, c) => c.cost - a.cost).map(p => {
     const v = E.positionView(p, quoteFor(p.key));
     return `<button class="row" data-open="${esc(p.key)}">${icon(p.inst)}
-      <span class="nm"><b>${esc(p.inst.sym)} <i class="mk-tag">${MARKET_LABEL[p.inst.m]}</i></b><small>Invested ${usd(p.cost)}${v.live ? "" : " · last saved price"}</small></span>
-      <span class="px"><b>${usd(v.value)}</b><small class="${dirCls(v.pl)}">${usd(v.pl, { sign: true })} (${pct(v.plPct * 100, 1)})</small></span></button>`;
+      <span class="nm"><b>${esc(p.inst.sym)} <i class="mk-tag">${MARKET_LABEL[p.inst.m]}</i></b><small>Invested ${$usd(p.cost)}${v.live ? "" : " · last saved price"}</small></span>
+      <span class="px"><b>${$usd(v.value)}</b><small class="${dirCls(v.pl)}">${$usd(v.pl, { sign: true })} (${$pct(v.plPct * 100, 1)})</small></span></button>`;
   }).join("");
   const hist = b.pf.trades.slice().reverse().slice(0, 200).map(t => tradeItem(t)).join("");
   return `<div class="sh-head"><span class="ico ico-bot" aria-hidden="true">🤖</span><div class="sh-title"><h2>${esc(b.name)}</h2><small>${STYLES[b.style].name} · rival bot</small></div>
       <button class="close" data-close aria-label="Close">✕</button></div>
     <div class="sh-body">
-      <div class="big">${usd(x.total)}</div>
-      <div class="chg"><span class="${dirCls(x.pl)}">${usd(x.pl, { sign: true })} (${pct(x.plPct * 100)})</span> from ${usd0(b.pf.start)}</div>
-      <p class="foot">${esc(STYLES[b.style].desc)} It trades only while the app is open, with the same costs and market hours as you. Bots never use cheats.</p>
+      <div class="big">${$usd(x.total)}</div>
+      <div class="chg"><span class="${dirCls(x.pl)}">${$usd(x.pl, { sign: true })} (${$pct(x.plPct * 100)})</span> from ${$usd0(b.pf.start)}</div>
+      <p class="foot">${esc(STYLES[b.style].desc)} It trades only while the app is open, with the same costs and market hours as you. ${CFG.botCheats ? "It arms up to 3 cheats a day from the bots' list (Settings → Rival bots)." : "Bot cheats are off in Settings."}${E.isCheated(b.pf) ? ` ★ It has cheated: ${esc((b.pf.cheats.log || []).slice(-3).map(x => x.text).join(" · "))}` : ""}</p>
       ${C.isOn(S, "xray") ? `<p class="xray card">${xrayText(b.id)}</p>` : ""}
       <div class="sb-grid card">
-        <div><small>Cash</small><b>${usd(b.pf.cash)}</b></div>
+        <div><small>Cash</small><b>${$usd(b.pf.cash)}</b></div>
         <div><small>Win rate</small><b>${x.winRate == null ? "—" : Math.round(x.winRate * 100) + "%"}</b><small>${x.closed} closed</small></div>
         <div><small>Best trade</small>${tr(x.best)}</div>
         <div><small>Worst trade</small>${tr(x.worst)}</div>
@@ -742,15 +982,17 @@ function openBot(id) {
 function botsSettingsHTML() {
   const full = BOTS.length >= MAX_BOTS;
   return `<h3>Rival bots</h3>
-      <p class="mut">Each bot gets its own portfolio, as big as yours (${usd0(S.start)}), and decides by itself what to buy, how much and when to sell, with your same costs and market hours. Bots trade only while the app is open: nothing is made up for the time it was closed.</p>
-      ${BOTS.map(b => { const x = standing(b.pf, quoteFor); return `<div class="bot-row"><span class="nm"><b>${esc(b.name)}</b><small>${STYLES[b.style].name} · ${usd(x.total)} · <span class="${dirCls(x.pl)}">${pct(x.plPct * 100)}</span></small></span><button class="btn ghost sm" data-delbot="${esc(b.id)}">Remove</button></div>`; }).join("")}
+      <p class="mut">Each bot gets its own portfolio, as big as yours (${$usd0(S.start)}), and decides by itself what to buy, how much and when to sell, with your same costs and market hours. Bots trade only while the app is open: nothing is made up for the time it was closed.</p>
+      ${BOTS.map(b => { const x = standing(b.pf, quoteFor); return `<div class="bot-row"><span class="nm"><b>${esc(b.name)}</b><small>${STYLES[b.style].name} · ${$usd(x.total)} · <span class="${dirCls(x.pl)}">${$pct(x.plPct * 100)}</span></small></span><button class="btn ghost sm" data-delbot="${esc(b.id)}">Remove</button></div>`; }).join("")}
+      <label class="tog"><input type="checkbox" id="botCheatsTog" ${CFG.botCheats ? "checked" : ""}><span>Bots can cheat</span></label>
+      <small class="mut">Each bot arms up to 3 cheats a day, at random: ${BOT_CHEATS.map(c => c.name).join(", ")}. Never Undo, Ghost trade, Oracle, X-ray, Time machine, Skip ahead or Always on. A bot that cheats gets a ★ on the leaderboard, and its cheats show in Rival moves.</small>
       <p class="lbl">Add a bot${full ? ` (max ${MAX_BOTS})` : ""}</p>
       <div class="bot-add">${STYLE_IDS.map(id => `<button class="bot-style" data-addbot="${id}" ${full ? "disabled" : ""}><b>+ ${STYLES[id].name}</b><small>${esc(STYLES[id].desc)}</small></button>`).join("")}</div>`;
 }
 function renderBotsBox() { const el = $("#botsBox"); if (el) el.innerHTML = botsSettingsHTML(); }
 
 function clockTick() {
-  const now = Date.now();
+  const now = appNow();
   const tot = E.totals(S, quoteFor);
   E.recordDay(S, localDay(now), tot.total, now);
   const got = evaluate(A, [], { trades: S.trades, total: tot.total, start: S.start, now, stockOpenSince: null, cheated: E.isCheated(S) });
@@ -763,7 +1005,7 @@ function clockTick() {
 // Market open/close transitions: re-check waiting orders the moment the bell rings.
 let wasOpen = {};
 function secondTick() {
-  const now = Date.now();
+  const now = appNow();
   for (const m of ["stock", "fx"]) {
     const open = mstatus(m, now).open;
     if (wasOpen[m] !== undefined && open !== wasOpen[m]) {
@@ -782,20 +1024,31 @@ function secondTick() {
   if (ui.tab === "home") { updateLastChance(now); updateMovers(now); }
   const sb = C.settleBoost(S, now);
   if (sb) {
-    toast(sb.extra > 0 ? `🌙 Moon boost paid ${usd(sb.extra, { sign: true })} on ${esc(sb.sym)}` : `🌙 Moon boost on ${esc(sb.sym || "your coin")} ended with no gain to triple`, sb.extra > 0 ? "gold" : "");
+    toast(sb.extra > 0 ? `🌙 Moon boost paid ${$usd(sb.extra, { sign: true })} on ${esc(sb.sym)}` : `🌙 Moon boost on ${esc(sb.sym || "your coin")} ended with no gain to triple`, sb.extra > 0 ? "gold" : "");
     saveSoon(0); renderView(); if (ui.sheet?.kind === "cheats") renderSheet(); frame();
   }
   renderTape();
 }
 
 // ---------------------------------------------------------------- formatting helpers
-function fmtPx(inst, px) {
-  if (!inst) return price(px);
-  if (inst.m === "fx") return price(px, inst.dp ?? FX_BY_ID[inst.id]?.dp ?? 5);
-  return price(px);
+function fmtPx(inst, px, full = false) {
+  if (!inst) return price(px, null, { full });
+  if (inst.m === "fx") return price(px, inst.dp ?? FX_BY_ID[inst.id]?.dp ?? 5, { full });
+  return price(px, null, { full });
 }
 /** Whole dollars when there are no cents: $100,000 instead of $100,000.00. */
-const usd0 = n => usd(n).replace(/\.00$/, "");
+const usd0 = (n, full = false) => usd(n, { full }).replace(/\.00$/, "");
+// The same, as HTML: an abbreviated number shows the full one when tapped.
+const $usd = (n, o = {}) => tap(usd(n, o), usd(n, { ...o, full: true }));
+const $usd0 = n => tap(usd0(n), usd0(n, true));
+const $pct = (n, d = 2) => tap(pct(n, d), pct(n, d, { full: true }));
+const $px = (inst, px) => tap(fmtPx(inst, px), fmtPx(inst, px, true));
+const $qty = n => tap(qty(n), qty(n, { full: true }));
+/** Set an element's number: abbreviated text, full number on tap. */
+function setNum(el, short, full) {
+  el.textContent = short;
+  if (short !== full) { el.dataset.full = full; el.classList.add("ab"); } else { delete el.dataset.full; el.classList.remove("ab"); }
+}
 /** Short chip label: $100, $2.5K, $1M. */
 function chipLabel(n) {
   if (n >= 1e6) return "$" + +(n / 1e6).toFixed(2) + "M";
@@ -817,12 +1070,12 @@ function chHTML(key) {
   const L = live.get(key);
   if (offline()) return `<small class="flat">offline</small>`;
   const v = L?.ch24;
-  return `<small data-c="${esc(key)}" class="${dirCls(v)}">${pct(v)}</small>`;
+  return `<small data-c="${esc(key)}" class="${dirCls(v)}">${$pct(v)}</small>`;
 }
 function subFor(inst) {
   const L = live.get(inst.key) || {};
-  if (inst.m === "meme") return `MC ${usd(L.mc, { compact: true })} · Liq ${usd(L.liq, { compact: true })}${inst.born ? ` · <span data-age="${inst.born}">${ago(inst.born)}</span>` : ""}`;
-  if (inst.m === "crypto") return esc(inst.name) + (L.vol ? ` · Vol ${usd(L.vol, { compact: true })}` : "");
+  if (inst.m === "meme") return `MC ${$usd(L.mc, { compact: true })} · Liq ${$usd(L.liq, { compact: true })}${inst.born ? ` · <span data-age="${inst.born}">${ago(inst.born, appNow())}</span>` : ""}`;
+  if (inst.m === "crypto") return esc(inst.name) + (L.vol ? ` · Vol ${$usd(L.vol, { compact: true })}` : "");
   return esc(inst.name);
 }
 function rowHTML(inst) {
@@ -837,19 +1090,22 @@ function rowHTML(inst) {
 // ---------------------------------------------------------------- header, tape, banners
 let lastTotal = null;
 function updateHeader() {
-  const now = Date.now();
+  const now = appNow();
   const t = E.totals(S, quoteFor);
   const el = $("#total");
-  if (SIM && lastTotal != null && Math.abs(t.total - lastTotal) > 0.004) rollNumber(el, lastTotal, t.total, usd);
+  if (SIM && lastTotal != null && Math.abs(t.total - lastTotal) > 0.004) rollNumber(el, lastTotal, t.total, n => usd(n));
   else if (!el._roll || !el.classList.contains("rolling")) el.textContent = usd(t.total);
+  el.dataset.full = usd(t.total, { full: true }); el.classList.add("ab");
+  if ((S.capCut || 0) > capSeen) { if (capSeen >= 0) worldsRichest(S.capCut - capSeen); capSeen = S.capCut; }
   if (lastTotal != null && Math.abs(t.total - lastTotal) > 0.004) flash(el, t.total > lastTotal ? 1 : -1);
   lastTotal = t.total;
   const day = S.days[localDay(now)];
   const dd = day ? t.total - day.first : null;
   const tp = $("#totalPl");
-  tp.innerHTML = `<span class="${dirCls(t.pl)}">${usd(t.pl, { sign: true })} (${pct(t.plPct * 100)})</span> from ${usd0(S.start)}` +
-    (dd != null && Math.abs(dd) >= 0.01 ? ` · <span class="${dirCls(dd)}">${usd(dd, { sign: true })} today</span>` : "") +
-    (E.isCheated(S) ? ` <span class="star" title="Cheats used in this portfolio">★</span>` : "");
+  tp.innerHTML = `<span class="${dirCls(t.pl)}">${$usd(t.pl, { sign: true })} (${$pct(t.plPct * 100)})</span> from ${$usd0(S.start)}` +
+    (dd != null && Math.abs(dd) >= 0.01 ? ` · <span class="${dirCls(dd)}">${$usd(dd, { sign: true })} today</span>` : "") +
+    (E.isCheated(S) ? ` <span class="star" title="Cheats used in this portfolio">★</span>` : "") +
+    (t.capped ? ` <span class="rich-tag">🌍 World's richest</span>` : "");
   const ok = Object.values(src).some(s => s.ok && now - s.ok < 90e3);
   const dot = $("#liveDot"), simb = $("#simBtn");
   if (SIM) {
@@ -874,20 +1130,20 @@ function updateDirty() {
     if (!L) continue;
     const sel = CSS.escape(k);
     for (const el of document.querySelectorAll(`[data-p="${sel}"]`)) {
-      const txt = fmtPx(L.inst, L.px);
-      if (el.textContent !== txt) { el.textContent = txt; flash(el, L.dir); }
+      const full = fmtPx(L.inst, L.px, true), txt = el.classList.contains("big") ? full : fmtPx(L.inst, L.px);
+      if (el.textContent !== txt) { setNum(el, txt, full); flash(el, L.dir); }
     }
-    for (const el of document.querySelectorAll(`[data-c="${sel}"]`)) { el.textContent = pct(L.ch24); el.className = dirCls(L.ch24); }
+    for (const el of document.querySelectorAll(`[data-c="${sel}"]`)) { el.className = dirCls(L.ch24); setNum(el, pct(L.ch24), pct(L.ch24, 2, { full: true })); }
     for (const m of E.marginPositions(S).filter(x => x.key === k)) {
       const v = E.positionView(m, quoteFor(k), S);
-      for (const el of document.querySelectorAll(`[data-mv="${CSS.escape(m.id)}"]`)) el.textContent = usd(v.value);
-      for (const el of document.querySelectorAll(`[data-mpl="${CSS.escape(m.id)}"]`)) { el.textContent = `${usd(v.pl, { sign: true })} (${pct(v.plPct * 100, 1)})`; el.className = dirCls(v.pl); }
+      for (const el of document.querySelectorAll(`[data-mv="${CSS.escape(m.id)}"]`)) setNum(el, usd(v.value), usd(v.value, { full: true }));
+      for (const el of document.querySelectorAll(`[data-mpl="${CSS.escape(m.id)}"]`)) { el.className = dirCls(v.pl); setNum(el, `${usd(v.pl, { sign: true })} (${pct(v.plPct * 100, 1)})`, `${usd(v.pl, { sign: true, full: true })} (${pct(v.plPct * 100, 1, { full: true })})`); }
     }
     const p = S.pos[k];
     if (p) {
       const v = E.positionView(p, quoteFor(k), S);
-      for (const el of document.querySelectorAll(`[data-v="${sel}"]`)) el.textContent = usd(v.value);
-      for (const el of document.querySelectorAll(`[data-pl="${sel}"]`)) { el.textContent = `${usd(v.pl, { sign: true })} (${pct(v.plPct * 100, 1)})`; el.className = dirCls(v.pl); }
+      for (const el of document.querySelectorAll(`[data-v="${sel}"]`)) setNum(el, usd(v.value), usd(v.value, { full: true }));
+      for (const el of document.querySelectorAll(`[data-pl="${sel}"]`)) { el.className = dirCls(v.pl); setNum(el, `${usd(v.pl, { sign: true })} (${pct(v.plPct * 100, 1)})`, `${usd(v.pl, { sign: true, full: true })} (${pct(v.plPct * 100, 1, { full: true })})`); }
     }
   }
   dirty.clear();
@@ -902,7 +1158,7 @@ function renderTape(force) {
   for (let i = 0; i < 5; i++) for (const list of per) if (list[i]) movers.push(list[i]);
   const el = $("#tape");
   if (!movers.length) { el.innerHTML = `<span class="tk mut">Waiting for live prices…</span>`; el.style.animationDuration = "0s"; return; }
-  const one = movers.map(L => `<button class="tk" data-open="${esc(L.inst.key)}"><b>${esc(L.inst.sym)}</b> <span data-c="${esc(L.inst.key)}" class="${dirCls(L.ch24)}">${pct(L.ch24, 1)}</span></button>`).join("");
+  const one = movers.map(L => `<button class="tk" data-open="${esc(L.inst.key)}"><b>${esc(L.inst.sym)}</b> <span data-c="${esc(L.inst.key)}" class="${dirCls(L.ch24)}">${$pct(L.ch24, 1)}</span></button>`).join("");
   el.innerHTML = `<div class="tape-run">${one}</div><div class="tape-run" aria-hidden="true">${one}</div>`;
   el.style.animationDuration = Math.max(20, movers.length * 3.2) + "s";
 }
@@ -910,7 +1166,7 @@ function renderTape(force) {
 const SRC_NAME = { dexscreener: "DexScreener", geckoterminal: "GeckoTerminal", binance: "Binance", coinbase: "Coinbase", coingecko: "CoinGecko", finnhub: "Finnhub", twelvedata: "Twelve Data", "coinbase-fx": "Coinbase (forex)" };
 function renderBanners() {
   const out = [];
-  const now = Date.now();
+  const now = appNow();
   if (SIM) {
     if (usingMemory()) out.push(["warn", "This browser won't let the app save data on the phone (private mode?)."]);
     $("#banners").innerHTML = simEventHTML() + out.map(([k, h]) => `<div class="banner ${k}" role="status">${h}</div>`).join("");
@@ -988,14 +1244,14 @@ function lastChances(now) {
     const q = quoteFor(o.key);
     if (!q || !mstatus(o.inst.m, now).open) continue;
     const dist = Math.abs(q.px - o.limit) / o.limit;
-    if (dist <= 0.005) out.push({ title: `Your ${o.inst.sym} limit order is ${(dist * 100).toFixed(2)}% from filling`, text: `Price ${fmtPx(o.inst, q.px)} · limit ${fmtPx(o.inst, o.limit)}`, key: o.key });
+    if (dist <= 0.005) out.push({ title: `Your ${o.inst.sym} limit order is ${(dist * 100).toFixed(2)}% from filling`, text: `Price ${$px(o.inst, q.px)} · limit ${$px(o.inst, o.limit)}`, key: o.key });
   }
   const seen = new Set();
   for (const k of [...lists.meme.new, ...lists.meme.trending]) {
     const L = live.get(k);
     if (seen.has(k) || !L?.inst.born || now - L.inst.born > 15 * 60e3 || now < L.inst.born) continue;
     seen.add(k);
-    out.push({ title: `${L.inst.sym} is new`, text: `Born <span data-age="${L.inst.born}">${ago(L.inst.born, now)}</span> ago · liquidity ${usd(L.liq, { compact: true })}`, key: k });
+    out.push({ title: `${L.inst.sym} is new`, text: `Born <span data-age="${L.inst.born}">${ago(L.inst.born, now)}</span> ago · liquidity ${$usd(L.liq, { compact: true })}`, key: k });
     if (seen.size >= 3) break;
   }
   return out;
@@ -1021,14 +1277,14 @@ function moversFor(m, n = 3) {
 }
 
 function viewHome() {
-  const now = Date.now();
+  const now = appNow();
   lcSig = lastChances(now).map(x => x.title).join("|");
   const streak = greenStreak(S.trades, now);
   const unlocked = Object.keys(A.unlocked).length;
   const todayTrades = S.trades.filter(t => localDay(t.t) === localDay(now)).length;
   const welcome = !S.trades.length ? (SIM
-    ? `<div class="hello"><b>Sim mode: ${usd0(S.start)} in Sim money.</b> Invented markets, prices that move every second, pumps, rugs and wild events. Your Live portfolio is kept apart.</div>`
-    : `<div class="hello"><b>You have ${usd0(S.start)} in fake money.</b> Prices are real and live. Pick a market, buy in two taps and slide to confirm.</div>`) : "";
+    ? `<div class="hello"><b>Sim mode: ${$usd0(S.start)} in Sim money.</b> Invented markets, prices that move every second, pumps, rugs and wild events. Your Live portfolio is kept apart.</div>`
+    : `<div class="hello"><b>You have ${$usd0(S.start)} in fake money.</b> Prices are real and live. Pick a market, buy in two taps and slide to confirm.</div>`) : "";
   const orders = S.orders.length ? `<section><h2>Waiting orders (${S.orders.length})</h2><div class="list">${S.orders.map(orderRow).join("")}</div></section>` : "";
   moversSig = moversSignature(); moversAt = now;
   return `${welcome}${marketCards(now)}<div id="lcSlot">${lastChanceHTML(now)}</div>
@@ -1109,8 +1365,8 @@ function viewMarkets() {
 }
 
 function orderRow(o) {
-  const what = o.side === "buy" ? `Buy ${usd(o.amount)}` : `Sell ${Math.round(o.frac * 100)}%`;
-  const how = o.type === "limit" ? `if it hits ${fmtPx(o.inst, o.limit)}` : `at the market open`;
+  const what = o.side === "buy" ? `Buy ${$usd(o.amount)}` : `Sell ${Math.round(o.frac * 100)}%`;
+  const how = o.type === "limit" ? `if it hits ${$px(o.inst, o.limit)}` : `at the market open`;
   return `<div class="ord"><button class="ord-main" data-open="${esc(o.key)}">${icon(o.inst)}<span class="nm"><b>${esc(o.inst.sym)}</b><small>${what} ${how}</small></span></button>
     <button class="x" data-cancel="${o.id}" aria-label="Cancel order">Cancel</button></div>`;
 }
@@ -1122,16 +1378,16 @@ function viewPortfolio() {
   const rows = pos.map(p => {
     const v = E.positionView(p, quoteFor(p.key), S);
     const bo = S.cheats?.boost?.key === p.key ? S.cheats.boost : null;
-    const badges = [p.sl ? `SL ${fmtPx(p.inst, p.sl)}` : "", p.tp ? `TP ${fmtPx(p.inst, p.tp)}` : "", p.cost === 0 ? "free (airdrop)" : "", p.ghost ? "👻" : "",
-      bo ? `🌙 3x <span data-cd="${bo.until}">${countdown(bo.until - Date.now())}</span>` : ""].filter(Boolean).join(" · ");
+    const badges = [p.sl ? `SL ${$px(p.inst, p.sl)}` : "", p.tp ? `TP ${$px(p.inst, p.tp)}` : "", p.cost === 0 ? "free (airdrop)" : "", p.ghost ? "👻" : "",
+      bo ? `🌙 3x <span data-cd="${bo.until}">${countdown(bo.until - appNow())}</span>` : ""].filter(Boolean).join(" · ");
     return `<button class="row" data-open="${esc(p.key)}">${icon(p.inst)}
-      <span class="nm"><b>${esc(p.inst.sym)} <i class="mk-tag">${MARKET_LABEL[p.inst.m]}</i></b><small>Invested ${usd(p.cost)}${badges ? " · " + badges : ""}${v.live ? "" : " · last saved price"}</small></span>
-      <span class="px"><b data-v="${esc(p.key)}">${usd(v.value)}</b><small data-pl="${esc(p.key)}" class="${dirCls(v.pl)}">${usd(v.pl, { sign: true })} (${pct(v.plPct * 100, 1)})</small></span></button>`;
+      <span class="nm"><b>${esc(p.inst.sym)} <i class="mk-tag">${MARKET_LABEL[p.inst.m]}</i></b><small>Invested ${$usd(p.cost)}${badges ? " · " + badges : ""}${v.live ? "" : " · last saved price"}</small></span>
+      <span class="px"><b data-v="${esc(p.key)}">${$usd(v.value)}</b><small data-pl="${esc(p.key)}" class="${dirCls(v.pl)}">${$usd(v.pl, { sign: true })} (${$pct(v.plPct * 100, 1)})</small></span></button>`;
   }).join("");
   return `<div class="stat-row">
-      <div><small>Cash</small><b>${usd(t.cash)}</b></div>
-      <div><small>Available</small><b>${usd(t.cash - t.reserved)}</b></div>
-      <div><small>Invested</small><b>${usd(t.held)}</b></div>
+      <div><small>Cash</small><b>${$usd(t.cash)}</b></div>
+      <div><small>Available</small><b>${$usd(t.cash - t.reserved)}</b></div>
+      <div><small>Invested</small><b>${$usd(t.held)}</b></div>
     </div>
     <h2>Positions (${pos.length})</h2>
     <div class="list">${rows || `<div class="empty">No open positions. Go to Markets, open something and buy.</div>`}</div>
@@ -1143,21 +1399,21 @@ function viewPortfolio() {
 
 function marginRow(p) {
   const q = quoteFor(p.key), v = E.positionView(p, q, S), liq = E.liqPrice(p, q);
-  const safe = C.isOn(S, "diamond") ? "💎 no liquidation" : C.isOn(S, "rugShield") ? "🛡️ shielded" : liq > 0 ? `liq. ${fmtPx(p.inst, liq)}` : "";
+  const safe = C.isOn(S, "diamond") ? "💎 no liquidation" : C.isOn(S, "rugShield") ? "🛡️ shielded" : liq > 0 ? `liq. ${$px(p.inst, liq)}` : "";
   return `<button class="row" data-open="${esc(p.key)}">${icon(p.inst)}
-      <span class="nm"><b>${esc(p.inst.sym)} <i class="mk-tag lev">${p.lev}x ${p.dir > 0 ? "Long" : "Short"}</i></b><small>Margin ${usd(p.cost)}${safe ? " · " + safe : ""}${p.ghost ? " · 👻" : ""}${v.live ? "" : " · last saved price"}</small></span>
-      <span class="px"><b data-mv="${esc(p.id)}">${usd(v.value)}</b><small data-mpl="${esc(p.id)}" class="${dirCls(v.pl)}">${usd(v.pl, { sign: true })} (${pct(v.plPct * 100, 1)})</small></span></button>`;
+      <span class="nm"><b>${esc(p.inst.sym)} <i class="mk-tag lev">${p.lev}x ${p.dir > 0 ? "Long" : "Short"}</i></b><small>Margin ${$usd(p.cost)}${safe ? " · " + safe : ""}${p.ghost ? " · 👻" : ""}${v.live ? "" : " · last saved price"}</small></span>
+      <span class="px"><b data-mv="${esc(p.id)}">${$usd(v.value)}</b><small data-mpl="${esc(p.id)}" class="${dirCls(v.pl)}">${$usd(v.pl, { sign: true })} (${$pct(v.plPct * 100, 1)})</small></span></button>`;
 }
 
-const REASON = { manual: "", limit: "limit order", open: "at the open", sl: "stop loss", tp: "take profit", bot: "", liq: "liquidated", airdrop: "airdrop", replay: "" };
+const REASON = { manual: "", limit: "limit order", open: "at the open", sl: "stop loss", tp: "take profit", bot: "", liq: "liquidated", airdrop: "airdrop", replay: "", trail: "trailing stop" };
 function tradeItem(t) {
   const why = t.why ? esc(t.why) : REASON[t.reason] || "";
   const lbl = sideLabel(t);
-  const right = t.reason === "airdrop" ? `<b>Free</b><small class="flat">worth ${usd(t.worth || 0)}</small>`
-    : `<b>${usd(t.usd)}</b>${t.side === "sell" ? `<small class="${dirCls(t.pl)}">${usd(t.pl, { sign: true })} (${pct(t.plPct * 100, 1)})</small>` : `<small class="flat">costs ${usd((t.fee || 0) + (t.slip || 0))}</small>`}`;
+  const right = t.reason === "airdrop" ? `<b>Free</b><small class="flat">worth ${$usd(t.worth || 0)}</small>`
+    : `<b>${$usd(t.usd)}</b>${t.side === "sell" ? `<small class="${dirCls(t.pl)}">${$usd(t.pl, { sign: true })} (${$pct(t.plPct * 100, 1)})</small>` : `<small class="flat">costs ${$usd((t.fee || 0) + (t.slip || 0))}</small>`}`;
   return `<div class="tr${t.cheat?.length ? " cheat" : ""}">
       <span class="side ${t.side}${t.dir === -1 ? " short" : ""}">${lbl}</span>
-      <span class="nm"><b>${esc(t.sym)}${t.lev > 1 ? ` <i class="mk-tag lev">${t.lev}x</i>` : ""}</b><small>${qty(t.qty)} at ${fmtPx(instOf(t.key) || { m: t.m, id: t.key.split(":")[1] }, t.reason === "airdrop" ? t.mid : t.px)}</small><small>${dateTime(t.t)}${why ? " · " + why : ""}</small>${t.cheat?.length ? `<small class="cheat-tag">★ ${esc(t.cheat.join(", "))}</small>` : ""}</span>
+      <span class="nm"><b>${esc(t.sym)}${t.lev > 1 ? ` <i class="mk-tag lev">${t.lev}x</i>` : ""}</b><small>${$qty(t.qty)} at ${$px(instOf(t.key) || { m: t.m, id: t.key.split(":")[1] }, t.reason === "airdrop" ? t.mid : t.px)}</small><small>${dateTime(t.t)}${why ? " · " + why : ""}</small>${t.cheat?.length ? `<small class="cheat-tag">★ ${esc(t.cheat.join(", "))}</small>` : ""}</span>
       <span class="px">${right}</span>
     </div>`;
 }
@@ -1179,7 +1435,7 @@ function viewHistory() {
     <div class="stat-row">
       <div><small>Trades</small><b>${trades.length}</b></div>
       <div><small>Win rate</small><b>${sb.winRate == null ? "—" : Math.round(sb.winRate * 100) + "%"}</b></div>
-      <div><small>Realized P&amp;L</small><b class="${dirCls(sb.total)}">${usd(sb.total, { sign: true })}</b></div>
+      <div><small>Realized P&amp;L</small><b class="${dirCls(sb.total)}">${$usd(sb.total, { sign: true })}</b></div>
     </div>
     <div class="list">${items || `<div class="empty">Every buy and sell is saved here.</div>`}</div>
     ${trades.length > ui.histN ? `<button class="btn ghost wide" data-more>Show more</button>` : ""}
@@ -1187,14 +1443,14 @@ function viewHistory() {
 }
 
 function viewAchievements() {
-  const now = Date.now();
+  const now = appNow();
   const streak = greenStreak(S.trades, now);
   const sb = scoreboard(S.trades);
-  const tr = t => t ? `<b class="${dirCls(t.pl)}">${usd(t.pl, { sign: true })}</b><small>${esc(t.sym)} · ${pct(t.plPct * 100, 1)}</small>` : "<b>—</b>";
+  const tr = t => t ? `<b class="${dirCls(t.pl)}">${$usd(t.pl, { sign: true })}</b><small>${esc(t.sym)} · ${$pct(t.plPct * 100, 1)}</small>` : "<b>—</b>";
   const card = (label, b) => `<div class="sb">
       <h3>${label}</h3>
       <div class="sb-grid">
-        <div><small>Total P&amp;L</small><b class="${dirCls(b.total)}">${usd(b.total, { sign: true })}</b></div>
+        <div><small>Total P&amp;L</small><b class="${dirCls(b.total)}">${$usd(b.total, { sign: true })}</b></div>
         <div><small>Win rate</small><b>${b.winRate == null ? "—" : Math.round(b.winRate * 100) + "%"}</b><small>${b.n} closed</small></div>
         <div><small>Best</small>${tr(b.best)}</div>
         <div><small>Worst</small>${tr(b.worst)}</div>
@@ -1207,7 +1463,7 @@ function viewAchievements() {
   const withCheats = ACHIEVEMENTS.filter(a => cheated(a.id));
   const cheatGrid = withCheats.map(a => `<div class="ach got cheat"><span class="ach-i" aria-hidden="true">${a.icon}</span><b>${esc(a.name)} <span class="star">★</span></b><small>With cheats · ${dateTime(A.unlocked[a.id])}</small></div>`).join("");
   const rivals = `<h2>Leaderboard</h2>${BOTS.length ? `<div id="lbSlotFull">${leaderboardHTML()}</div>` : `<div class="empty sm">No rivals yet. <button class="lnk" data-settings>Add a bot in Settings</button> to race against it: Momentum, Contrarian, Degen or Random.</div>`}`;
-  return `${SIM ? recordsHTML() : ""}${rivals}<div class="streak"><span>🔥</span><div><b>${plural(streak, "green day", "green days")}</b><small>Days in a row closing trades with a net profit.</small></div></div>
+  return `${SIM ? recordsHTML() : ""}${ladderHTML()}${rivals}<div class="streak"><span>🔥</span><div><b>${plural(streak, "green day", "green days")}</b><small>Days in a row closing trades with a net profit.</small></div></div>
     <h2>Scoreboards</h2>
     <div class="seg chips">${["all", ...MARKETS].map(m => `<button data-sb="${m}" aria-pressed="${ui.sb === m}">${m === "all" ? "All" : MARKET_LABEL[m]}</button>`).join("")}</div>
     ${card(ui.sb === "all" ? "All markets" : MARKET_LABEL[ui.sb], sb[ui.sb])}
@@ -1269,7 +1525,7 @@ function closeSheet(fromPop) {
   if (!fromPop && history.state?.sheet) history.back();
 }
 
-function marketLine(inst, now = Date.now()) {
+function marketLine(inst, now = appNow()) {
   if (SIM) return `<span class="mkt open">Sim · always open</span>`;
   if (inst.m === "meme" || inst.m === "crypto") return `<span class="mkt open">Open 24/7</span>`;
   const st = mstatus(inst.m, now);
@@ -1282,7 +1538,7 @@ function statsFor(inst, L) {
   const s = [];
   if (inst.m === "meme") {
     s.push(["Market cap", usd(L.mc, { compact: true })], ["Liquidity", usd(L.liq, { compact: true })], ["24h volume", usd(L.vol, { compact: true })]);
-    if (inst.born) s.push(["Age", `<span data-age="${inst.born}">${ago(inst.born)}</span>`]);
+    if (inst.born) s.push(["Age", `<span data-age="${inst.born}">${ago(inst.born, appNow())}</span>`]);
   } else if (inst.m === "crypto") {
     const m = crypto.meta[inst.id] || {};
     s.push(["24h volume", usd(L.vol, { compact: true })]);
@@ -1301,9 +1557,9 @@ function statsFor(inst, L) {
 
 function changeLine(inst, L) {
   if (offline()) return `<div class="chg flat">offline</div>`;
-  if (inst.m === "meme") return `<div class="chg">${[["5m", L.ch5m], ["1h", L.ch1h], ["6h", L.ch6h], ["24h", L.ch24]].map(([k, v]) => `<span class="${dirCls(v)}">${pct(v, 1)}</span> ${k}`).join(" · ")}</div>`;
+  if (inst.m === "meme") return `<div class="chg">${[["5m", L.ch5m], ["1h", L.ch1h], ["6h", L.ch6h], ["24h", L.ch24]].map(([k, v]) => `<span class="${dirCls(v)}">${$pct(v, 1)}</span> ${k}`).join(" · ")}</div>`;
   const lbl = inst.m === "fx" ? "vs. yesterday" : inst.m === "stock" ? "today" : "24h";
-  return `<div class="chg"><span data-c="${esc(inst.key)}" class="${dirCls(L.ch24)}">${pct(L.ch24)}</span> ${lbl}</div>`;
+  return `<div class="chg"><span data-c="${esc(inst.key)}" class="${dirCls(L.ch24)}">${$pct(L.ch24)}</span> ${lbl}</div>`;
 }
 
 function renderSheet() {
@@ -1324,11 +1580,12 @@ function renderSheet() {
     return `<section class="card pos">
       <h3>Your position</h3>
       <div class="stats">
-        <div><small>Quantity</small><b>${qty(p.qty)}</b></div>
-        <div><small>Worth</small><b data-v="${esc(key)}">${usd(v.value)}</b></div>
-        <div><small>P&amp;L</small><b data-pl="${esc(key)}" class="${dirCls(v.pl)}">${usd(v.pl, { sign: true })} (${pct(v.plPct * 100, 1)})</b></div>
-        <div><small>Average price</small><b>${fmtPx(inst, avg)}</b></div>
+        <div><small>Quantity</small><b>${$qty(p.qty)}</b></div>
+        <div><small>Worth</small><b data-v="${esc(key)}">${$usd(v.value)}</b></div>
+        <div><small>P&amp;L</small><b data-pl="${esc(key)}" class="${dirCls(v.pl)}">${$usd(v.pl, { sign: true })} (${$pct(v.plPct * 100, 1)})</b></div>
+        <div><small>Average price</small><b>${$px(inst, avg)}</b></div>
       </div>
+      ${p.best > 0 ? `<p class="lc-line">⏳ High since you bought: <b>${$px(inst, p.best)}</b>${L.px > 0 ? ` (now ${$pct(-E.drawdown(p, L.px) * 100, 1)})` : ""}. ${CFG.lc.trail ? "Trailing stop sells" : CFG.lc.warn ? "Last chance warning" : "Last chance is off;"} at ${$px(inst, p.best * (1 - CFG.lc.pct / 100))} (−${CFG.lc.pct}%).</p>` : ""}
       <div class="stops">
         <label>Stop loss <input id="slIn" type="number" inputmode="decimal" step="any" min="0" placeholder="price" value="${p.sl ?? ""}"></label>
         <div class="chips">${[5, 10, 20].map(n => `<button data-sl="${n}">−${n}%</button>`).join("")}</div>
@@ -1342,9 +1599,9 @@ function renderSheet() {
     <div class="sh-head">${icon(inst)}<div class="sh-title"><h2>${esc(inst.sym)}</h2><small>${esc(inst.name)} · ${MARKET_LABEL[inst.m]}</small></div>
       <button class="close" data-close aria-label="Close">✕</button></div>
     <div class="sh-body">
-      <div class="big" data-p="${esc(key)}">${L.px > 0 ? fmtPx(inst, L.px) : "—"}</div>
+      <div class="big" data-p="${esc(key)}">${L.px > 0 ? fmtPx(inst, L.px, true) : "—"}</div>
       ${changeLine(inst, L)}
-      ${E.whaleMult(S, key) !== 1 && L.px > 0 ? `<div class="chg">🐋 In your game: <b>${fmtPx(inst, L.px * E.whaleMult(S, key))}</b> (${pct((E.whaleMult(S, key) - 1) * 100, 2)} from your own trades)</div>` : ""}
+      ${E.whaleMult(S, key) !== 1 && L.px > 0 ? `<div class="chg">🐋 In your game: <b>${$px(inst, L.px * E.whaleMult(S, key))}</b> (${$pct((E.whaleMult(S, key) - 1) * 100, 2)} from your own trades)</div>` : ""}
       <div class="mline">${marketLine(inst)}</div>
       ${needKey ? noKeyCard() : `
       <div class="chart-bar">
@@ -1353,6 +1610,8 @@ function renderSheet() {
       </div>
       <canvas id="chart" aria-label="${esc(inst.sym)} chart"></canvas>
       <div class="chart-note" id="chartNote">${esc(chart?.note || "")}</div>
+      ${SIM ? `<div class="oracle-note" id="oracleNote"></div>` : ""}
+      <div class="skip${SIM ? "" : " off"}" role="group" aria-label="Skip ahead"><span>⏩ Skip ahead${SIM ? "" : ` <small class="sim-only">Sim only</small>`}</span>${Object.keys(SW.SKIPS).map(k => `<button class="btn sm ghost" data-skip="${k}" ${SIM ? "" : "disabled"}>+${k}</button>`).join("")}</div>
       ${statsFor(inst, L)}`}
       ${posHTML}
       ${marginCardHTML(key)}
@@ -1360,7 +1619,7 @@ function renderSheet() {
       ${needKey ? "" : `<section class="card">
         <h3>Alert me when it hits</h3>
         <form class="alert-form" data-alertform><input id="alertIn" type="number" inputmode="decimal" step="any" min="0" placeholder="price" aria-label="Alert price"><button class="btn">Alert me</button></form>
-        ${myAlerts.map(a => `<div class="alert-row">${a.dir === "above" ? "If it rises to" : "If it falls to"} ${fmtPx(inst, a.price)} <button class="lnk" data-delalert="${a.id}">remove</button></div>`).join("")}
+        ${myAlerts.map(a => `<div class="alert-row">${a.dir === "above" ? "If it rises to" : "If it falls to"} ${$px(inst, a.price)} <button class="lnk" data-delalert="${a.id}">remove</button></div>`).join("")}
       </section>`}
       ${inst.m === "meme" && inst.url ? `<p class="foot"><a href="${esc(inst.url)}" target="_blank" rel="noopener">View on DexScreener ↗</a></p>` : ""}
     </div>
@@ -1405,7 +1664,7 @@ function tradeBoxHTML() {
 
 function tradePreview() {
   const sh = ui.sheet, inst = instOf(sh.key), p = S.pos[sh.key];
-  const now = Date.now();
+  const now = appNow();
   const q = quoteFor(sh.key);
   const mkt = mstatus(inst.m, now);
   const lines = [];
@@ -1420,13 +1679,13 @@ function tradePreview() {
   if (isMarginSide(sh.side)) {
     const lev = C.leverage(S), dir = sh.side === "short" ? -1 : 1, avail = E.available(S);
     if (!(sh.amount > 0)) { lines.push("Choose how much margin to put in."); ok = false; }
-    else if (sh.amount > avail + 1e-9) { lines.push(`Not enough cash: you have ${usd(avail)} available.`); ok = false; }
+    else if (sh.amount > avail + 1e-9) { lines.push(`Not enough cash: you have ${$usd(avail)} available.`); ok = false; }
     else if (gq) {
       const r = quoteOpenMargin(inst, sh.amount, lev, dir, gq, mods);
       if (r) {
         const liq = E.liqPrice({ inst, avg: r.eff, dir, cost: sh.amount, entryFee: r.fee, qty: r.qty }, gq);
-        lines.push(`${dir > 0 ? "Long" : "Short"} ${usd(r.notional)} (${lev}x on ${usd(sh.amount)} of margin) at ${fmtPx(inst, r.eff)} · fee ${usd(r.fee)} · ${costName} ${usd(r.slip)}`);
-        lines.push(C.isOn(S, "diamond") ? "💎 Diamond hands: it won't be liquidated." : C.isOn(S, "rugShield") ? "🛡️ Rug shield: it can't lose more than 20%." : liq > 0 ? `Liquidated at ${fmtPx(inst, liq)} (${pct((liq / q.px - 1) * 100, 1)}) if the loss reaches your margin.` : "Liquidated if the loss reaches your margin.");
+        lines.push(`${dir > 0 ? "Long" : "Short"} ${$usd(r.notional)} (${lev}x on ${$usd(sh.amount)} of margin) at ${$px(inst, r.eff)} · fee ${$usd(r.fee)} · ${costName} ${$usd(r.slip)}`);
+        lines.push(C.isOn(S, "diamond") ? "💎 Diamond hands: it won't be liquidated." : C.isOn(S, "rugShield") ? "🛡️ Rug shield: it can't lose more than 20%." : liq > 0 ? `Liquidated at ${$px(inst, liq)} (${$pct((liq / q.px - 1) * 100, 1)}) if the loss reaches your margin.` : "Liquidated if the loss reaches your margin.");
       }
     }
     if (!mkt.open) { lines.push(`<b>${inst.m === "stock" ? "Wall Street" : "Forex"} is closed:</b> leveraged and short trades need an open market.`); ok = false; }
@@ -1436,17 +1695,17 @@ function tradePreview() {
   if (sh.side === "buy") {
     const avail = E.available(S);
     if (!(sh.amount > 0)) { lines.push("Choose an amount."); ok = false; }
-    else if (sh.amount > avail + 1e-9) { lines.push(`Not enough cash: you have ${usd(avail)} available.`); ok = false; }
+    else if (sh.amount > avail + 1e-9) { lines.push(`Not enough cash: you have ${$usd(avail)} available.`); ok = false; }
     else if (qx) {
       const r = quoteBuy(inst, sh.amount, gq, mods);
-      if (r) lines.push(`You get ~${qty(r.qty)} ${esc(inst.m === "fx" ? inst.base : inst.sym)} at ${fmtPx(inst, r.eff)} · fee ${usd(r.fee)} · ${costName} ${usd(r.slip)}`);
+      if (r) lines.push(`You get ~${$qty(r.qty)} ${esc(inst.m === "fx" ? inst.base : inst.sym)} at ${$px(inst, r.eff)} · fee ${$usd(r.fee)} · ${costName} ${$usd(r.slip)}`);
     }
   } else if (p && qx) {
     const r = quoteSell(inst, p, sh.frac, gq, mods);
-    if (r) lines.push(`You get ~${usd(r.proceeds)} · P&amp;L <span class="${dirCls(r.pl)}">${usd(r.pl, { sign: true })} (${pct(r.plPct * 100, 1)})</span> · fee ${usd(r.fee)} · ${costName} ${usd(r.slip)}`);
+    if (r) lines.push(`You get ~${$usd(r.proceeds)} · P&amp;L <span class="${dirCls(r.pl)}">${$usd(r.pl, { sign: true })} (${$pct(r.plPct * 100, 1)})</span> · fee ${$usd(r.fee)} · ${costName} ${$usd(r.slip)}`);
   }
   if (isLimit && sh.limit > 0) {
-    lines.push(`Fills at the live price when it hits ${fmtPx(inst, sh.limit)}, while the app is open; when you open it, it's checked against the current price.`);
+    lines.push(`Fills at the live price when it hits ${$px(inst, sh.limit)}, while the app is open; when you open it, it's checked against the current price.`);
     if (q && (sh.side === "buy" ? q.px <= sh.limit : q.px >= sh.limit)) lines.push("The price is already there: it will fill when you confirm.");
   }
   lines.push(...armedNotes(sh.side, inst, isLimit || !mkt.open));
@@ -1490,7 +1749,7 @@ async function submitTrade() {
   const sh = ui.sheet;
   if (!sh || sh.kind !== "inst" || submitting) return;
   const inst = instOf(sh.key);
-  let now = Date.now();
+  let now = appNow();
   const mkt = mstatus(inst.m, now);
   const margin = isMarginSide(sh.side);
   const spec = sh.side !== "sell"
@@ -1501,7 +1760,7 @@ async function submitTrade() {
     if (margin && !mkt.open) throw new E.TradeError("Leveraged and short trades need an open market.");
     const cheat = sh.type === "market" && mkt.open ? await cheatPrice(sh.side, inst) : null;
     if (ui.sheet !== sh) return;
-    now = Date.now();
+    now = appNow();
     const opts = cheat ? { price: cheat.px, tags: [cheat.name] } : {};
     const r = margin
       ? { trade: E.openMargin(S, inst, spec.amount, C.leverage(S), sh.side === "short" ? -1 : 1, quoteFor(sh.key), now, "manual", opts) }
@@ -1512,7 +1771,7 @@ async function submitTrade() {
     if (r.trade) { celebrate(r.trade); afterTrades([r.trade]); }
     else {
       const o = r.order;
-      toast(o.type === "limit" ? `Limit order placed: ${o.side === "buy" ? "buy" : "sell"} ${inst.sym} at ${fmtPx(inst, o.limit)}` : `Order placed: it fills at the market open`, "");
+      toast(o.type === "limit" ? `Limit order placed: ${o.side === "buy" ? "buy" : "sell"} ${inst.sym} at ${$px(inst, o.limit)}` : `Order placed: it fills at the market open`, "");
       vibrate(15);
       saveSoon(0);
       runChecks(sh.key);
@@ -1528,7 +1787,7 @@ async function submitTrade() {
 
 /** Golden entry, Perfect exit and Sniper: the fill price comes from real candles. null when none is armed. */
 async function cheatPrice(side, inst) {
-  const now = Date.now();
+  const now = appNow();
   if (SIM && side !== "sell" && inst.m === "meme" && C.isArmed(S, "sniper")) {
     const wi = W.insts[inst.key], b = wi?.b1[0];
     if (!wi || !b || b[0] > wi.born + 10 * 60e3) throw new E.TradeError("Sniper: this coin is too old, its first candle is gone. Sniper stays armed.");
@@ -1553,7 +1812,7 @@ async function cheatPrice(side, inst) {
 
 /** Lowest (or highest) real price since `from`: source candles plus the live prices seen. It must cover the whole window. */
 async function extremePrice(inst, from, kind) {
-  const ivl = kind === "low" ? "1m" : "5m", ms = INTERVALS[ivl], now = Date.now();
+  const ivl = kind === "low" ? "1m" : "5m", ms = INTERVALS[ivl], now = appNow();
   let bars = [], whole = false;
   if (SIM) { const wi = W.insts[inst.key]; bars = wi ? SW.bars(wi, ivl) : []; whole = !!wi?.born && wi.born >= from - 60e3; }
   else if (!TEST) {
@@ -1578,8 +1837,8 @@ async function extremePrice(inst, from, kind) {
 
 // ---------------------------------------------------------------- cheats sheet
 function cheatsHTML() {
-  const now = Date.now();
-  const toggle = id => `<label class="sw"><input type="checkbox" data-cheat="${id}" ${C.isOn(S, id) ? "checked" : ""} aria-label="${esc(C.CHEAT[id].name)}"><span></span></label>`;
+  const now = appNow();
+  const toggle = id => `<label class="sw"><input type="checkbox" data-cheat="${id}" ${C.isOn(S, id) ? "checked" : ""} ${id === "oracle" && !SIM ? "disabled" : ""} aria-label="${esc(C.CHEAT[id].name)}"><span></span></label>`;
   const armBtn = id => `<button class="btn sm ${C.isArmed(S, id) ? "on" : "ghost"}" data-arm="${id}" aria-pressed="${C.isArmed(S, id)}">${C.isArmed(S, id) ? "Armed ✓" : "Arm"}</button>`;
   const lastT = S.undo ? S.trades.filter(t => t.id > S.undo.seq).pop() : null;
   const win = C.lastWin(S);
@@ -1590,28 +1849,32 @@ function cheatsHTML() {
   const body = {
     printer: `<div class="chips">${C.PRINTER.map(n => `<button data-print="${n}">+${chipLabel(n)}</button>`).join("")}</div>`,
     leverage: `<div class="chips" role="group" aria-label="Leverage">${C.LEVERAGE.map(l => `<button data-lev="${l}" aria-pressed="${C.leverage(S) === l}">${l === 1 ? "Off" : l + "x"}</button>`).join("")}</div>`,
-    undo: lastT ? `<button class="btn sm ghost" data-undo>Undo: ${sideLabel(lastT)} ${esc(lastT.sym)} ${usd(lastT.usd)}</button>` : `<small class="mut">Nothing to undo yet: it works on your last trade.</small>`,
-    don: win ? `<button class="btn sm ghost" data-don>Flip on ${usd(win.pl, { sign: true })} ${esc(win.sym)}</button>` : `<small class="mut">Close a trade in the green first: it works on your last trade.</small>`,
+    undo: lastT ? `<button class="btn sm ghost" data-undo>Undo: ${sideLabel(lastT)} ${esc(lastT.sym)} ${$usd(lastT.usd)}</button>` : `<small class="mut">Nothing to undo yet: it works on your last trade.</small>`,
+    don: (win ? `<button class="btn sm ghost" data-don>Flip on ${$usd(win.pl, { sign: true })} ${esc(win.sym)}</button>` : `<small class="mut">Close a trade in the green first: it works on your last trade.</small>`) + `<small class="mut">If you lose, your whole portfolio drops to $100.</small>`,
     moon: bo && now <= bo.until ? `<small class="mut">🌙 Running on ${esc(S.pos[bo.key]?.inst.sym || "")}: <b data-cd="${bo.until}">${countdown(bo.until - now)}</b> left. It pays at the end, at the last live price.</small>`
       : memes.length ? `<div class="chips">${memes.map(p => `<button data-moon="${esc(p.key)}">🌙 ${esc(p.inst.sym)}</button>`).join("")}</div>` : `<small class="mut">Hold a memecoin first.</small>`,
-    airdrop: C.airdropReady(S, now) ? `<button class="btn sm ghost" data-airdrop>Claim today's airdrop (${usd0(S.start * C.AIRDROP_SHARE)} of a random memecoin)</button>` : `<small class="mut">Already claimed today. The next one is tomorrow.</small>`,
+    airdrop: C.airdropReady(S, now) ? `<button class="btn sm ghost" data-airdrop>Claim today's airdrop (${$usd0(S.start * C.AIRDROP_SHARE)} of a random memecoin)</button>` : `<small class="mut">Already claimed today. The next one is tomorrow.</small>`,
     timeMachine: tmList.length ? `<label class="sel">Replay <select id="tmInst">${tmList.map(o => `<option value="${esc(o.key)}">${esc(o.label)}</option>`).join("")}</select></label>
       <label class="sel">Day <select id="tmDay">${RP.replayDays(now).map(d => `<option value="${d.from}">${esc(d.label)}</option>`).join("")}</select></label>
       <button class="btn sm" data-tm>⏪ Start replay</button>
-      <small class="mut">A separate replay portfolio of ${usd0(S.start)}: your ${SIM ? "Sim" : "real"} one is not touched.${SIM ? " Sim history: minutes older than 6 hours are filled in from each hour's candle." : CFG.twelveKey ? "" : " Stocks and forex need the Twelve Data key."}</small>`
+      <small class="mut">A separate replay portfolio of ${$usd0(S.start)}: your ${SIM ? "Sim" : "real"} one is not touched.${SIM ? " Sim history: minutes older than 6 hours are filled in from each hour's candle." : CFG.twelveKey ? "" : " Stocks and forex need the Twelve Data key."}</small>`
       : `<small class="mut">Waiting for the market lists…</small>`,
     timeSkip: `<small class="mut">Inside a Time machine replay: “+1 hour” and “+1 day”.</small>`,
-    copycat: leader ? `<button class="btn sm ghost" data-copycat="${esc(leader.id)}">Copy ${esc(leader.name)} (${usd(leader.total)}, ${pct(leader.plPct * 100)})</button>` : `<small class="mut">Add a rival bot first (Settings → Rival bots).</small>`,
+    oracle: SIM ? `<small class="mut">${C.isOn(S, "oracle") ? "🔮 On: open any Sim coin and its chart shows the next 30 minutes, faded, with BUY and SELL = max profit." : "Turn it on, then open any Sim coin."}</small>` : `<small class="sim-only">Sim only</small> <small class="mut">The real future isn't known: switch to Sim at the top of the screen.</small>`,
+    copycat: leader ? `<button class="btn sm ghost" data-copycat="${esc(leader.id)}">Copy ${esc(leader.name)} (${$usd(leader.total)}, ${$pct(leader.plPct * 100)})</button>` : `<small class="mut">Add a rival bot first (Settings → Rival bots).</small>`,
   };
   const groups = [...new Set(C.CHEATS.map(c => c.group))];
-  const card = c => `<div class="cheat${C.isOn(S, c.id) || C.isArmed(S, c.id) || (c.id === "leverage" && C.leverage(S) > 1) ? " active" : ""}">
-      <div class="ch-top"><span class="ch-i" aria-hidden="true">${c.icon}</span><span class="nm"><b>${esc(c.name)}</b><small>${esc(c.desc)}</small></span>
+  const always = id => C.ALWAYS.includes(id) ? `<button class="always-btn" data-always="${id}" aria-pressed="${C.isAlways(S, id)}">♾️ Always on${C.isAlways(S, id) ? " ✓" : ""}</button>` : "";
+  const card = c => `<div class="cheat${C.isOn(S, c.id) || C.isArmed(S, c.id) || C.isAlways(S, c.id) || (c.id === "leverage" && C.leverage(S) > 1) ? " active" : ""}${C.isAlways(S, c.id) ? " always" : ""}">
+      <div class="ch-top"><span class="ch-i" aria-hidden="true">${c.icon}</span><span class="nm"><b>${esc(c.name)}${C.isAlways(S, c.id) ? ` <i class="always-tag">ALWAYS ON</i>` : ""}</b><small>${esc(c.desc)}</small></span>
       ${c.kind === "toggle" ? toggle(c.id) : c.kind === "arm" ? armBtn(c.id) : ""}</div>
-      ${body[c.id] ? `<div class="ch-body">${body[c.id]}</div>` : ""}</div>`;
-  return `<div class="sh-head"><span class="ico ico-bot" aria-hidden="true">🎮</span><div class="sh-title"><h2>Cheats</h2><small>Bots never use them</small></div><button class="close" data-close aria-label="Close">✕</button></div>
+      ${body[c.id] || C.ALWAYS.includes(c.id) ? `<div class="ch-body">${body[c.id] || ""}${always(c.id)}</div>` : ""}</div>`;
+  const alwaysList = C.ALWAYS.filter(id => C.isAlways(S, id)).map(id => C.CHEAT[id].name);
+  return `<div class="sh-head"><span class="ico ico-bot" aria-hidden="true">🎮</span><div class="sh-title"><h2>Cheats</h2><small>Bots have their own list (Settings → Rival bots)</small></div><button class="close" data-close aria-label="Close">✕</button></div>
   <div class="sh-body cheats">
     <div class="cheat-note">${E.isCheated(S) ? `<b><span class="star">★</span> This portfolio is marked</b><small>Cheats used since ${dateTime(S.cheats.since)}. The star shows on the leaderboard and in your history, and achievements earned now are kept apart. Resetting the portfolio removes it.</small>`
       : `<b>Clean portfolio</b><small>Turning on, arming or using any cheat marks it with a ★ on the leaderboard and in your history, and achievements earned with cheats are kept apart. Resetting the portfolio removes the star.</small>`}</div>
+    ${alwaysList.length ? `<div class="always-list">♾️ <b>Always on:</b> ${alwaysList.map(esc).join(", ")}</div>` : ""}
     ${groups.map(g => `<h3 class="sec">${esc(g)}</h3>${C.CHEATS.filter(c => c.group === g).map(card).join("")}`).join("")}
   </div>`;
 }
@@ -1632,19 +1895,20 @@ function tmChoices() {
 
 function cheatChanged() {
   saveSoon(0);
+  oracleVer++;
   if (ui.sheet?.kind === "cheats" || ui.sheet?.kind === "bot") renderSheet();
   else if (ui.sheet?.kind === "inst") { const tb = $("#tradeBox"); if (tb && !ui.sheet.side) { tb.innerHTML = tradeBoxHTML(); bindTradeBox(); } }
   renderView(); refreshStandings(); frame();
 }
 
 function doAirdrop() {
-  const now = Date.now();
+  const now = appNow();
   const pool = [...live.values()].filter(L => L.inst?.m === "meme" && L.px > 0 && L.t && now - L.t < 10 * 60e3);
   if (!pool.length) { toast("Waiting for live memecoin prices for the airdrop…", "down"); kick("meme"); return; }
   const L = pool[Math.floor(rand() * pool.length)];
   try {
     const t = C.airdrop(S, L.inst, quoteFor(L.inst.key), now);
-    toast(`🪂 Airdrop: ${qty(t.qty)} ${esc(t.sym)} worth ${usd(t.worth)}, free`, "gold");
+    toast(`🪂 Airdrop: ${$qty(t.qty)} ${esc(t.sym)} worth ${$usd(t.worth)}, free`, "gold");
     confetti($("#confetti")); vibrate([20, 30, 20]);
     afterTrades([t]);
   } catch (e) { toast(e.message, "down"); }
@@ -1672,7 +1936,7 @@ function rpTick(now) {
 async function startReplay(key, day, testBars) {
   const inst = instOf(key);
   if (!inst) return;
-  const now = Date.now(), w = RP.loadWindow(day, now);
+  const now = appNow(), w = RP.loadWindow(day, now);
   try {
     let bars = testBars;
     if (!bars) {
@@ -1700,9 +1964,9 @@ function rpStatsHTML(rp) {
   const t = RP.totals(rp), p = rp.pf.pos[rp.inst.key], q = RP.quote(rp);
   const v = p ? E.positionView(p, q, rp.pf) : null;
   return `<div class="sb-grid">
-    <div><small>Replay portfolio</small><b>${usd(t.total)}</b><small class="${dirCls(t.pl)}">${usd(t.pl, { sign: true })} (${pct(t.plPct * 100)})</small></div>
-    <div><small>Cash</small><b>${usd(t.cash)}</b><small>${plural(rp.pf.trades.length, "trade", "trades")}</small></div>
-    <div><small>${esc(rp.inst.sym)} position</small><b>${v ? usd(v.value) : "—"}</b>${v ? `<small class="${dirCls(v.pl)}">${usd(v.pl, { sign: true })} (${pct(v.plPct * 100, 1)})</small>` : ""}</div>
+    <div><small>Replay portfolio</small><b>${$usd(t.total)}</b><small class="${dirCls(t.pl)}">${$usd(t.pl, { sign: true })} (${$pct(t.plPct * 100)})</small></div>
+    <div><small>Cash</small><b>${$usd(t.cash)}</b><small>${plural(rp.pf.trades.length, "trade", "trades")}</small></div>
+    <div><small>${esc(rp.inst.sym)} position</small><b>${v ? usd(v.value) : "—"}</b>${v ? `<small class="${dirCls(v.pl)}">${$usd(v.pl, { sign: true })} (${$pct(v.plPct * 100, 1)})</small>` : ""}</div>
     <div><small>Market then</small><b>${RP.marketOpen(rp) ? "Open" : "Closed"}</b></div>
   </div>`;
 }
@@ -1756,12 +2020,12 @@ function replayAction(a) {
     rp.playing = false;
     const end = RP.skip(rp, a === "hour" ? 3600e3 : 86400e3);
     const t = RP.totals(rp);
-    toast(`⏩ ${a === "hour" ? "+1 hour" : "+1 day"}: ${esc(rpClock(rp))} · replay portfolio ${usd(t.total)} (${usd(t.pl, { sign: true })})${end ? " · you reached the present" : ""}`, t.pl >= 0 ? "up" : "down");
+    toast(`⏩ ${a === "hour" ? "+1 hour" : "+1 day"}: ${esc(rpClock(rp))} · replay portfolio ${$usd(t.total)} (${$usd(t.pl, { sign: true })})${end ? " · you reached the present" : ""}`, t.pl >= 0 ? "up" : "down");
     renderSheet(); return;
   }
   try {
     if (a === "sell") { const t = RP.sell(rp); celebrate(t); }
-    else { const usdAmt = Math.min(E.available(rp.pf), Math.round(rp.pf.start * +a * 100) / 100); const t = RP.buy(rp, usdAmt); toast(`Replay: bought ${usd(t.usd)} of ${esc(t.sym)} at ${fmtPx(rp.inst, t.px)}`, "up"); }
+    else { const usdAmt = Math.min(E.available(rp.pf), Math.round(rp.pf.start * +a * 100) / 100); const t = RP.buy(rp, usdAmt); toast(`Replay: bought ${$usd(t.usd)} of ${esc(t.sym)} at ${$px(rp.inst, t.px)}`, "up"); }
   } catch (e) { toast(e.message, "down"); }
   renderSheet();
 }
@@ -1784,7 +2048,7 @@ async function loadChart() {
   setChartNote(chart.note); drawChartSoon(true);
   if (TEST) return;
   let bars, srcName, note;
-  const now = Date.now();
+  const now = appNow();
   try {
     if (inst.m === "crypto") {
       bars = await crypto.candles(inst.id, ivl);
@@ -1836,8 +2100,19 @@ function drawChartSoon(now) {
     const c = $("#chart");
     if (!c || !chart || !ui.sheet) return;
     const inst = instOf(chart.key);
-    const bars = chart.src === "sim" ? (W?.insts[chart.key] ? SW.bars(W.insts[chart.key], chart.ivl) : []) : chart.src === "live" ? ticksToBars(ticks.get(chart.key) || [], chart.ivl) : chart.bars;
-    drawChart(c, bars, { mode: CFG.chartMode, dp: inst?.m === "fx" ? (inst.dp ?? 5) : null, ivl: chart.ivl, empty: chart.src === "live" ? "The chart is drawn from live prices while you have the app open." : "" });
+    let bars = chart.src === "sim" ? (W?.insts[chart.key] ? SW.bars(W.insts[chart.key], chart.ivl) : []) : chart.src === "live" ? ticksToBars(ticks.get(chart.key) || [], chart.ivl) : chart.bars;
+    let ghost = 0, marks = [];
+    if (chart.src === "sim") {
+      const o = oracleFor(chart.key);
+      if (o?.inst && bars.length) {
+        const lastT = bars[bars.length - 1].t;
+        const fut = SW.bars(o.inst, chart.ivl).filter(b => b.t > lastT);
+        ghost = fut.length; bars = bars.concat(fut);
+        if (o.best) marks = [{ t: o.best.buy.t, px: o.best.buy.px, label: "BUY", kind: "buy" }, { t: o.best.sell.t, px: o.best.sell.px, label: "SELL = max profit", kind: "sell" }];
+      }
+      oracleNote(o, inst);
+    }
+    drawChart(c, bars, { mode: CFG.chartMode, dp: inst?.m === "fx" ? (inst.dp ?? 5) : null, ivl: chart.ivl, ghost, ghostLabel: "Oracle", marks, empty: chart.src === "live" ? "The chart is drawn from live prices while you have the app open." : "" });
   };
   if (now) return run();
   if (chartTimer) return;
@@ -1850,9 +2125,9 @@ function resetHTML() {
   return `<h3>Reset portfolio</h3>
       <p class="mut">${SIM ? "This resets your <b>Sim</b> portfolio only; Live is not touched. " : ""}Start over with a new balance. Positions, orders, history and the cheats ★ are erased; achievements stay. Rival bots restart with the same balance. Export first if you want to keep your history.</p>
       <p class="lbl">Starting balance</p>
-      <div class="chips start" role="group" aria-label="Starting balance">${START_CHOICES.map(n => `<button data-start="${n}" aria-pressed="${!ui.resetCustom && st === n}">${usd0(n)}</button>`).join("")}<button data-start="custom" aria-pressed="${ui.resetCustom}">Custom</button></div>
-      ${ui.resetCustom ? `<label class="amt-in">Amount in dollars (${usd0(START_MIN)} to ${usd0(START_MAX)}) <input id="startIn" type="number" inputmode="decimal" step="any" min="${START_MIN}" max="${START_MAX}" value="${st || ""}"></label>` : ""}
-      <button class="btn danger" data-reset ${okAmt ? "" : "disabled"}>${okAmt ? `Reset to ${usd0(st)}` : "Enter an amount"}</button>`;
+      <div class="chips start" role="group" aria-label="Starting balance">${START_CHOICES.map(n => `<button data-start="${n}" aria-pressed="${!ui.resetCustom && st === n}">${$usd0(n)}</button>`).join("")}<button data-start="custom" aria-pressed="${ui.resetCustom}">Custom</button></div>
+      ${ui.resetCustom ? `<label class="amt-in">Amount in dollars (${$usd0(START_MIN)} to ${$usd0(START_MAX)}) <input id="startIn" type="number" inputmode="decimal" step="any" min="${START_MIN}" max="${START_MAX}" value="${st || ""}"></label>` : ""}
+      <button class="btn danger" data-reset ${okAmt ? "" : "disabled"}>${okAmt ? `Reset to ${$usd0(st)}` : "Enter an amount"}</button>`;
 }
 function renderReset() { const el = $("#resetBox"); if (el) el.innerHTML = resetHTML(); }
 
@@ -1885,13 +2160,25 @@ function settingsHTML() {
       ${tog("summary", "Summary at the Wall Street close")}
       ${tog("streak", "Streaks (“4 green days in a row”)")}
       <small class="mut">They arrive while the app is open or recently minimized. With the app fully closed it would need a notification server, which this version doesn't have. On iPhone, add the app to the Home Screen (iOS 16.4 or later).</small>
-      ${CFG.alerts.length ? `<h4>Active price alerts</h4>${CFG.alerts.map(a => `<div class="alert-row">${esc(a.inst.sym)}: ${a.dir === "above" ? "if it rises to" : "if it falls to"} ${fmtPx(a.inst, a.price)} <button class="lnk" data-delalert="${a.id}">remove</button></div>`).join("")}` : ""}
+      ${CFG.alerts.length ? `<h4>Active price alerts</h4>${CFG.alerts.map(a => `<div class="alert-row">${esc(a.inst.sym)}: ${a.dir === "above" ? "if it rises to" : "if it falls to"} ${$px(a.inst, a.price)} <button class="lnk" data-delalert="${a.id}">remove</button></div>`).join("")}` : ""}
+    </section>
+    <section class="card" id="capBox"><h3>Money cap</h3>
+      <p class="mut">No portfolio (yours in Live, yours in Sim, or a bot's) can be worth more than the combined fortune of the world's 100 richest people: <b>${$usd(RICH.WORLD_CAP)}</b>. If a gain would pass it, the portfolio stays at the cap with a “World's richest” notice.</p>
+      <small class="mut">Figure: ${RICH.SOURCE}, ${richDate()} (a snapshot; Trophies shows where you'd rank).</small>
+    </section>
+    <section class="card" id="lcBox"><h3>Last chance</h3>
+      <p class="mut">After you buy, the app follows the highest price since your buy (the lowest, for a short). If it falls this much from there:</p>
+      <div class="chips" role="group" aria-label="Drop from the high">${[5, 10, 15, 20, 30].map(n => `<button data-lcpct="${n}" aria-pressed="${CFG.lc.pct === n}">−${n}%</button>`).join("")}</div>
+      <label class="sel">Or exactly <input id="lcPct" type="number" inputmode="decimal" min="1" max="90" step="0.5" value="${CFG.lc.pct}"> %</label>
+      <label class="tog"><input type="checkbox" id="lcWarn" ${CFG.lc.warn ? "checked" : ""}><span>Big “Last chance” warning with a Sell button</span></label>
+      <label class="tog"><input type="checkbox" id="lcTrail" ${CFG.lc.trail ? "checked" : ""}><span>Trailing stop: sell automatically at that drop instead</span></label>
+      <small class="mut">Live and Sim, everything you hold (leveraged too). Stocks and forex sell only while their market is open.</small>
     </section>
     <section class="card"><h3>Sound</h3>${`<label class="tog"><input type="checkbox" id="soundTog" ${CFG.sound ? "checked" : ""}><span>Sounds when trading (Live)</span></label>`}
       <label class="tog"><input type="checkbox" id="simSoundTog" ${CFG.simSound ? "checked" : ""}><span>Sim sounds: buys, sales, pumps, rugs, events and jackpots</span></label></section>
     <section class="card" id="botsBox">${botsSettingsHTML()}</section>
     <section class="card" id="cheatsBox"><h3>Cheats</h3>
-      <p class="mut">Money printer, Zero fees, Leverage, Undo, Time machine and ${C.CHEATS.length - 5} more. Using any cheat marks your portfolio with a ★ on the leaderboard and in your history, and achievements earned with cheats are kept apart. Bots never cheat. Resetting the portfolio removes the star.</p>
+      <p class="mut">Money printer, Zero fees, Leverage, Undo, Time machine and ${C.CHEATS.length - 5} more. Using any cheat marks your portfolio with a ★ on the leaderboard and in your history, and achievements earned with cheats are kept apart. Bots cheat too (Settings → Rival bots). Resetting the portfolio removes the star.</p>
       ${E.isCheated(S) ? `<p class="mut"><span class="star">★</span> This portfolio has used cheats.</p>` : ""}
       <button class="btn" data-cheats>Open cheats</button>
     </section>
@@ -2031,9 +2318,16 @@ function onClick(e) {
   const d = t.dataset;
   if (d.open) { openSheet(d.open); return; }
   if (d.setmode) { setMode(d.setmode); return; }
+  if (d.lcpct) { CFG.lc.pct = +d.lcpct; saveCfg(); const i = $("#lcPct"); if (i) i.value = CFG.lc.pct; $$("[data-lcpct]").forEach(b => b.setAttribute("aria-pressed", b.dataset.lcpct === d.lcpct)); return; }
+  if (d.lcsell !== undefined) { lastChanceSell(); return; }
+  if (d.lckeep !== undefined) { hideLastChance(); return; }
+  if (d.skip) { skipAhead(d.skip); return; }
+  if (d.skipok !== undefined) { $("#skipBox").hidden = true; return; }
   if (d.bot) { openBot(d.bot); return; }
   if (d.cheats !== undefined) { openPanel({ kind: "cheats" }); return; }
-  if (d.arm || d.lev || d.print || d.undo !== undefined || d.don !== undefined || d.moon || d.airdrop !== undefined || d.copycat || d.closem) { cheatClick(t, d); return; }
+  if (d.donno !== undefined) { $("#confirm").hidden = true; return; }
+  if (d.always) { C.setAlways(S, d.always, !C.isAlways(S, d.always), appNow()); toast(C.isAlways(S, d.always) ? `♾️ ${C.CHEAT[d.always].name}: always on` : `${C.CHEAT[d.always].name}: always on is off`, "gold"); cheatChanged(); return; }
+  if (d.arm || d.lev || d.print || d.undo !== undefined || d.don !== undefined || d.donflip !== undefined || d.moon || d.airdrop !== undefined || d.copycat || d.closem) { cheatClick(t, d); return; }
   if (d.tm !== undefined) { startReplay($("#tmInst")?.value, +$("#tmDay")?.value); return; }
   if (d.rp) { replayAction(d.rp); return; }
   if (d.rpbuy) { replayAction(d.rpbuy); return; }
@@ -2113,30 +2407,32 @@ function onClick(e) {
   }
   if (d.reset !== undefined) {
     const start = ui.resetStart;
-    if (!E.validStart(start)) { toast(`Enter a starting balance between ${usd0(START_MIN)} and ${usd0(START_MAX)}.`, "down"); return; }
+    if (!E.validStart(start)) { toast(`Enter a starting balance between ${$usd0(START_MIN)} and ${$usd0(START_MAX)}.`, "down"); return; }
     if (!t.dataset.sure) {
       t.dataset.sure = "1"; t.textContent = `Tap again to erase everything and start with ${usd0(start)}`;
       setTimeout(() => { if (t.isConnected) { delete t.dataset.sure; t.textContent = `Reset to ${usd0(ui.resetStart)}`; } }, 5000);
       return;
     }
-    S = E.newPortfolio(Date.now(), start); S.undoable = true; saveSoon(0);
-    resetBots(S.start, Date.now());
+    S = E.newPortfolio(appNow(), start); S.undoable = true; saveSoon(0);
+    resetBots(S.start, appNow());
     CFG.lastBuy = defaultBuy(S.start); saveCfg();
-    toast(`Portfolio reset: ${usd0(S.start)}. Your achievements stay.`, "up");
+    toast(`Portfolio reset: ${$usd0(S.start)}. Your achievements stay.`, "up");
     closeSheet(); renderAll(); return;
   }
 }
 
 function cheatClick(t, d) {
-  const now = Date.now();
+  const now = appNow();
   try {
     if (d.arm) { C.arm(S, d.arm, !C.isArmed(S, d.arm), now); if (C.isArmed(S, d.arm)) toast(`${C.CHEAT[d.arm].icon} ${C.CHEAT[d.arm].name} armed`, "gold"); }
     else if (d.lev) { C.setLeverage(S, +d.lev, now); toast(+d.lev > 1 ? `⚙️ Leverage ${d.lev}x: your buys open leveraged positions` : "Leverage off"); }
-    else if (d.print) { C.printMoney(S, +d.print, now); toast(`🖨️ ${usd0(+d.print)} printed into your cash`, "gold"); confetti($("#confetti")); }
+    else if (d.print) { const cut = C.printMoney(S, +d.print, now); if (cut) { capSeen = S.capCut; worldsRichest(cut); } else toast(`🖨️ ${$usd0(+d.print)} printed into your cash`, "gold"); confetti($("#confetti")); }
     else if (d.undo !== undefined) { const gone = C.undo(S, now); toast(`↩️ Undone: ${gone.map(x => `${sideLabel(x)} ${esc(x.sym)}`).join(", ") || "last trade"}`, "gold"); }
-    else if (d.don !== undefined) {
+    else if (d.don !== undefined) { askDon(); return; }
+    else if (d.donflip !== undefined) {
+      $("#confirm").hidden = true;
       const r = C.doubleOrNothing(S, rand(), now);
-      bigResult($("#result"), { text: r.won ? usd(r.gain * 2, { sign: true }) : usd(0, { sign: true }), sub: `🪙 ${r.won ? "Heads: doubled" : "Tails: the profit is gone"} · ${r.trade.sym}`, win: r.won });
+      bigResult($("#result"), { text: r.won ? usd(r.gain * 2, { sign: true }) : usd(C.DON_FLOOR), sub: r.won ? `🪙 Heads: the profit doubled · ${r.trade.sym}` : `🪙 Tails: your whole portfolio dropped to ${usd(C.DON_FLOOR)}`, win: r.won });
       if (r.won) { confetti($("#confetti")); sfx("win"); } else { shake($("#app")); sfx("loss"); }
     }
     else if (d.moon) { C.startBoost(S, d.moon, quoteFor(d.moon)?.px, now); toast(`🌙 Moon boost: gains on ${esc(S.pos[d.moon].inst.sym)} count 3x for 10 minutes`, "gold"); }
@@ -2168,7 +2464,7 @@ function onSubmit(e) {
     CFG.alerts.push({ id: Date.now(), key, inst: E.slimInst(inst), dir: v >= q.px ? "above" : "below", price: v, createdAt: Date.now() });
     saveCfg();
     const ns = notifySupport();
-    toast(`Alert set: ${inst.sym} at ${fmtPx(inst, v)}` + (ns.ok && ns.permission !== "granted" ? ". Allow notifications in Settings to get it on your phone." : ""), "up");
+    toast(`Alert set: ${inst.sym} at ${$px(inst, v)}` + (ns.ok && ns.permission !== "granted" ? ". Allow notifications in Settings to get it on your phone." : ""), "up");
     renderSheet();
   }
 }
@@ -2192,7 +2488,12 @@ function onChange(e) {
   const t = e.target;
   if (t.dataset.notif) { CFG.notif[t.dataset.notif] = t.checked; saveCfg(); return; }
   if (t.id === "moveTh") { CFG.moveTh = +t.value; saveCfg(); return; }
-  if (t.dataset.cheat) { C.setToggle(S, t.dataset.cheat, t.checked, Date.now()); if (t.checked) toast(`${C.CHEAT[t.dataset.cheat].icon} ${C.CHEAT[t.dataset.cheat].name} on`, "gold"); cheatChanged(); return; }
+  if (t.id === "botCheatsTog") { CFG.botCheats = t.checked; saveCfg(); for (const b of BOTS) botCheatTick(b, appNow(), { allowed: CFG.botCheats, quoteFor }); saveBots(); refreshStandings(); return; }
+  if (t.id === "lcPct") { const v = +t.value; if (v >= 1 && v <= 90) { CFG.lc.pct = v; saveCfg(); $$("[data-lcpct]").forEach(b => b.setAttribute("aria-pressed", +b.dataset.lcpct === v)); } else toast("Choose between 1% and 90%.", "down"); return; }
+  if (t.id === "lcWarn") { CFG.lc.warn = t.checked; saveCfg(); return; }
+  if (t.id === "lcTrail") { CFG.lc.trail = t.checked; saveCfg(); toast(t.checked ? `Trailing stop on: it sells at −${CFG.lc.pct}% from the high since you bought.` : "Trailing stop off."); for (const k of trackedKeys()) runChecks(k); return; }
+  if (t.dataset.cheat === "oracle" && !SIM) { t.checked = false; toast("Oracle works only in Sim mode.", "down"); return; }
+  if (t.dataset.cheat) { C.setToggle(S, t.dataset.cheat, t.checked, appNow()); if (t.checked) toast(`${C.CHEAT[t.dataset.cheat].icon} ${C.CHEAT[t.dataset.cheat].name} on`, "gold"); cheatChanged(); return; }
   if (t.id === "simSoundTog") { CFG.simSound = t.checked; saveCfg(); if (t.checked) sounds.pump(); return; }
   if (t.id === "soundTog") { CFG.sound = t.checked; saveCfg(); if (t.checked) sounds.tap(); return; }
   if (t.id === "importIn" && t.files?.[0]) importBackup(t.files[0]);
@@ -2240,7 +2541,7 @@ async function boot() {
   await openStore(TEST ? "ghost-desk-test" : undefined);
   SIM = (await kv.get("mode")) === "sim";
   document.body.classList.toggle("sim", SIM);
-  S = (await kv.get(K("portfolio"))) || E.newPortfolio(Date.now());
+  S = (await kv.get(K("portfolio"))) || E.newPortfolio(appNow());
   S.margin ||= {}; S.undoable = true;
   A = (await kv.get(K("achievements"))) || newAchievements();
   const savedBots = await kv.get(K("bots"));
@@ -2250,6 +2551,12 @@ async function boot() {
   for (const p of [...Object.values(S.pos), ...E.marginPositions(S)]) if (!live.get(p.key) && p.lastPx) live.set(p.key, { inst: { ...p.inst }, px: null });
   const h = location.hash.slice(1);
   if (TABS.includes(h)) ui.tab = h;
+  document.addEventListener("click", e => {
+    const ab = e.target.closest?.(".ab");
+    if (!ab?.dataset.full || e.target.closest(".btn, .chips, .swipe, .bs, .seg, .sw, .tog")) return;
+    e.preventDefault(); e.stopPropagation();
+    toast(`${esc(ab.dataset.full)}`);
+  }, true);
   document.addEventListener("click", onClick);
   document.addEventListener("submit", onSubmit);
   document.addEventListener("input", onInput);
@@ -2279,9 +2586,9 @@ function setupTestHooks() {
   window.ghostDesk = {
     state: () => S, setLive, openSheet, openSettings, closeSheet, setTab, renderAll,
     bots: () => BOTS, botTick, addBot, openBot,
-    C, E, SW, sim: () => W, rec: () => REC, isSim: () => SIM, simAdvance, setMode,
+    C, E, SW, sim: () => W, rec: () => REC, isSim: () => SIM, simAdvance, setMode, skipAhead, oracleFor, appNow, cfg: () => CFG, RICH, askDon, botExtreme, afterTrades,
     simForce: type => { const ev = SW.forceEvent(W, type, W.t); simEvents([{ kind: "event", ev }]); return ev; },
-    showJackpot: (sym, mult, gain) => showJackpot(sym, mult, gain, Date.now()),
+    showJackpot: (sym, mult, gain) => showJackpot(sym, mult, gain, appNow()),
     openCheats: () => openPanel({ kind: "cheats" }), startReplay, replay: () => ui.replay, rpTick, runChecks, ticks,
     chooseSide: side => $(`[data-side="${side}"]`)?.click(),
     lists, live,

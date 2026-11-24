@@ -5,14 +5,22 @@
 // when it comes back, it continues from where it was (no fast-forward through the time it was closed).
 //
 // Bars are compact arrays [t, o, h, l, c, gold]; gold = 1 marks a candle inside a pump.
+//
+// Random streams: every instrument and currency has its own (i.rs), events have theirs (w.evr) and new coins use
+// the world's (w.rs). A coin's future depends only on its own stream and on the events, so the Oracle can play it
+// ahead on a copy of the world and it happens exactly like that.
 
 export const MIN = 60e3, HOUR = 3600e3, DAY = 86400e3;
 const B1_MAX = 360, BH_MAX = 240, BD_MAX = 120;   // 6 hours of 1m, 10 days of 1h, 120 days of 1d
 export const MAX_MEMES = 45;
 export const MAX_GAP = 30e3;                        // a longer gap (app closed or hidden) is not simulated
+export const VERSION = 2;
+export const SKIPS = { "1h": 3600e3, "1d": 86400e3, "1w": 7 * 86400e3 };
 
 // Volatility per second, by market: crypto high, stocks with crashes and rallies, forex calm except news.
 export const SIG = { crypto: 0.0003, stock: 0.00012, fx: 0.00002, meme: 0.004 };
+// Crypto, stocks and currencies drift back toward their usual price (a gap halves in about 12 hours), so crashes, rallies and events stay big but a long Skip ahead never ends at zero or at infinity.
+export const REVERT = Math.LN2 / (12 * 3600);
 
 export const EVENTS = {
   bull: { icon: "🐂", title: "Bull run", text: "Everything is going up", dur: 75 },
@@ -48,6 +56,9 @@ export function rand(w) {
   return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
 }
 const U = (w, a, b) => a + (b - a) * rand(w);
+const seedOf = w => (rand(w) * 4294967296) >>> 0;
+/** Seconds of [a, b] inside (t0, t1]. */
+const ov = (a, b, t0, t1) => Math.max(0, Math.min(b, t1) - Math.max(a, t0)) / 1000;
 const pick = (w, arr) => arr[Math.floor(rand(w) * arr.length)];
 function gauss(w) {
   let u = 0;
@@ -125,19 +136,20 @@ function layeredHistory(w, i, from, to) {
 
 export function createWorld(seed, now) {
   const w = {
-    v: 1, rs: seed >>> 0, seed: seed >>> 0, t: now, created: now, insts: {}, cur: {}, memes: [],
-    event: null, nextEventAt: now + 45e3, nextCoinAt: now + 3e3, coinN: 0,
+    v: VERSION, rs: seed >>> 0, seed: seed >>> 0, t: now, created: now, insts: {}, cur: {}, memes: [],
+    event: null, nextEventAt: now + 45e3, nextCoinAt: now + 3e3, coinN: 0, off: 0,
   };
+  w.evr = { rs: seedOf(w) };
   const from = now - BD_MAX * DAY;
   for (const [name, sym, px] of CRYPTO) {
-    const i = w.insts[`crypto:${sym}`] = base("crypto", sym, sym, name, px, from, { crowd: U(w, 0.2, 0.9), supply: Math.round(U(w, 2e7, 5e9)) });
+    const i = w.insts[`crypto:${sym}`] = base("crypto", sym, sym, name, px, from, { crowd: U(w, 0.2, 0.9), supply: Math.round(U(w, 2e7, 5e9)), rs: seedOf(w) });
     layeredHistory(w, i, from, now);
   }
   for (const [name, sym, px] of STOCKS) {
-    const i = w.insts[`stock:${sym}`] = base("stock", sym, sym, name, px, from, { crowd: U(w, 0.1, 0.8) });
+    const i = w.insts[`stock:${sym}`] = base("stock", sym, sym, name, px, from, { crowd: U(w, 0.1, 0.8), rs: seedOf(w) });
     layeredHistory(w, i, from, now);
   }
-  for (const c in CURRENCIES) w.cur[c] = { name: CURRENCIES[c][0], usd: CURRENCIES[c][1] };
+  for (const c in CURRENCIES) w.cur[c] = { name: CURRENCIES[c][0], usd: CURRENCIES[c][1], usd0: CURRENCIES[c][1], rs: seedOf(w) };
   w.cur.USD = { name: "US Dollar", usd: 1 };
   for (const [b, q] of FX) {
     const px = w.cur[b].usd / w.cur[q].usd;
@@ -157,7 +169,7 @@ function fxHistory(w, from, to) {
   const h1 = Math.max(from, to - 10 * DAY), m1 = Math.max(from, to - 6 * HOUR);
   const run = (a, b, stepMs) => {
     for (let t = a; t < b; t += stepMs) {
-      for (const c in w.cur) if (c !== "USD") w.cur[c].usd *= Math.exp(SIG.fx * Math.sqrt(stepMs / 1000) * gauss(w));
+      for (const c in w.cur) if (c !== "USD") { const cur = w.cur[c]; cur.usd *= Math.exp(-REVERT * Math.log(cur.usd / cur.usd0) * (stepMs / 1000) + SIG.fx * Math.sqrt(stepMs / 1000) * gauss(cur)); }
       for (const i of Object.values(w.insts)) if (i.m === "fx") addPrice(i, t, w.cur[i.base].usd / w.cur[i.quote].usd);
     }
   };
@@ -187,7 +199,7 @@ function newCoin(w, born, now) {
   const rugs = rand(w) < (kind === "normal" ? 0.4 : 0.5);
   const rugAt = !rugs ? null : kind === "normal" ? born + U(w, 60e3, 25 * MIN) : pumpAt + pumpDur * 1000 + U(w, 30e3, 5 * MIN);
   const i = base("meme", id, sym, name, px, born, {
-    born, supply: 1e9, liq0: U(w, 6e3, 60e3), dead: false, fate: { kind, pumpAt, pumpDur, mult, rugAt },
+    born, supply: 1e9, liq0: U(w, 6e3, 60e3), dead: false, fate: { kind, pumpAt, pumpDur, mult, rugAt }, rs: seedOf(w),
   });
   i.liq = i.liq0;
   w.insts[i.key] = i;
@@ -201,15 +213,14 @@ function newCoin(w, born, now) {
   return i;
 }
 
-// ---------------------------------------------------------------- one second
-function eventMu(w, i, t) {
-  const ev = w.event;
-  if (!ev || t > ev.until) return 0;
+// ---------------------------------------------------------------- one step (1 second live, longer when skipping ahead)
+/** Drift per second an event gives this instrument. */
+function eventMu(ev, i) {
   switch (ev.type) {
-    case "bull": return { crypto: 0.0006, stock: 0.0003, meme: 0.003, fx: 0 }[i.m];
+    case "bull": return { crypto: 0.00096, stock: 0.00054, meme: 0.0036, fx: 0 }[i.m]; // as much up as a Black swan takes down
     case "blackSwan": return { crypto: -0.0016, stock: -0.0009, meme: -0.006, fx: 0 }[i.m];
     case "whaleAlert": return ev.keys.includes(i.key) ? ev.dir * 0.0006 : 0;
-    case "shortSqueeze": return ev.keys.includes(i.key) ? 0.0045 : 0;
+    case "shortSqueeze": return ev.keys.includes(i.key) ? 0.0025 : 0;
     case "fedSurprise": return i.m === "stock" ? ev.dir * 0.0006 : 0;
     case "elonTweet": return ev.keys.includes(i.key) ? ev.rate : 0;
   }
@@ -217,43 +228,48 @@ function eventMu(w, i, t) {
 }
 
 /**
- * Move one instrument by dt seconds. out (or null) collects what happened. quiet = building history.
+ * Move one instrument from t - dt seconds to t. out (or null) collects what happened. quiet = building history.
+ * Pumps, events, crashes, rallies and cascades count only for the part of their window inside the step.
  */
 function moveInst(w, i, t, dt, out, quiet = false, opts = {}) {
   if (i.m === "fx") return;
-  let mu = 0, sig = SIG[i.m], gold = false, jump = 1;
+  const t0 = t - dt * 1000;
+  let drift = 0, sig = SIG[i.m], gold = false, jump = 1;
   if (i.m === "meme") {
     const f = i.fate;
-    mu = -0.00005;
-    if (!i.dead && f.mult && t >= f.pumpAt && t <= f.pumpAt + f.pumpDur * 1000) {
-      mu += Math.log(f.mult) / f.pumpDur; gold = true;
+    drift = -0.00005 * dt;
+    const o = !i.dead && f.mult ? ov(f.pumpAt, f.pumpAt + f.pumpDur * 1000, t0, t) : 0;
+    if (o > 0) {
+      drift += (Math.log(f.mult) / f.pumpDur) * o; gold = true;
       if (!i.pumping) { i.pumping = true; if (!quiet) out?.push({ kind: f.kind === "moonshot" ? "moonshot" : "pump", key: i.key }); }
     } else i.pumping = false;
     if (!i.dead && f.rugAt && t >= f.rugAt) {
-      i.dead = true; jump = U(w, 0.005, 0.04); i.liq *= 0.02;
+      i.dead = true; jump = U(i, 0.005, 0.04); i.liq *= 0.02;
       if (!quiet) out?.push({ kind: "rug", key: i.key, drop: 1 - jump });
     }
-    if (i.dead) { sig *= 0.3; mu = -0.0004; }
-    else if (!quiet && rand(w) < dt / 600) {
-      const up = rand(w) < 0.55;
-      jump = up ? U(w, 1.2, 1.7) : U(w, 0.55, 0.8);
+    if (i.dead) { sig *= 0.3; drift = -0.0004 * dt; }
+    else if (!quiet && rand(i) < Math.min(0.5, dt / 600)) {
+      const up = rand(i) < 0.55;
+      jump = up ? U(i, 1.2, 1.7) : U(i, 0.55, 0.8);
       out?.push({ kind: "whale", key: i.key, up, move: jump - 1 });
     }
   } else {
+    drift -= Math.min(0.5, REVERT * dt) * Math.log(i.px / i.px0);
     if (i.m === "stock") {
-      if (i.reg && t > i.reg.until) i.reg = null;
-      if (!i.reg && !quiet && rand(w) < dt / 1500) {
-        const crash = rand(w) < 0.5;
-        i.reg = { type: crash ? "crash" : "rally", mu: crash ? -U(w, 0.0015, 0.004) : U(w, 0.001, 0.003), until: t + U(w, 60, 240) * 1000 };
+      if (i.reg && t0 >= i.reg.until) i.reg = null;
+      if (!i.reg && !quiet && rand(i) < Math.min(0.5, dt / 1500)) {
+        const crash = rand(i) < 0.5;
+        i.reg = { type: crash ? "crash" : "rally", mu: (crash ? -1 : 1) * U(i, 0.001, 0.0025), from: t, until: t + U(i, 30, 120) * 1000 };
         out?.push({ kind: i.reg.type, key: i.key });
       }
-      if (i.reg) mu += i.reg.mu;
+      if (i.reg) drift += i.reg.mu * ov(i.reg.from ?? t0, i.reg.until, t0, t);
     }
-    if (i.casc && t > i.casc.until) i.casc = null;
-    if (i.casc) mu += i.casc.mu;
+    if (i.casc && t0 >= i.casc.until) i.casc = null;
+    if (i.casc) drift += i.casc.mu * ov(i.casc.from ?? t0, i.casc.until, t0, t);
   }
-  mu += eventMu(w, i, t);
-  let px = i.px * jump * Math.exp(mu * dt + sig * Math.sqrt(dt) * gauss(w));
+  const ev = w.event;
+  if (ev) drift += eventMu(ev, i) * ov(ev.start, ev.until, t0, t);
+  let px = i.px * jump * Math.exp(drift + sig * Math.sqrt(dt) * gauss(i));
   px = Math.max(px, i.m === "meme" ? 1e-12 : 1e-6);
   if (i.m === "meme" && !i.dead) i.liq = Math.min(5e7, i.liq0 * Math.sqrt(px / i.px0), px * i.supply * 0.8);
   addPrice(i, t, px, gold);
@@ -263,33 +279,34 @@ function moveInst(w, i, t, dt, out, quiet = false, opts = {}) {
     const crowd = (i.crowd || 0) + Math.min(0.4, (opts.lev?.[i.key] || 0) / 2e5);
     const th = i.m === "crypto" ? -0.025 : -0.018;
     if (prev && px / prev - 1 <= th && crowd >= 0.45) {
-      i.casc = { mu: -0.002 * crowd, until: t + 20e3 }; i.cascAt = t;
-      out?.push({ kind: "cascade", key: i.key, usd: Math.round(crowd * U(w, 30, 250)) * 1e6 });
+      i.casc = { mu: -0.002 * crowd, from: t, until: t + 20e3 }; i.cascAt = t;
+      out?.push({ kind: "cascade", key: i.key, usd: Math.round(crowd * U(i, 30, 250)) * 1e6 });
     }
   }
 }
 
 function startEvent(w, t, forced) {
-  const type = EVENTS[forced] ? forced : pick(w, EVENT_IDS), spec = EVENTS[type];
+  const r = w.evr;
+  const type = EVENTS[forced] ? forced : pick(r, EVENT_IDS), spec = EVENTS[type];
   const ev = { type, icon: spec.icon, title: spec.title, text: spec.text || "", start: t, until: t + spec.dur * 1000, keys: [], dir: 1 };
   const list = m => Object.values(w.insts).filter(i => i.m === m && !i.dead);
   if (type === "whaleAlert") {
-    const i = pick(w, list("crypto"));
-    ev.dir = rand(w) < 0.5 ? 1 : -1; ev.keys = [i.key];
-    const move = U(w, 0.05, 0.12);
+    const i = pick(r, list("crypto"));
+    ev.dir = rand(r) < 0.5 ? 1 : -1; ev.keys = [i.key];
+    const move = U(r, 0.05, 0.12);
     addPrice(i, t, i.px * (1 + ev.dir * move));
-    ev.text = `${Math.round(U(w, 5e3, 9e4)).toLocaleString("en-US")} ${i.sym} just moved: ${i.sym} ${ev.dir > 0 ? "jumps" : "drops"} ${Math.round(move * 100)}%`;
+    ev.text = `${Math.round(U(r, 5e3, 9e4)).toLocaleString("en-US")} ${i.sym} just moved: ${i.sym} ${ev.dir > 0 ? "jumps" : "drops"} ${Math.round(move * 100)}%`;
   } else if (type === "shortSqueeze") {
     const all = list("stock");
-    for (let k = 0; k < 3; k++) { const i = pick(w, all); if (!ev.keys.includes(i.key)) ev.keys.push(i.key); }
+    for (let k = 0; k < 3; k++) { const i = pick(r, all); if (!ev.keys.includes(i.key)) ev.keys.push(i.key); }
     ev.text = `${ev.keys.map(k => w.insts[k].sym).join(", ")} shorts are getting squeezed`;
   } else if (type === "fedSurprise") {
-    ev.dir = rand(w) < 0.5 ? 1 : -1;
-    for (const c in w.cur) if (c !== "USD") w.cur[c].usd *= 1 + (rand(w) < 0.5 ? -1 : 1) * U(w, 0.003, 0.012);
+    ev.dir = rand(r) < 0.5 ? 1 : -1;
+    for (const c in w.cur) if (c !== "USD") w.cur[c].usd *= 1 + (rand(r) < 0.5 ? -1 : 1) * U(r, 0.003, 0.012);
   } else if (type === "elonTweet") {
     const young = list("meme").filter(i => t - i.born < 6 * HOUR);
-    const i = pick(w, young.length ? young : list("meme"));
-    ev.keys = [i.key]; ev.rate = Math.log(U(w, 5, 20)) / spec.dur;
+    const i = pick(r, young.length ? young : list("meme"));
+    ev.keys = [i.key]; ev.rate = Math.log(U(r, 5, 20)) / spec.dur;
     ev.text = `A famous tweet just mentioned ${i.sym}`;
   }
   return ev;
@@ -307,12 +324,24 @@ function prune(w, keep, t) {
   return [...drop];
 }
 
-function tick(w, t, out, opts) {
+function tick(w, t, out, opts, dt = 1) {
+  // forex: calm currencies, news jumps now and then
+  for (const c in w.cur) {
+    if (c === "USD") continue;
+    const cur = w.cur[c];
+    let r = -REVERT * Math.log(cur.usd / cur.usd0) * dt + SIG.fx * Math.sqrt(dt) * gauss(cur);
+    if (rand(cur) < Math.min(0.5, dt / 2400)) { const j = (rand(cur) < 0.5 ? -1 : 1) * U(cur, 0.004, 0.012); r += j; out.push({ kind: "news", cur: c, move: j }); }
+    cur.usd *= Math.exp(r);
+  }
+  for (const i of Object.values(w.insts)) {
+    if (i.m === "fx") addPrice(i, t, w.cur[i.base].usd / w.cur[i.quote].usd);
+    else moveInst(w, i, t, dt, out, false, opts);
+  }
   if (w.event && t > w.event.until) { out.push({ kind: "end", ev: w.event }); w.event = null; }
   if (!w.event && t >= w.nextEventAt) {
     w.event = startEvent(w, t);
     out.push({ kind: "event", ev: w.event });
-    w.nextEventAt = w.event.until + U(w, 90, 240) * 1000;
+    w.nextEventAt = w.event.until + U(w.evr, 120, 360) * 1000;
   }
   if (t >= w.nextCoinAt) {
     const i = newCoin(w, t, t);
@@ -320,17 +349,6 @@ function tick(w, t, out, opts) {
     w.nextCoinAt = t + U(w, 4, 10) * 1000;
     const gone = prune(w, opts.keep || new Set(), t);
     if (gone.length) out.push({ kind: "gone", keys: gone });
-  }
-  // forex: calm currencies, news jumps now and then
-  for (const c in w.cur) {
-    if (c === "USD") continue;
-    let r = SIG.fx * gauss(w);
-    if (rand(w) < 1 / 2400) { const j = (rand(w) < 0.5 ? -1 : 1) * U(w, 0.004, 0.012); r += j; out.push({ kind: "news", cur: c, move: j }); }
-    w.cur[c].usd *= Math.exp(r);
-  }
-  for (const i of Object.values(w.insts)) {
-    if (i.m === "fx") addPrice(i, t, w.cur[i.base].usd / w.cur[i.quote].usd);
-    else moveInst(w, i, t, 1, out, false, opts);
   }
 }
 
@@ -343,6 +361,52 @@ export function step(w, now, opts = {}) {
   if (now - w.t > MAX_GAP) w.t = now - MAX_GAP;
   while (w.t + 1000 <= now) { w.t += 1000; tick(w, w.t, out, opts); }
   return out;
+}
+
+/** One step of dt seconds (Skip ahead). */
+export function stepBy(w, dt, opts = {}) {
+  const out = [];
+  w.t += dt * 1000;
+  tick(w, w.t, out, opts, dt);
+  return out;
+}
+
+/**
+ * How Skip ahead plays `ms`: the last 6 hours in 20-second steps (so the 1-minute candles are complete),
+ * anything before that in 5-minute steps. Returns [{dt (seconds), n (steps)}] in order.
+ */
+export function skipPlan(ms) {
+  const fine = Math.min(ms, 6 * HOUR), coarse = ms - fine, plan = [];
+  if (coarse > 0) plan.push({ dt: 300, n: Math.round(coarse / 300e3) });
+  plan.push({ dt: 20, n: Math.round(fine / 20e3) });
+  return plan;
+}
+
+/**
+ * Oracle: play `secs` seconds ahead on a copy of the world (same opts as the live one) and return the path of one
+ * instrument, second by second, and its copy (with the future candles). The real world is not touched.
+ */
+export function future(w, key, secs, opts = {}) {
+  const c = structuredClone(w);
+  const path = [];
+  for (let n = 0; n < secs; n++) {
+    c.t += 1000;
+    tick(c, c.t, [], opts, 1);
+    const i = c.insts[key];
+    if (!i) break;
+    path.push([c.t, i.px]);
+  }
+  return { path, inst: c.insts[key] || null };
+}
+
+/** The best single trade on a path: buy at the lowest point before the biggest gain, sell at that peak. null if no gain. */
+export function bestTrade(path, now, px) {
+  let lo = { t: now, px }, best = null;
+  for (const [t, p] of path) {
+    if (lo.px > 0 && (!best || p / lo.px - 1 > best.gain)) best = { buy: { ...lo }, sell: { t, px: p }, gain: p / lo.px - 1 };
+    if (p < lo.px) lo = { t, px: p };
+  }
+  return best && best.gain > 0 ? best : null;
 }
 
 /** Start a global event now (tests). */

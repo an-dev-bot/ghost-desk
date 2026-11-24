@@ -4,7 +4,7 @@ import { price } from "./format.js";
 
 function cssVar(name) { return getComputedStyle(document.documentElement).getPropertyValue(name).trim(); }
 
-export function drawChart(canvas, bars, { mode = "candles", dp, ivl = "1m", empty = "", ghost = 0 } = {}) {
+export function drawChart(canvas, bars, { mode = "candles", dp, ivl = "1m", empty = "", ghost = 0, ghostLabel = "Peek", marks = [] } = {}) {
   const dpr = Math.min(3, window.devicePixelRatio || 1);
   const W = canvas.clientWidth || 300, H = canvas.clientHeight || 200;
   if (canvas.width !== Math.round(W * dpr) || canvas.height !== Math.round(H * dpr)) {
@@ -30,7 +30,7 @@ export function drawChart(canvas, bars, { mode = "candles", dp, ivl = "1m", empt
   let lo = Infinity, hi = -Infinity;
   for (const b of view) { if (mode === "line") { lo = Math.min(lo, b.c); hi = Math.max(hi, b.c); } else { lo = Math.min(lo, b.l); hi = Math.max(hi, b.h); } }
   if (hi === lo) { hi *= 1.001; lo *= 0.999; }
-  const pad = (hi - lo) * 0.08; hi += pad; lo -= pad;
+  const pad = (hi - lo) * 0.08; hi += pad; lo = lo - pad < 0 && lo >= 0 ? 0 : lo - pad; // prices never go below zero
   const y = v => top + (hi - v) / (hi - lo) * plotH;
   const step = plotW / view.length;
   const x = i => left + step * i + step / 2;
@@ -79,8 +79,25 @@ export function drawChart(canvas, bars, { mode = "candles", dp, ivl = "1m", empt
   if (real < view.length) {
     const nx = Math.round((x(real - 1) + x(real)) / 2) + 0.5;
     g.setLineDash([2, 3]); g.strokeStyle = fg; g.beginPath(); g.moveTo(nx, top); g.lineTo(nx, top + plotH); g.stroke(); g.setLineDash([]);
-    g.fillStyle = muted; g.font = `10px ${mono}`; g.textAlign = "left"; g.textBaseline = "top"; g.fillText("Peek", nx + 4, top);
+    g.fillStyle = muted; g.font = `10px ${mono}`; g.textAlign = "left"; g.textBaseline = "top"; g.fillText(ghostLabel, nx + 4, top);
     g.textBaseline = "middle";
+  }
+
+  // marks (Oracle): a dot on the price at that moment and a label pill (BUY below it, SELL above it)
+  for (const m of marks) {
+    let i = -1;
+    for (let k = 0; k < view.length; k++) if (view[k].t <= m.t) i = k;
+    if (i < 0) continue;
+    const mx = x(i), my = y(m.px), buy = m.kind === "buy";
+    const col = buy ? up : gold;
+    g.fillStyle = col; g.strokeStyle = cssVar("--bg") || "#000"; g.lineWidth = 2;
+    g.beginPath(); g.arc(mx, my, 5, 0, Math.PI * 2); g.fill(); g.stroke();
+    g.font = `700 10px ${mono}`;
+    const tw = g.measureText(m.label).width + 10, th = 16;
+    const bx = Math.min(Math.max(left, mx - tw / 2), left + plotW - tw);
+    const by = buy ? Math.min(top + plotH - th, my + 9) : Math.max(top, my - 9 - th);
+    g.fillStyle = col; roundRect(g, bx, by, tw, th, 5); g.fill();
+    g.fillStyle = "#06070b"; g.textAlign = "left"; g.textBaseline = "middle"; g.fillText(m.label, bx + 5, by + th / 2 + 0.5);
   }
 
   // last price line + tag
