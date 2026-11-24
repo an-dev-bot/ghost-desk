@@ -15,7 +15,7 @@ export const CHEATS = [
   { id: "leverage", group: "Trading", icon: "⚙️", name: "Leverage", desc: "10x, 50x or 100x on what you buy, long or short in crypto, stocks and forex. Liquidated for real when the loss reaches your margin." },
   { id: "shortAll", group: "Trading", icon: "🩳", name: "Short anything", kind: "toggle", desc: "Short every market, memecoins too, at your leverage (1x without it)." },
   { id: "magicLimit", group: "Trading", icon: "🪄", name: "Magic limit", kind: "toggle", desc: "Limit orders fill at your price when the live price comes within 0.5%." },
-  { id: "whale", group: "Trading", icon: "🐋", name: "Whale mode", kind: "toggle", desc: "Your big memecoin buys push its price up, only inside your game (sells push it down)." },
+  { id: "whale", group: "Trading", icon: "🐋", name: "Whale mode", kind: "toggle", desc: "Your big memecoin buys push its price up, only inside your game (sells push it down), 25% per trade at most." },
   { id: "golden", group: "Next trade", icon: "🥇", name: "Golden entry", kind: "arm", desc: "Your next market buy fills at the lowest price of the last 15 minutes." },
   { id: "perfect", group: "Next trade", icon: "🎯", name: "Perfect exit", kind: "arm", desc: "Your next market sale fills at the highest price the coin touched today." },
   { id: "sniper", group: "Next trade", icon: "🔭", name: "Sniper", kind: "arm", desc: "Your next memecoin buy fills at the price of its first candle (real GeckoTerminal data)." },
@@ -152,7 +152,7 @@ export function startBoost(s, key, px, now) {
   if (!(px > 0)) throw new E.TradeError("Wait for a live price.");
   const c = state(s);
   if (c.boost && now <= c.boost.until) throw new E.TradeError(`Moon boost is already running on ${s.pos[c.boost.key]?.inst.sym || "a coin"}.`);
-  const base = px * E.whaleMult(s, key);
+  const base = E.gameQuote(s, key, { px }).px;
   c.boost = { key, from: now, until: now + BOOST_MS, basePx: base, lastPx: base };
   mark(s, "moon", `Moon boost on ${p.inst.sym} for 10 minutes`, now);
   return c.boost;

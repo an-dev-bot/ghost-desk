@@ -131,6 +131,8 @@ picks up the new version. If you change app files, also bump the `VERSION` strin
   when a position reaches 10x. Sim sounds are off until you turn them on in Settings. Sim has its own portfolio,
   bots, achievements and records table (best multiplier, biggest jackpot, worst rug, longest streak), with the same
   costs, orders, bots and cheats as Live. Nothing in Sim is real. The Sim world only moves while the app is open.
+- **Sim limits**: no Sim coin goes past a $10T market cap ($1T for memecoins), and Whale mode moves a price 25% per
+  trade at most.
 - **Skip ahead** (Sim only, +1m / +5m / +15m / +1h / +1d / +1w under the chart): plays the whole Sim world forward: candles, events,
   new coins, rugs and the bots' trades; your limit orders, stop loss, take profit and trailing stop fill on the way.
 - **Rewind** (cheat, Sim only, -1m / -5m / -15m / -1h / -1d / -1w next to Skip ahead): the Sim world, your Sim portfolio and the bots go

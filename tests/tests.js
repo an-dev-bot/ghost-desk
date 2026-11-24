@@ -1329,6 +1329,29 @@ await test("Rewind · a point rebuilt from its chain is exactly the world, portf
   ok(E.isCheated(back.s) && C.isOn(back.s, "oracle"), "the star stays");
 });
 
+await test("Sim · market cap limits: $10T, memecoins $1T; Whale mode 25% per trade; saved coins above come back", () => {
+  const w = SW.createWorld(31, T0), mk = w.memes[w.memes.length - 1], m = w.insts[mk], n = w.insts["crypto:NBL"];
+  // a saved world with absurd prices
+  m.px = 1.39e9; m.dead = false; m.b1[m.b1.length - 1][2] = 1.4e9; n.px = 1e9;
+  const s = cheated(); s.memeMax = SW.MEME_MAX_PX;
+  s.pos[mk] = { key: mk, inst: SW.instOf(m), qty: 1, cost: 10, avg: 10, lastPx: 1.39e9, best: 1.4e9, sl: 1e9, tp: null, openedAt: T0, minRatio: 1 };
+  C.setToggle(s, "whale", true, T0); s.cheats.whale[mk] = 1e6;
+  const keys = SW.capWorld(w); SW.capPortfolio(s, w);
+  deepEq(keys.sort(), [mk, "crypto:NBL"].sort(), "brought down"); eq(m.px * m.supply, 1e12, "memecoin at $1T"); near(n.px * n.supply, 10e12, "crypto at $10T");
+  ok(m.b1.every(b => b[2] <= 1000), "candles too"); const p = s.pos[mk];
+  ok(p.best === 1000 && p.lastPx === 1000 && p.sl === null && s.cheats.whale[mk] === 1, "nothing sells because of the old prices");
+  eq(SW.capWorld(w).length, 0, "only once"); ok(E.positionValue(s, p, { px: 1000 }) <= 1000, "valued at the limit");
+  // it never goes past it again, whatever happens
+  for (let k = 0; k < 500; k++) { m.px = n.px = Infinity; m.px = SW.maxPx(m); n.px = SW.maxPx(n); SW.stepBy(w, 300, { keep: new Set([mk]) }); for (const i of Object.values(w.insts)) if (!(i.px <= SW.maxPx(i))) throw new Error(i.key + " " + i.px); }
+  // Whale mode: huge buys
+  const g = cheated(); g.cash = 1e12; g.memeMax = SW.MEME_MAX_PX;
+  C.setToggle(g, "whale", true, T0); C.setToggle(g, "zeroFees", true, T0);
+  E.executeBuy(g, MEME, 1e9, { px: 1, liq: 1000, t: T0 }, T0); near(E.whaleMult(g, MEME.key), 1.25, "25% per trade");
+  for (let k = 0; k < 60; k++) E.executeBuy(g, MEME, 1e6, { px: 1, liq: 1000, t: T0 }, T0);
+  near(E.gameQuote(g, MEME.key, { px: 1 }).px, 1000, "many buys stop at the limit"); eq(E.gameQuote(g, MEME.key, { px: 900 }).px, 1000, "also when the Sim price rises");
+  E.executeSell(g, MEME.key, 0.5, { px: 1, liq: 1000, t: T0 }, T0); near(E.gameQuote(g, MEME.key, { px: 1 }).px, 750, "a sale lowers it from there");
+});
+
 const pass = results.filter(r => r[0]).length;
 document.getElementById("results").innerHTML = results.map(r => `<span class="${r[0] ? "pass" : "fail"}">${r[0] ? "PASS" : "FAIL"}</span> ${r[1]}${r[0] ? "" : "\n       → " + r[2]}`).join("\n");
 document.getElementById("summary").innerHTML = `<b class="${pass === results.length ? "pass" : "fail"}">${pass}/${results.length} pass</b>`;

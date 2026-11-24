@@ -683,10 +683,19 @@ async function setMode(m) {
 }
 
 const newWorld = () => SW.createWorld(TEST ? 12345 : Math.floor(Math.random() * 2147483647), Date.now());
+/** Market cap limits on everything loaded (world, portfolio, bots). Returns how many coins came down. */
+function capSim() {
+  const keys = SW.capWorld(W);
+  for (const pf of [S, ...BOTS.map(b => b.pf)]) SW.capPortfolio(pf, W);
+  if (keys.length) { sigStale = true; for (const k of ["world", "portfolio", "bots"]) DUE.add(k); saveIn(0); }
+  return keys.length;
+}
 async function loadSim() {
   REC = await loadClean("sim.records", (v, is) => CLEAN.cleanRecords(v, FUN.newRecords(), is));
   W = await loadClean("sim.world", (v, is) => (v && v.v === SW.VERSION ? CLEAN.cleanWorld(v, newWorld, is) : null));
   if (!W) W = newWorld();
+  const capped = capSim();
+  if (capped) setTimeout(() => toast(`${plural(capped, "Sim coin was", "Sim coins were")} above the market cap limit ($10T, memecoins $1T) and came back to it.`), 1200);
   W.off = W.t - Date.now(); // the Sim clock continues exactly where it stopped
   bootAt = appNow();
   try { await loadPoints(); } catch (e) { console.warn("Rewind points", e?.message); PTS = []; FINE = []; lastPt = null; }
@@ -1090,7 +1099,8 @@ async function rewind(id) {
     const from = W.t, to = pt.t;
     const back = RW.carryOver(RW.restore(chain), S, BOTS, to);
     const gone = PTS.slice(j + 1), goneF = FINE.filter(p => p.t > to);
-    W = back.w; S = back.s; S.undoable = true; BOTS = back.bots; bootAt = W.t;
+    W = back.w; S = back.s; S.undoable = true; S.memeMax = SIM ? SW.MEME_MAX_PX : null; BOTS = back.bots; bootAt = W.t;
+    capSim();
     PTS = PTS.slice(0, j + 1); lastPt = main; FINE = FINE.filter(p => p.t <= to);
     C.mark(S, "rewind", `Rewind ${id}: back to ${dateTime(to)} (Sim)`, W.t);
     const keys = ["portfolio", "world", "bots"];
@@ -2052,7 +2062,7 @@ function renderSheet() {
     <div class="sh-body">
       <div class="big" data-p="${esc(key)}">${L.px > 0 ? fmtPx(inst, L.px, true) : "—"}</div>
       ${changeLine(inst, L)}
-      ${E.whaleMult(S, key) !== 1 && L.px > 0 ? `<div class="chg">🐋 In your game: <b>${$px(inst, L.px * E.whaleMult(S, key))}</b> (${$pct((E.whaleMult(S, key) - 1) * 100, 2)} from your own trades)</div>` : ""}
+      ${E.whaleMult(S, key) !== 1 && L.px > 0 ? `<div class="chg">🐋 In your game: <b>${$px(inst, E.gameQuote(S, key, L).px)}</b> (${$pct((E.gameQuote(S, key, L).px / L.px - 1) * 100, 2)} from your own trades)</div>` : ""}
       <div class="mline">${marketLine(inst)}</div>
       ${needKey ? noKeyCard() : `
       <div class="chart-bar">
@@ -2700,7 +2710,7 @@ async function importBackup(file) {
   try {
     const text = await file.text();
     const d = parseBackup(text);
-    S = d.portfolio; S.undoable = true;
+    S = d.portfolio; S.undoable = true; S.memeMax = SIM ? SW.MEME_MAX_PX : null;
     if (SIM) { await clearPoints(); addPoint(); }
     if (d.achievements) A = mergeAchievements(A, d.achievements);
     if (d.bots) BOTS = d.bots;
@@ -2893,7 +2903,7 @@ function onClick(e) {
       setTimeout(() => { if (t.isConnected) { delete t.dataset.sure; t.textContent = `Reset to ${usd0(ui.resetStart)}`; } }, 5000);
       return;
     }
-    S = E.newPortfolio(appNow(), start); S.undoable = true; saveSoon(0);
+    S = E.newPortfolio(appNow(), start); S.undoable = true; S.memeMax = SIM ? SW.MEME_MAX_PX : null; saveSoon(0);
     resetBots(S.start, appNow());
     if (SIM) clearPoints().then(() => addPoint()).catch(e => console.warn(e?.message));
     CFG.lastBuy = defaultBuy(S.start); saveCfg();
@@ -3033,7 +3043,7 @@ async function boot() {
   document.body.classList.toggle("sim", SIM);
   const now0 = Date.now();
   S = await loadClean(K("portfolio"), (v, is) => (v == null ? null : CLEAN.cleanPortfolio(v, now0, is))) || E.newPortfolio(appNow());
-  S.undoable = true;
+  S.undoable = true; S.memeMax = SIM ? SW.MEME_MAX_PX : null;
   A = await loadClean(K("achievements"), (v, is) => CLEAN.cleanAchievements(v, now0, is));
   BOTS = await loadClean(K("bots"), (v, is) => CLEAN.cleanBots(v == null ? null : v.list ?? v, now0, is));
   CFG = await loadClean("settings", (v, is) => CLEAN.cleanSettings(v, DEFAULT_CFG, is));

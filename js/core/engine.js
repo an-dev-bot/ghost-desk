@@ -50,6 +50,7 @@ export function available(s) {
 const EPS = 1e-9;
 export const SHIELD = 0.8;            // Rug shield: a position keeps at least 80% of what it cost
 export const BOOST_X = 3;             // Moon boost: gains count 3x
+export const WHALE_MAX = 0.25;        // Whale mode: one trade moves the price 25% at most
 export const MAGIC_NEAR = 0.005;      // Magic limit: fills when the price comes within 0.5%
 
 // ---------------------------------------------------------------- cheat helpers
@@ -67,13 +68,16 @@ export function whaleMult(s, key) {
 }
 export function gameQuote(s, key, q) {
   const m = s ? whaleMult(s, key) : 1;
-  return m === 1 || !q ? q : { ...q, px: q.px * m };
+  if (m === 1 || !q) return q;
+  // s.memeMax: highest memecoin price (Sim)
+  return { ...q, px: Math.min(q.px * m, s.memeMax || Infinity) };
 }
-function pushWhale(s, inst, usd, liq, dir) {
+function pushWhale(s, inst, usd, liq, dir, px) {
   if (!on(s).whale || inst.m !== "meme") return 0;
-  const imp = memeImpact(usd, liq);
+  const imp = Math.min(WHALE_MAX, memeImpact(usd, liq));
   const m = s.cheats.whale[inst.key] || 1;
   s.cheats.whale[inst.key] = dir > 0 ? m * (1 + imp) : m * (1 - imp);
+  if (s.memeMax && px > 0) s.cheats.whale[inst.key] = Math.min(s.cheats.whale[inst.key], Math.max(1, s.memeMax / px));
   if (Math.abs(s.cheats.whale[inst.key] - 1) < 1e-9) delete s.cheats.whale[inst.key];
   return imp;
 }
@@ -158,7 +162,7 @@ export function executeBuy(s, inst, usd, q, now, reason = "manual", fromOrder = 
   for (const n of opts.tags || []) tag(tr, n);
   if (plain.fee + plain.slip - r.fee - r.slip > 1e-9) tag(tr, mods.zeroFees ? "Zero fees" : "Market maker");
   if (gq !== q0) tag(tr, "Whale mode");
-  if (pushWhale(s, inst, usd, q.liq, 1) > 0) tag(tr, "Whale mode");
+  if (pushWhale(s, inst, usd, q.liq, 1, q.px) > 0) tag(tr, "Whale mode");
   attachGhost(s, p, tr);
   s.trades.push(tr);
   return tr;
@@ -215,7 +219,7 @@ export function executeSell(s, key, frac, q, now, reason = "manual", opts = {}) 
   if (r.proceeds - plain.proceeds > 1e-9) tags.push(mods.zeroFees ? "Zero fees" : "Market maker");
   if (gq !== q0) tags.push("Whale mode");
   tags.push(...saleCheats(s, p, r, frac));
-  pushWhale(s, p.inst, r.qty * q0.px, q.liq, -1);
+  pushWhale(s, p.inst, r.qty * q0.px, q.liq, -1, q.px);
   p.qty -= r.qty;
   p.cost -= r.costPart;
   s.cash += r.proceeds;
@@ -293,7 +297,7 @@ export function openMargin(s, inst, margin, lev, dir, q, now, reason = "manual",
     const plain = quoteOpenMargin(inst, margin, lev, dir, gq);
     if (plain.fee + plain.slip - r.fee - r.slip > 1e-9) tag(tr, mods.zeroFees ? "Zero fees" : "Market maker");
   }
-  if (pushWhale(s, inst, r.notional, q.liq, dir) > 0 || gq !== q0) tag(tr, "Whale mode");
+  if (pushWhale(s, inst, r.notional, q.liq, dir, q.px) > 0 || gq !== q0) tag(tr, "Whale mode");
   attachGhost(s, p, tr);
   s.trades.push(tr);
   return tr;
@@ -322,7 +326,7 @@ export function closeMargin(s, id, frac, q, now, reason = "manual", opts = {}) {
   }
   if (on(s).diamond && r.proceeds < 0) tags.push("Diamond hands");
   tags.push(...saleCheats(s, p, r, frac));
-  pushWhale(s, p.inst, r.qty * q0.px * quoteToUsd(p.inst, q0), q.liq, -p.dir);
+  pushWhale(s, p.inst, r.qty * q0.px * quoteToUsd(p.inst, q0), q.liq, -p.dir, q.px);
   p.qty -= r.qty;
   p.cost -= r.costPart;
   p.entryFee = (p.entryFee || 0) * (1 - frac);
@@ -428,7 +432,7 @@ export function checkKey(s, key, q, now, mkt, opts = {}) {
     if (v != null && p0.cost > 0) p0.minRatio = Math.min(p0.minRatio ?? 1, v / p0.cost);
   }
   const b = s.cheats?.boost;
-  if (b && b.key === key && now <= b.until && (q.t ?? now) >= b.from) b.lastPx = q.px * whaleMult(s, key);
+  if (b && b.key === key && now <= b.until && (q.t ?? now) >= b.from) b.lastPx = gameQuote(s, key, q).px;
   for (const p of marginPositions(s)) {
     if (p.key !== key) continue;
     trackBest(p, q.px);

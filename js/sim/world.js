@@ -15,6 +15,12 @@ const B1_MAX = 360, BH_MAX = 240, BD_MAX = 120;   // 6 hours of 1m, 10 days of 1
 export const MAX_MEMES = 45;
 export const MAX_GAP = 30e3;                        // a longer gap (app closed or hidden) is not simulated
 export const VERSION = 2;
+// No Sim coin can be worth more than this (market cap, dollars).
+export const MAX_MC = { crypto: 10e12, meme: 1e12 };
+const MEME_SUPPLY = 1e9;
+export const MEME_MAX_PX = MAX_MC.meme / MEME_SUPPLY;
+/** Highest price of an instrument (Infinity for stocks and forex: they have no supply). */
+export const maxPx = i => (MAX_MC[i.m] && i.supply > 0 ? MAX_MC[i.m] / i.supply : Infinity);
 export const SKIPS = { "1m": 60e3, "5m": 5 * 60e3, "15m": 15 * 60e3, "1h": 3600e3, "1d": 86400e3, "1w": 7 * 86400e3 };
 
 // Volatility per second, by market: crypto high, stocks with crashes and rallies, forex calm except news.
@@ -82,6 +88,7 @@ function put(arr, ms, t, px, gold, max) {
   }
 }
 function addPrice(i, t, px, gold = false) {
+  px = Math.min(px, maxPx(i));
   put(i.b1, MIN, t, px, gold, B1_MAX);
   put(i.bh, HOUR, t, px, gold, BH_MAX);
   put(i.bd, DAY, t, px, false, BD_MAX);
@@ -199,7 +206,7 @@ function newCoin(w, born, now) {
   const rugs = rand(w) < (kind === "normal" ? 0.4 : 0.5);
   const rugAt = !rugs ? null : kind === "normal" ? born + U(w, 60e3, 25 * MIN) : pumpAt + pumpDur * 1000 + U(w, 30e3, 5 * MIN);
   const i = base("meme", id, sym, name, px, born, {
-    born, supply: 1e9, liq0: U(w, 6e3, 60e3), dead: false, fate: { kind, pumpAt, pumpDur, mult, rugAt }, rs: seedOf(w),
+    born, supply: MEME_SUPPLY, liq0: U(w, 6e3, 60e3), dead: false, fate: { kind, pumpAt, pumpDur, mult, rugAt }, rs: seedOf(w),
   });
   i.liq = i.liq0;
   w.insts[i.key] = i;
@@ -270,7 +277,7 @@ function moveInst(w, i, t, dt, out, quiet = false, opts = {}) {
   const ev = w.event;
   if (ev) drift += eventMu(ev, i) * ov(ev.start, ev.until, t0, t);
   let px = i.px * jump * Math.exp(drift + sig * Math.sqrt(dt) * gauss(i));
-  px = Math.max(px, i.m === "meme" ? 1e-12 : 1e-6);
+  px = Math.min(Math.max(px, i.m === "meme" ? 1e-12 : 1e-6), maxPx(i)); // liquidity below uses the capped price
   if (i.m === "meme" && !i.dead) i.liq = Math.min(5e7, i.liq0 * Math.sqrt(px / i.px0), px * i.supply * 0.8);
   addPrice(i, t, px, gold);
   // liquidation cascade: a sharp drop with a crowded long side (yours included) liquidates more longs, which drops it more
@@ -427,6 +434,32 @@ export function forceEvent(w, type, t = w.t) {
   w.event = ev;
   w.nextEventAt = ev.until + 120e3;
   return ev;
+}
+
+/** Saved worlds from before the limit: prices and candles above it come back to it. Returns the keys brought down. */
+export function capWorld(w) {
+  const out = [];
+  for (const i of Object.values(w.insts)) {
+    const max = maxPx(i);
+    if (max === Infinity) continue;
+    if (i.px > max) { i.px = max; out.push(i.key); }
+    if (i.px0 > max) i.px0 = max;
+    for (const f of ["b1", "bh", "bd"]) for (const b of i[f]) for (let k = 1; k <= 4; k++) if (b[k] > max) b[k] = max;
+    if (i.m === "meme" && !i.dead) i.liq = Math.min(i.liq, 5e7, i.px * i.supply * 0.8);
+  }
+  return out;
+}
+/** The same for a portfolio: what it remembers of prices above the limit (so nothing sells because of them). */
+export function capPortfolio(s, w) {
+  const max = key => (w.insts[key] ? maxPx(w.insts[key]) : key.startsWith("meme:") ? MEME_MAX_PX : Infinity);
+  for (const p of [...Object.values(s.pos), ...Object.values(s.margin || {})]) {
+    const m = max(p.key);
+    for (const f of ["lastPx", "best", "lcBest"]) if (p[f] > m) p[f] = m;
+    if (p.sl > m) p.sl = null;
+  }
+  const c = s.cheats;
+  for (const k in c?.whale || {}) { const px = w.insts[k]?.px; if (px > 0 && c.whale[k] * px > max(k)) c.whale[k] = max(k) / px; }
+  if (c?.boost) for (const f of ["basePx", "lastPx"]) if (c.boost[f] > max(c.boost.key)) c.boost[f] = max(c.boost.key);
 }
 
 // ---------------------------------------------------------------- what the app shows
